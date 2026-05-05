@@ -188,6 +188,13 @@ def check_positions() -> None:
     if not _market_is_open():
         return
 
+    # Sync bot state with Alpaca before every monitoring cycle
+    try:
+        from position_sync import sync_all
+        sync_all()
+    except Exception as e:
+        _log.warning("[monitor] sync_all failed: %s", e)
+
     positions = _get_positions()
     if not positions:
         return

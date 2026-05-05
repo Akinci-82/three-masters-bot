@@ -326,6 +326,11 @@ def run_daily():
         _save_report(report)
         return
 
+    # ── Position sync — reconcile bot state with Alpaca before touching risk ──
+    from position_sync import sync_all as _sync_all, log_full_state
+    _sync_all()
+    log_full_state()
+
     # ── Risk state ────────────────────────────────────────────────────────────
     from risk_manager import check_can_trade, daily_reset, get_state
     daily_reset()
@@ -407,13 +412,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # ── Layer 3 + Execution: Tudor Jones — Size + Place Orders ────────────────
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
-    from risk_manager import position_size, register_trade, check_can_trade, sync_positions
+    from risk_manager import position_size, register_trade, check_can_trade
     from broker import place_buy_stop, cancel_all_orders
     from config import RISK
 
-    # Sync risk state with actual Alpaca positions — removes stale entries from test runs
     held_symbols = {p["symbol"] for p in positions}
-    sync_positions(held_symbols)
 
     cancelled = cancel_all_orders()
     if cancelled:
