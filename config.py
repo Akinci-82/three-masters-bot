@@ -59,7 +59,7 @@ VCP = {
     "min_contraction_ratio":    0.50,
     "max_depth_from_high":      0.35,
     "volume_decline_required":  True,
-    "final_tight_pct":          0.05,
+    "final_tight_pct":          0.10,
     "lookback_days":            60,
     "breakout_volume_min":      1.5,   # today's volume ≥ 1.5x avg = breakout confirmed
     # Candlestick confirmation on entry candle
