@@ -186,3 +186,17 @@ def daily_reset():
     state["halt_reason"] = ""
     _save(state)
     _log.info("[risk] Daily reset complete")
+
+def sync_positions(held_symbols: set):
+    """Sync positions_risk with actual held symbols — removes stale entries."""
+    state = _load()
+    before = dict(state.get("positions_risk", {}))
+    state["positions_risk"] = {
+        sym: risk for sym, risk in before.items()
+        if sym in held_symbols
+    }
+    state["open_risk_pct"] = sum(state["positions_risk"].values())
+    removed = set(before) - set(state["positions_risk"])
+    if removed:
+        _log.info("[risk] Removed stale risk entries: %s", removed)
+    _save(state)

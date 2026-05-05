@@ -407,16 +407,19 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # ── Layer 3 + Execution: Tudor Jones — Size + Place Orders ────────────────
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
-    from risk_manager import position_size, register_trade, check_can_trade
-    from broker import place_buy_stop, place_sell_stop, cancel_all_orders
+    from risk_manager import position_size, register_trade, check_can_trade, sync_positions
+    from broker import place_buy_stop, cancel_all_orders
     from config import RISK
+
+    # Sync risk state with actual Alpaca positions — removes stale entries from test runs
+    held_symbols = {p["symbol"] for p in positions}
+    sync_positions(held_symbols)
 
     cancelled = cancel_all_orders()
     if cancelled:
         _log.info("[main] Cancelled %d stale orders", cancelled)
 
     orders_placed = []
-    held_symbols  = {p["symbol"] for p in positions}
     max_new_pos   = RISK["max_positions"] - len(positions)
 
     vcp_sorted = sorted(vcp_passed,
@@ -451,11 +454,17 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                       vcp.symbol, sizing["notional"], cash)
             continue
 
+        # Skip if stock already above breakout level — it's broken out, buy-stop won't fire
+        if vcp.current_price >= vcp.breakout_level * 1.005:
+            _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — already broke out, skip",
+                      vcp.symbol, vcp.current_price, vcp.breakout_level)
+            continue
+
         buy_order = place_buy_stop(vcp.symbol, sizing["shares"], vcp.breakout_level)
         if not buy_order:
             continue
 
-        sl_order = place_sell_stop(vcp.symbol, sizing["shares"], vcp.stop_loss)
+        # Note: sell-stop placed by position_monitor after buy fills (avoids Alpaca wash-trade block)
         register_trade(vcp.symbol, sizing["risk_pct"])
 
         order_rec = {
@@ -472,7 +481,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "last_candle":    vcp.last_candle,
             "vcp_notes":      vcp.ai_reasoning[:100],
             "buy_order_id":   buy_order.get("id"),
-            "sl_order_id":    sl_order.get("id") if sl_order else None,
+            "sl_order_id":    None,  # placed by position_monitor after fill
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
