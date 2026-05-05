@@ -218,7 +218,7 @@ def _build_state() -> dict:
     }
 
 
-def start(stop_event: threading.Event, port: int = 5001) -> threading.Thread | None:
+def start(stop_event: threading.Event, port: int = 5002) -> threading.Thread | None:
     """Start Flask dashboard in a daemon thread."""
     try:
         import flask  # noqa: F401
@@ -232,9 +232,12 @@ def start(stop_event: threading.Event, port: int = 5001) -> threading.Thread | N
         import logging as _logging
         wlog = _logging.getLogger("werkzeug")
         wlog.setLevel(_logging.ERROR)   # suppress Flask request logs
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+        try:
+            app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+        except OSError as e:
+            _log.warning("[dash] Could not bind port %d: %s", port, e)
 
     t = threading.Thread(target=_run, daemon=True, name="dashboard")
     t.start()
-    _log.info("[dash] Dashboard started at http://0.0.0.0:%d", port)
+    _log.info("[dash] Dashboard started at http://0.0.0.0:%d  (LAN: http://docker-nuc:%d)", port, port)
     return t

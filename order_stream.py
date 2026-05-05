@@ -1,18 +1,17 @@
 """
-Order fill notification via Alpaca trade-update stream.
+Order fill notification via Alpaca trade-update stream (alpaca-trade-api v3).
 Sends Telegram alert the moment a buy-stop fills.
-
-Uses alpaca-trade-api v3 WebSocket (trade_updates channel).
 Runs in a background daemon thread — restarts automatically on disconnect.
 """
 from __future__ import annotations
+import asyncio
 import logging
 import os
 import threading
 import time
 
 _log = logging.getLogger(__name__)
-_RECONNECT_DELAY = 30   # seconds before reconnect attempt
+_RECONNECT_DELAY = 30
 
 
 def _tg(msg: str) -> None:
@@ -30,31 +29,41 @@ def _tg(msg: str) -> None:
         pass
 
 
-def _handle_fill(order: dict, event: str) -> None:
-    """React to a filled or partially-filled buy order."""
-    symbol    = order.get("symbol", "?")
-    side      = order.get("side", "?")
-    qty_fill  = float(order.get("filled_qty", 0))
-    avg_fill  = float(order.get("filled_avg_price") or 0)
-    qty_total = float(order.get("qty", 0))
-    partial   = qty_fill < qty_total
+def _handle_trade_update(data) -> None:
+    """React to Alpaca trade update events."""
+    try:
+        event     = data.event
+        order     = data.order
+        symbol    = order.symbol
+        side      = order.side
+        qty_fill  = float(order.filled_qty or 0)
+        avg_fill  = float(order.filled_avg_price or 0)
+        qty_total = float(order.qty or 0)
 
-    if side != "buy":
-        return
+        if side != "buy":
+            return
 
-    tag    = "⚡ *PARTIAL FILL*" if partial else "✅ *ORDER FILLED*"
-    filled = f"{qty_fill:.0f}/{qty_total:.0f}sh" if partial else f"{qty_fill:.0f}sh"
-
-    _log.info("[stream] %s %s %s @ $%.2f", event, symbol, filled, avg_fill)
-    _tg(
-        f"{tag} — *{symbol}*\n"
-        f"Filled: {filled} @ ${avg_fill:.2f}\n"
-        f"Position monitor will place trailing stop at next cycle (≤15 min)."
-    )
+        if event == "fill":
+            _log.info("[stream] FILL %s %dsh @ $%.2f", symbol, qty_fill, avg_fill)
+            _tg(
+                f"\u2705 *ORDER FILLED* \u2014 *{symbol}*\n"
+                f"Filled: {qty_fill:.0f}sh @ ${avg_fill:.2f}\n"
+                f"Trailing stop will be placed at next monitor cycle (\u226415 min)."
+            )
+        elif event == "partial_fill":
+            _log.info("[stream] PARTIAL FILL %s %.0f/%.0f sh @ $%.2f",
+                      symbol, qty_fill, qty_total, avg_fill)
+            _tg(
+                f"\u26a1 *PARTIAL FILL* \u2014 *{symbol}*\n"
+                f"Filled: {qty_fill:.0f}/{qty_total:.0f}sh @ ${avg_fill:.2f}"
+            )
+        elif event == "canceled":
+            _log.info("[stream] CANCELED %s", symbol)
+    except Exception as e:
+        _log.debug("[stream] handle_trade_update error: %s", e)
 
 
 def _stream_loop(stop_event: threading.Event) -> None:
-    """Inner loop: connect, stream, reconnect on failure."""
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -71,36 +80,28 @@ def _stream_loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
             _log.info("[stream] Connecting to Alpaca trade stream...")
-            conn = tradeapi.StreamConn(
-                key_id=key, secret_key=secret,
-                base_url=base, data_stream="",
+            stream = tradeapi.Stream(
+                key_id=key,
+                secret_key=secret,
+                base_url=base,
+                data_feed="iex",
             )
 
-            @conn.on(r"trade_updates")
-            async def on_trade(conn, channel, data):
-                event = data.event
-                order = data.order if hasattr(data, "order") else {}
-                if isinstance(order, dict):
-                    pass
-                else:
-                    order = order._raw if hasattr(order, "_raw") else {}
+            @stream.on_trade_update
+            async def on_trade_update(data):
+                _handle_trade_update(data)
 
-                if event in ("fill", "partial_fill"):
-                    _handle_fill(order, event)
-                elif event == "canceled":
-                    sym = order.get("symbol", "?")
-                    _log.info("[stream] Order cancelled: %s", sym)
-
-            conn.run(["trade_updates"])
+            stream.subscribe_trade_updates(on_trade_update)
+            stream.run()   # blocks until disconnect
 
         except Exception as e:
             if stop_event.is_set():
                 break
-            _log.warning("[stream] Stream disconnected: %s — reconnecting in %ds",
+            _log.warning("[stream] Disconnected: %s — reconnecting in %ds",
                          e, _RECONNECT_DELAY)
             stop_event.wait(_RECONNECT_DELAY)
 
-    _log.info("[stream] Order stream stopped")
+    _log.info("[stream] Order fill stream stopped")
 
 
 def start(stop_event: threading.Event) -> threading.Thread | None:
