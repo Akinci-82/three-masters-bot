@@ -387,6 +387,39 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         return TrendResult(symbol=symbol, passed=False, fail_reason=f"error:{e}")
 
 
+# ── Sector lookup with persistent cache ──────────────────────────────────────
+
+_SECTOR_CACHE_FILE = LOG_DIR / "sector_cache.json"
+_sector_mem: dict[str, str] = {}
+
+
+def get_sector(symbol: str) -> str:
+    """Return GICS sector for symbol. Cached to logs/sector_cache.json."""
+    import json as _json
+    global _sector_mem
+    if not _sector_mem:
+        try:
+            if _SECTOR_CACHE_FILE.exists():
+                _sector_mem = _json.loads(_SECTOR_CACHE_FILE.read_text())
+        except Exception:
+            pass
+    if symbol in _sector_mem:
+        return _sector_mem[symbol]
+    try:
+        info   = yf.Ticker(symbol).info
+        sector = info.get("sector") or "Unknown"
+    except Exception:
+        sector = "Unknown"
+    _sector_mem[symbol] = sector
+    try:
+        _SECTOR_CACHE_FILE.parent.mkdir(exist_ok=True)
+        _SECTOR_CACHE_FILE.write_text(_json.dumps(_sector_mem, indent=2))
+    except Exception:
+        pass
+    _log.debug("[screen] %s sector: %s", symbol, sector)
+    return sector
+
+
 def run(symbols: list[str] | None = None, workers: int = 10) -> list[TrendResult]:
     if symbols is None:
         symbols = load_universe()

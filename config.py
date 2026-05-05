@@ -72,6 +72,7 @@ RISK = {
     "risk_per_trade_pct":      0.015,
     "max_risk_per_trade_pct":  0.02,
     "max_positions":           8,
+    "max_positions_per_sector": 2,
     "max_sector_pct":          0.30,
     "max_daily_loss_pct":      0.04,
     "max_drawdown_pct":        0.12,

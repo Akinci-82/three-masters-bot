@@ -91,6 +91,7 @@ class VCPResult:
     breakout_volume: bool = False
     last_candle: str = "neutral"
     tier_used: str = ""            # "quant_fail" | "haiku_rejected" | "sonnet"
+    rs_rating: float = 0.0         # RS rating from screener (for final sort priority)
 
     @property
     def risk_reward(self) -> float:
@@ -475,6 +476,7 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50) -> list[VCPResult]:
         _log.info("[vcp] %d/%d: %s", i, len(candidates), trend.symbol)
         last_candle = getattr(trend, "last_candle", "neutral")
         result = analyze(trend.symbol, trend.df, last_candle=last_candle)
+        result.rs_rating = getattr(trend, "rs_rating", 0.0)
         results.append(result)
         time.sleep(0.3)  # gentle rate-limit
 

@@ -172,25 +172,29 @@ _last_briefing_date: date | None = None
 
 
 def _send_morning_briefing() -> None:
-    """Send a brief Telegram message before US market opens."""
+    """Send a morning Telegram briefing before US open: equity, positions, pending orders."""
     try:
-        import pytz, requests
-        from config import ALPACA_BASE_URL, ALPACA_API_KEY, ALPACA_SECRET_KEY
-        hdrs = {
-            "APCA-API-KEY-ID":     ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        }
+        from broker import get_account, get_positions, get_open_orders
+        acct      = get_account()
+        equity    = acct["portfolio_value"]
+        positions = get_positions()
+        buy_stops = [o for o in get_open_orders()
+                     if o.get("side") == "buy" and o.get("type") == "stop"]
 
-        positions = requests.get(f"{ALPACA_BASE_URL}/positions",
-                                 headers=hdrs, timeout=10).json()
-        orders    = requests.get(f"{ALPACA_BASE_URL}/orders",
-                                 params={"status": "open", "limit": 50},
-                                 headers=hdrs, timeout=10).json()
+        lines = [f"🌅 *Three Masters — Morning Briefing {date.today()}*",
+                 f"Portfolio: ${equity:,.0f}"]
 
-        buy_stops = [o for o in orders if isinstance(o, dict)
-                     and o.get("type") == "stop" and o.get("side") == "buy"]
+        ret_line = _equity_return_str(equity)
+        if ret_line:
+            lines.append(ret_line)
 
-        lines = [f"🌅 *Three Masters — Morning Briefing {date.today()}*"]
+        # Risk state summary
+        from risk_manager import get_state
+        rs = get_state()
+        heat   = rs.get("open_risk_pct", 0) * 100
+        dpnl   = rs.get("daily_pnl_pct", 0) * 100
+        losses = rs.get("consecutive_losses", 0)
+        lines.append(f"Heat: {heat:.1f}% | Day P&L: {dpnl:+.1f}% | Loss streak: {losses}")
 
         if positions:
             lines.append(f"\n*Open positions ({len(positions)}):*")
@@ -200,15 +204,21 @@ def _send_morning_briefing() -> None:
                 avg_cost = float(p["avg_entry_price"])
                 cur      = float(p["current_price"])
                 pnl_pct  = (cur - avg_cost) / avg_cost * 100
+                pnl_usd  = (cur - avg_cost) * qty
                 tag      = "📈" if pnl_pct >= 0 else "📉"
-                lines.append(f"  {tag} *{sym}* {qty}sh  ${cur:.2f}  ({pnl_pct:+.1f}%)")
+                lines.append(f"  {tag} *{sym}* {qty}sh  ${cur:.2f}  ({pnl_pct:+.1f}%  ${pnl_usd:+.0f})")
         else:
             lines.append("\nNo open positions")
 
         if buy_stops:
             lines.append(f"\n*Pending buy-stops ({len(buy_stops)}):*")
-            for o in buy_stops[:5]:
-                lines.append(f"  ⏳ *{o['symbol']}* {o['qty']}sh @ ${float(o.get('stop_price',0)):.2f}")
+            for o in buy_stops[:6]:
+                lines.append(f"  ⏳ *{o['symbol']}* {int(float(o['qty']))}sh @ ${o['stop_price']:.2f}")
+
+        # Market regime
+        regime, spy_price, spy_ma200, spy_pct = _check_market_regime()
+        regime_emoji = {"bull": "🟢", "neutral": "🟡", "bear": "🔴"}[regime]
+        lines.append(f"\nMarket: {regime_emoji} {regime.upper()}  SPY ${spy_price:.0f} ({spy_pct:+.1f}% vs MA200)")
 
         _tg("\n".join(lines))
         _log.info("[briefing] Morning briefing sent")
@@ -279,6 +289,88 @@ def _send_weekly_report(portfolio_value: float) -> None:
         _log.info("[weekly] Weekly report sent")
     except Exception as e:
         _log.warning("[weekly] Report failed: %s", e)
+
+
+
+# ── Market regime filter ──────────────────────────────────────────────────────
+
+def _check_market_regime() -> tuple[str, float, float, float]:
+    """
+    Determine market regime from SPY vs its 200-day MA.
+    Returns (regime, spy_price, ma200, pct_diff).
+      'bull'    — SPY above MA200 or within 3% below  → full sizing
+      'neutral' — SPY 3-8% below MA200                → 75% sizing
+      'bear'    — SPY >8% below MA200                 → no new positions
+    On fetch failure returns 'bull' so the bot never blocks itself on error.
+    """
+    try:
+        import yfinance as yf
+        df    = yf.Ticker("SPY").history(period="1y", interval="1d", auto_adjust=True)
+        close = df["Close"]
+        ma200 = float(close.rolling(200).mean().iloc[-1])
+        price = float(close.iloc[-1])
+        pct   = (price - ma200) / ma200
+        if pct > -0.03:
+            regime = "bull"
+        elif pct > -0.08:
+            regime = "neutral"
+        else:
+            regime = "bear"
+        _log.info("[regime] SPY $%.2f | MA200 $%.2f | %+.1f%% → %s",
+                  price, ma200, pct * 100, regime.upper())
+        return regime, price, ma200, pct
+    except Exception as e:
+        _log.warning("[regime] Check failed (%s) — defaulting to BULL", e)
+        return "bull", 0.0, 0.0, 0.0
+
+
+def _adaptive_risk_pct(confidence: float, base_pct: float) -> float:
+    """Scale position risk 1.5-2% based on Sonnet VCP confidence."""
+    if confidence >= 0.85:
+        return min(base_pct * (4 / 3), 0.020)   # high conviction → up to 2%
+    if confidence >= 0.70:
+        return min(base_pct * (7 / 6), 0.020)   # good setup → ~1.75%
+    return base_pct                               # standard → 1.5%
+
+
+def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
+    """
+    Compare existing Alpaca buy-stop orders against new VCP candidates.
+    Cancels stale or price-drifted orders; keeps valid ones.
+    Returns set of symbols whose existing order is retained (skip re-placing).
+    """
+    from broker import get_open_orders, cancel_all_orders as _cancel_sym
+    existing = {
+        o["symbol"]: o for o in get_open_orders()
+        if o.get("side") == "buy" and o.get("type") == "stop"
+    }
+    new_map  = {r.symbol: r.breakout_level for r in vcp_passed}
+    keep: set[str] = set()
+
+    for sym, order in list(existing.items()):
+        if sym in held_symbols:
+            _cancel_sym(sym)
+            _log.info("[main] Cancelled buy-stop for %s — position already filled", sym)
+            continue
+        if sym not in new_map:
+            _cancel_sym(sym)
+            _log.info("[main] Cancelled stale order: %s (no longer a VCP candidate)", sym)
+            continue
+        old_stop   = float(order.get("stop_price", 0))
+        new_stop   = new_map[sym]
+        price_drift = abs(new_stop - old_stop) / old_stop if old_stop > 0 else 1.0
+        if price_drift > 0.005:
+            _cancel_sym(sym)
+            _log.info("[main] Cancelled %s — breakout level moved $%.2f→$%.2f (%.1f%%)",
+                      sym, old_stop, new_stop, price_drift * 100)
+        else:
+            keep.add(sym)
+            _log.info("[main] Keeping valid order: %s @ $%.2f (unchanged)", sym, old_stop)
+
+    if existing:
+        _log.info("[main] Smart order mgmt: %d kept, %d cancelled",
+                  len(keep), len(existing) - len(keep))
+    return keep
 
 
 # ── Main daily run ────────────────────────────────────────────────────────────
@@ -420,40 +512,83 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _save_report(report)
         return
 
+    # ── Market regime filter ─────────────────────────────────────────────────
+    regime, spy_price, spy_ma200, spy_pct = _check_market_regime()
+    if regime == "bear":
+        msg = (f"SPY ${spy_price:.0f} is {abs(spy_pct):.1f}% below MA200 "
+               f"— bear market. {len(vcp_passed)} VCP setup(s) found but no orders placed.")
+        _log.warning("[main] BEAR regime — skipping order placement. %d VCPs found.", len(vcp_passed))
+        _tg(f"🐻 *Three Masters — Bear Regime*\n{msg}")
+        report["summary"] = "bear_regime_no_orders"
+        report["vcp_found_no_orders"] = [r.symbol for r in vcp_passed]
+        _save_report(report)
+        _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
+        return
+
+    regime_size_factor = 0.75 if regime == "neutral" else 1.0
+    if regime == "neutral":
+        _log.info("[main] Neutral regime (SPY %+.1f%% vs MA200) — position sizing at 75%%",
+                  spy_pct * 100)
+
     # ── Layer 3 + Execution: Tudor Jones — Size + Place Orders ────────────────
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
     from risk_manager import position_size, register_trade, check_can_trade
-    from broker import place_buy_stop, cancel_all_orders
+    from broker import place_buy_stop
+    from screener import get_sector
     from config import RISK
 
     held_symbols = {p["symbol"] for p in positions}
 
-    cancelled = cancel_all_orders()
-    if cancelled:
-        _log.info("[main] Cancelled %d stale orders", cancelled)
+    # Smart order management: retain unchanged orders, cancel stale/moved ones
+    orders_to_skip = _smart_order_management(vcp_passed, held_symbols)
+    max_new_pos    = max(0, RISK["max_positions"] - len(positions) - len(orders_to_skip))
+
+    # Sector concentration tracking: count existing positions + retained orders
+    sector_counts: dict[str, int] = {}
+    for sym in held_symbols | orders_to_skip:
+        sec = get_sector(sym)
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+    max_per_sector = RISK.get("max_positions_per_sector", 2)
 
     orders_placed = []
-    max_new_pos   = RISK["max_positions"] - len(positions)
 
+    # Sort: breakout-volume-confirmed > Sonnet confidence > RS rating
     vcp_sorted = sorted(vcp_passed,
-                        key=lambda r: (-(1 if r.breakout_volume else 0), -r.confidence))
+                        key=lambda r: (-(1 if r.breakout_volume else 0),
+                                       -r.confidence,
+                                       -getattr(r, "rs_rating", 0)))
 
     for vcp in vcp_sorted:
         if len(orders_placed) >= max_new_pos:
-            _log.info("[main] Max positions reached (%d) — stopping.", RISK["max_positions"])
+            _log.info("[main] Max new positions reached (%d) — stopping.", RISK["max_positions"])
             break
 
         if vcp.symbol in held_symbols:
             _log.info("[main] %s already held — skipping.", vcp.symbol)
             continue
 
-        can, reason = check_can_trade(portfolio_value, RISK["risk_per_trade_pct"])
+        if vcp.symbol in orders_to_skip:
+            _log.info("[main] %s — existing valid order retained.", vcp.symbol)
+            continue
+
+        # Sector concentration check (max_positions_per_sector from config)
+        sec = get_sector(vcp.symbol)
+        if sector_counts.get(sec, 0) >= max_per_sector:
+            _log.info("[main] %s skipped — sector '%s' already at limit (%d/%d)",
+                      vcp.symbol, sec, sector_counts.get(sec, 0), max_per_sector)
+            continue
+
+        # Adaptive risk: scale by VCP confidence, then by market regime
+        base_risk = RISK["risk_per_trade_pct"]
+        risk_pct  = _adaptive_risk_pct(vcp.confidence, base_risk) * regime_size_factor
+
+        can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
             _log.warning("[main] Cannot trade: %s", reason)
             break
 
         try:
-            sizing = position_size(portfolio_value, vcp.breakout_level, vcp.stop_loss)
+            sizing = position_size(portfolio_value, vcp.breakout_level, vcp.stop_loss, risk_pct)
         except ValueError as e:
             _log.warning("[main] %s sizing error: %s", vcp.symbol, e)
             continue
@@ -467,9 +602,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                       vcp.symbol, sizing["notional"], cash)
             continue
 
-        # Skip if stock already above breakout level — it's broken out, buy-stop won't fire
         if vcp.current_price >= vcp.breakout_level * 1.005:
-            _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — already broke out, skip",
+            _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — skip",
                       vcp.symbol, vcp.current_price, vcp.breakout_level)
             continue
 
@@ -477,8 +611,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if not buy_order:
             continue
 
-        # Note: sell-stop placed by position_monitor after buy fills (avoids Alpaca wash-trade block)
         register_trade(vcp.symbol, sizing["risk_pct"])
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
         order_rec = {
             "symbol":         vcp.symbol,
@@ -494,7 +628,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "last_candle":    vcp.last_candle,
             "vcp_notes":      vcp.ai_reasoning[:100],
             "buy_order_id":   buy_order.get("id"),
-            "sl_order_id":    None,  # placed by position_monitor after fill
+            "sl_order_id":    None,  # placed by position_monitor after buy fills
+            "sector":         sec,
+            "regime":         regime,
+            "rs_rating":      round(getattr(vcp, "rs_rating", 0), 1),
+            "adaptive_risk":  round(risk_pct, 4),
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
@@ -503,10 +641,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         vol_tag = " 🔥" if vcp.breakout_volume else ""
         _log.info(
             "[main] ✅ %s | %d sh | buy-stop=$%.2f | SL=$%.2f | TP=$%.2f | "
-            "risk=$%.0f (%.1f%%) | candle=%s%s",
+            "risk=$%.0f (%.1f%%) | candle=%s | sector=%s | RS=%.0f%s",
             vcp.symbol, sizing["shares"], vcp.breakout_level, vcp.stop_loss,
             sizing["target_price"], sizing["risk_amount"], sizing["risk_pct"] * 100,
-            vcp.last_candle, vol_tag,
+            vcp.last_candle, sec, getattr(vcp, "rs_rating", 0), vol_tag,
         )
 
     report["orders_placed"] = orders_placed

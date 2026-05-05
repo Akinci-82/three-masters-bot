@@ -183,6 +183,44 @@ def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> bool:
 
 # ── Core monitoring logic ─────────────────────────────────────────────────────
 
+def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value: float) -> None:
+    """Append completed trade record to logs/trade_journal.jsonl."""
+    import json as _json
+    avg_cost    = sym_data.get("avg_cost", 0)
+    last_price  = sym_data.get("last_price", avg_cost)
+    initial_qty = sym_data.get("initial_qty", 0)
+    partial_qty = sym_data.get("partial_qty", 0)
+    exit_qty    = initial_qty - partial_qty
+    pnl_dollar  = (last_price - avg_cost) * exit_qty if avg_cost > 0 else 0.0
+    # Approximate R-multiple using 7% initial risk (trailing stop pct)
+    risk_per_share = avg_cost * 0.07
+    r_multiple = (last_price - avg_cost) / risk_per_share if risk_per_share > 0 else 0.0
+
+    entry = {
+        "ts":              datetime.now().isoformat(),
+        "symbol":          symbol,
+        "avg_cost":        round(avg_cost, 2),
+        "exit_price":      round(last_price, 2),
+        "initial_qty":     initial_qty,
+        "partial_done":    sym_data.get("partial_done", False),
+        "partial_qty":     partial_qty,
+        "partial_price":   sym_data.get("partial_price"),
+        "pnl_pct":         round(pnl_pct * 100, 2),
+        "pnl_dollar":      round(pnl_dollar, 2),
+        "r_multiple":      round(r_multiple, 2),
+        "portfolio_after": round(portfolio_value, 2),
+    }
+    journal = os.path.join(os.path.dirname(__file__), "logs", "trade_journal.jsonl")
+    try:
+        os.makedirs(os.path.dirname(journal), exist_ok=True)
+        with open(journal, "a") as jf:
+            jf.write(_json.dumps(entry) + "\n")
+        _log.info("[monitor] Trade journaled: %s pnl=%.1f%% (%.1fR)",
+                  symbol, pnl_pct * 100, r_multiple)
+    except Exception as e:
+        _log.warning("[monitor] Journal write failed: %s", e)
+
+
 def check_positions() -> None:
     """Run one monitoring cycle. Called every 15 min during market hours."""
     if not _market_is_open():
@@ -298,6 +336,7 @@ def check_positions() -> None:
                 from broker import get_account
                 portfolio_value = get_account()["portfolio_value"]
                 close_trade(sym, pnl_pct, portfolio_value)   # start_value read from risk_state
+                _journal_trade(sym, sym_data, pnl_pct, portfolio_value)
             except Exception as e:
                 _log.warning("[monitor] close_trade %s failed: %s", sym, e)
 
