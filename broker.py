@@ -67,9 +67,8 @@ def is_market_open() -> bool:
 
 def place_buy_stop(symbol: str, qty: int, stop_price: float) -> dict | None:
     """
-    Place a buy-stop order: executes as market when price crosses stop_price upward.
-    This is how we enter on a VCP breakout — order triggers when price breaks out.
-    Good for 1 trading day.
+    Place a GTC buy-stop order: executes when price crosses stop_price upward.
+    Placed after close (22:30 CEST) — triggers during the NEXT trading day if price breaks out.
     """
     try:
         order = get_api().submit_order(
@@ -78,7 +77,7 @@ def place_buy_stop(symbol: str, qty: int, stop_price: float) -> dict | None:
             side="buy",
             type="stop",
             stop_price=round(stop_price, 2),
-            time_in_force="day",
+            time_in_force="gtc",   # GTC: survives overnight, executes next trading day
         )
         _log.info("[broker] BUY-STOP %s qty=%d stop=$%.2f id=%s", symbol, qty, stop_price, order.id)
         return {"id": order.id, "symbol": symbol, "qty": qty, "stop": stop_price, "type": "buy_stop"}

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Three Masters Bot — Main Orchestrator
-Runs daily at 07:00 CET (configurable).
+Runs daily at 22:30 CEST — right after US market close.
+Orders placed are GTC buy-stops for the next trading day.
 
 Flow:
   1. [Simons]      Fetch OHLCV for 500+ stocks, apply Trend Template
@@ -26,7 +27,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 from config import (
     LOG_DIR, REPORT_DIR, CHART_DIR,
-    DAILY_TRIGGER_HOUR_CET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     LOG_LEVEL, LOG_MAX_MB, LOG_BACKUPS,
 )
 
@@ -300,15 +301,21 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 def _seconds_until_trigger() -> int:
-    """Seconds until next 07:00 CET trigger."""
+    """Seconds until next 22:30 CEST trigger (after US market close)."""
     import pytz
     cet = pytz.timezone("Europe/Stockholm")
     now_cet = datetime.now(cet)
-    target  = now_cet.replace(hour=DAILY_TRIGGER_HOUR_CET, minute=0, second=0, microsecond=0)
+    target  = now_cet.replace(hour=DAILY_TRIGGER_HOUR_CET, minute=DAILY_TRIGGER_MIN_CET, second=0, microsecond=0)
     if now_cet >= target:
-        # Already past today's trigger — schedule for tomorrow
+        # Already past today's trigger — schedule for next occurrence
         from datetime import timedelta
         target += timedelta(days=1)
+
+    # Skip weekends: if target lands on Saturday (5) or Sunday (6), push to Monday
+    from datetime import timedelta as _td
+    while target.weekday() in (5, 6):
+        target += _td(days=1)
+
     return int((target - now_cet).total_seconds())
 
 

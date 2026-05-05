@@ -68,7 +68,8 @@ UNIVERSE_FILE = BASE_DIR / "universe.txt"   # list of symbols, one per line
 SP500_UNIVERSE = True                        # use dynamic S&P 500 + Nasdaq 100
 
 # ── Scheduling ────────────────────────────────────────────────────────────────
-DAILY_TRIGGER_HOUR_CET = 7    # 07:00 CET = 05:00 UTC = 01:00 ET
+DAILY_TRIGGER_HOUR_CET = 22   # 22:30 CEST — after US close
+DAILY_TRIGGER_MIN_CET  = 30   # :30 to let daily bars finalize
 MARKET_OPEN_ET  = (9, 30)     # 09:30 ET
 MARKET_CLOSE_ET = (16, 0)     # 16:00 ET
 
