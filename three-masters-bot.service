@@ -1,0 +1,17 @@
+[Unit]
+Description=Three Masters Bot (Simons + Minervini + Tudor Jones)
+After=network.target
+
+[Service]
+Type=simple
+User=habil
+WorkingDirectory=/home/habil/three-masters-bot
+EnvironmentFile=/home/habil/three-masters-bot/.env
+ExecStart=/home/habil/three-masters-bot/venv/bin/python main.py
+Restart=always
+RestartSec=30s
+StandardOutput=append:/home/habil/three-masters-bot/logs/stdout.log
+StandardError=append:/home/habil/three-masters-bot/logs/stdout.log
+
+[Install]
+WantedBy=multi-user.target

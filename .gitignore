@@ -1,0 +1,12 @@
+venv/
+venv
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+reports/
+charts/
+*.db
+*.pkl
+*.bak
