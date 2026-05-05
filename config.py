@@ -89,6 +89,7 @@ MONITOR = {
     "partial_exit_trigger":   0.15,        # take partial at +15% gain
     # Trailing stop on remaining position
     "trailing_stop_pct":      0.07,        # 7% trailing stop on remainder
+    "trailing_stop_after_partial": 0.05,  # 5% trailing stop after partial exit (profit locked)
     "trailing_stop_type":     "percent",   # Alpaca native trailing stop type
     # Hard stop upgrade: move stop to breakeven after +8%
     "breakeven_trigger":      0.08,

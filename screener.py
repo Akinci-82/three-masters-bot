@@ -249,6 +249,23 @@ def _detect_candlestick(df: pd.DataFrame) -> str:
     return "bullish" if c0 > o0 else "bearish"
 
 
+def _rs_line_new_high(close: pd.Series, spy_close: pd.Series, lookback: int = 252) -> bool:
+    """
+    Return True if the RS line (stock/SPY ratio) is at a 52-week high today.
+    Minervini's strongest single signal: RS line leads the price breakout.
+    """
+    n = min(len(close), len(spy_close), lookback)
+    if n < 60:
+        return False
+    stock = close.iloc[-n:].values
+    spy   = spy_close.iloc[-n:].values
+    if len(stock) != len(spy) or spy[-1] == 0:
+        return False
+    rs_line = stock / spy
+    return float(rs_line[-1]) >= float(rs_line.max()) * 0.995  # within 0.5% of 52w high
+
+
+
 # ── Per-symbol full check ─────────────────────────────────────────────────────
 
 @dataclass
@@ -272,6 +289,7 @@ class TrendResult:
     weekly_note: str          = ""
     days_to_earnings: int | None = None
     last_candle: str          = ""
+    rs_line_at_high: bool     = False  # RS line making 52-week high today
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -380,6 +398,9 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 result.fail_reason = weekly_note
                 return result
 
+        result.rs_line_at_high = _rs_line_new_high(close, spy_close)
+        if result.rs_line_at_high:
+            _log.debug("[screen] %s RS line at 52-week high — strong signal", symbol)
         result.passed = True
         return result
 

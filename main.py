@@ -552,9 +552,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     orders_placed = []
 
-    # Sort: breakout-volume-confirmed > Sonnet confidence > RS rating
+    # Sort: RS-line-at-new-high > breakout-volume > confidence > RS rating
     vcp_sorted = sorted(vcp_passed,
-                        key=lambda r: (-(1 if r.breakout_volume else 0),
+                        key=lambda r: (-(1 if getattr(r, "rs_line_at_high", False) else 0),
+                                       -(1 if r.breakout_volume else 0),
                                        -r.confidence,
                                        -getattr(r, "rs_rating", 0)))
 
@@ -632,6 +633,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "sector":         sec,
             "regime":         regime,
             "rs_rating":      round(getattr(vcp, "rs_rating", 0), 1),
+            "quality_score":  getattr(vcp, "quality_score", 0),
+            "rs_line_high":   getattr(vcp, "rs_line_at_high", False),
             "adaptive_risk":  round(risk_pct, 4),
         }
         orders_placed.append(order_rec)
@@ -676,11 +679,15 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
     lines.append("")
 
     for o in orders:
-        vol_tag = " 🔥" if o.get("breakout_vol") else ""
+        vol_tag  = " 🔥" if o.get("breakout_vol") else ""
+        rs_hi    = " ⭐RS-HIGH" if o.get("rs_line_high") else ""
+        qs_str   = f" Q{o['quality_score']}/5" if o.get("quality_score") else ""
+        rs_str   = f" RS={o['rs_rating']:.0f}" if o.get("rs_rating") else ""
+        sect     = f" [{o['sector']}]" if o.get("sector") else ""
         lines.append(
-            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}{vol_tag}\n"
+            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}{vol_tag}{rs_hi}{qs_str}{rs_str}\n"
             f"     SL=${o['stop_loss']:.2f} | TP=${o['target']:.2f} | "
-            f"Risk=${o['risk_amount']:.0f} ({o['risk_pct']*100:.1f}%) | {o['rr_ratio']:.1f}R\n"
+            f"Risk=${o['risk_amount']:.0f} ({o['risk_pct']*100:.1f}%) | {o['rr_ratio']:.1f}R{sect}\n"
             f"     candle={o.get('last_candle','?')} | _{o['vcp_notes'][:80]}_"
         )
     if not orders:
@@ -724,6 +731,27 @@ def _start_position_monitor() -> threading.Thread | None:
     return t
 
 
+def _start_background_services() -> None:
+    """Start Telegram commands, fill stream, and dashboard alongside main loop."""
+    try:
+        import telegram_commands
+        telegram_commands.start(_monitor_stop)
+    except Exception as e:
+        _log.warning("[main] Telegram command listener failed to start: %s", e)
+
+    try:
+        import order_stream
+        order_stream.start(_monitor_stop)
+    except Exception as e:
+        _log.warning("[main] Order fill stream failed to start: %s", e)
+
+    try:
+        import dashboard
+        dashboard.start(_monitor_stop)
+    except Exception as e:
+        _log.warning("[main] Dashboard failed to start: %s", e)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     _setup_logging()
@@ -743,6 +771,7 @@ def main():
         return
 
     _start_position_monitor()
+    _start_background_services()
     _heartbeat()
 
     while not _SHUTDOWN:

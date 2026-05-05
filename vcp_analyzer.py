@@ -92,6 +92,8 @@ class VCPResult:
     last_candle: str = "neutral"
     tier_used: str = ""            # "quant_fail" | "haiku_rejected" | "sonnet"
     rs_rating: float = 0.0         # RS rating from screener (for final sort priority)
+    quality_score: int = 0             # Sonnet quality score 1-5
+    rs_line_at_high: bool = False      # RS line at 52-week high (Minervini signal)
 
     @property
     def risk_reward(self) -> float:
@@ -107,6 +109,40 @@ class VCPResult:
                 f"entry=${self.breakout_level:.2f} SL=${self.stop_loss:.2f} "
                 f"depth={self.pattern_depth_pct:.1%} contractions={self.contractions}"
                 f" candle={self.last_candle}{vol_tag} [{self.tier_used}]")
+
+
+def _atr_adjusted_stop(df: pd.DataFrame, entry: float, pivot_stop: float) -> float:
+    """
+    Validate and tighten the VCP pivot stop using ATR.
+
+    Rules:
+      - Stop must be at least 1× ATR below entry (not too tight — allows normal noise)
+      - Stop must be at most 3× ATR below entry (not too loose — limits risk)
+      - If pivot_stop violates either bound, clamp to the ATR bound
+    """
+    try:
+        recent = df.tail(15)
+        high   = recent["High"]
+        low    = recent["Low"]
+        close  = recent["Close"].shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - close).abs(),
+            (low  - close).abs(),
+        ], axis=1).max(axis=1)
+        atr = float(tr.mean())
+        if atr <= 0:
+            return pivot_stop
+        min_stop = entry - 1.0 * atr   # floor: can't be tighter than 1 ATR
+        max_stop = entry - 3.0 * atr   # ceiling: can't be wider than 3 ATR
+        if pivot_stop > min_stop:
+            return min_stop            # too tight — widen slightly
+        if pivot_stop < max_stop:
+            return max_stop            # too loose — tighten to 3 ATR
+        return pivot_stop              # within healthy range
+    except Exception:
+        return pivot_stop              # never block on error
+
 
 
 # ── Tier 0: Quantitative pre-filter ──────────────────────────────────────────
@@ -444,6 +480,8 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
             tier_used="sonnet",
         )
 
+    quality   = int(s_data.get("quality_score", 0))
+    stop_loss = _atr_adjusted_stop(df, breakout, stop_loss)  # clamp to 1-3 ATR
     passed = confirmed and confidence >= min_conf and breakout > stop_loss
     result = VCPResult(
         symbol=symbol, passed=passed, current_price=price,
@@ -455,6 +493,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
         fail_reason="" if passed else f"sonnet_rejected_conf={confidence:.0%}",
         breakout_volume=breakout_vol, last_candle=last_candle,
         tier_used="sonnet",
+        quality_score=quality,
     )
 
     if passed:
@@ -476,7 +515,8 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50) -> list[VCPResult]:
         _log.info("[vcp] %d/%d: %s", i, len(candidates), trend.symbol)
         last_candle = getattr(trend, "last_candle", "neutral")
         result = analyze(trend.symbol, trend.df, last_candle=last_candle)
-        result.rs_rating = getattr(trend, "rs_rating", 0.0)
+        result.rs_rating      = getattr(trend, "rs_rating", 0.0)
+        result.rs_line_at_high = getattr(trend, "rs_line_at_high", False)
         results.append(result)
         time.sleep(0.3)  # gentle rate-limit
 

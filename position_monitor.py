@@ -135,7 +135,8 @@ def _place_market_sell(symbol: str, qty: int) -> bool:
         return False
 
 
-def _place_stop(symbol: str, qty: int, stop_price: float) -> bool:
+def _place_stop(symbol: str, qty: int, stop_price: float) -> str | None:
+    """Place hard stop. Returns Alpaca order ID on success, None on failure."""
     try:
         body = {
             "symbol": symbol,
@@ -150,14 +151,17 @@ def _place_stop(symbol: str, qty: int, stop_price: float) -> bool:
             json=body, headers=_alpaca_headers(), timeout=10
         )
         r.raise_for_status()
-        _log.info("[monitor] Stop $%.2f placed on %s (%d shares)", stop_price, symbol, qty)
-        return True
+        order_id = r.json().get("id")
+        _log.info("[monitor] Stop $%.2f placed on %s (%d shares) id=%s",
+                  stop_price, symbol, qty, order_id)
+        return order_id
     except Exception as e:
         _log.warning("[monitor] place_stop(%s) error: %s", symbol, e)
-        return False
+        return None
 
 
-def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> bool:
+def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> str | None:
+    """Place trailing stop. Returns Alpaca order ID on success, None on failure."""
     trail_val = round(trail_pct * 100, 1)
     try:
         body = {
@@ -173,11 +177,29 @@ def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> bool:
             json=body, headers=_alpaca_headers(), timeout=10
         )
         r.raise_for_status()
-        _log.info("[monitor] Trailing stop %.0f%% placed on %s (%d shares)",
-                  trail_val, symbol, qty)
-        return True
+        order_id = r.json().get("id")
+        _log.info("[monitor] Trailing stop %.0f%% placed on %s (%d shares) id=%s",
+                  trail_val, symbol, qty, order_id)
+        return order_id
     except Exception as e:
         _log.warning("[monitor] trailing_stop(%s) error: %s", symbol, e)
+        return None
+
+
+def _stop_order_alive(order_id: str) -> bool:
+    """Return True if the Alpaca order exists and is still open/pending."""
+    if not order_id:
+        return False
+    try:
+        r = requests.get(
+            f"{_alpaca_base()}/orders/{order_id}",
+            headers=_alpaca_headers(), timeout=8
+        )
+        if r.status_code == 404:
+            return False
+        data = r.json()
+        return data.get("status") in ("new", "accepted", "pending_new", "held")
+    except Exception:
         return False
 
 
@@ -285,10 +307,17 @@ def check_positions() -> None:
                    symbol, qty, avg_cost, cur_price, pnl_pct * 100)
 
         # ── Step A: Initial trailing stop (placed once when position first seen) ──
-        if not sym.get("trailing_stop_placed"):
+        # If we have a saved order ID, verify it still lives in Alpaca before re-placing.
+        if not sym.get("trailing_stop_placed") or (
+            sym.get("trailing_stop_placed") and
+            sym.get("stop_order_id") and
+            not _stop_order_alive(sym["stop_order_id"])
+        ):
             _cancel_stop_orders(symbol)
-            if _place_trailing_stop(symbol, qty, trail_pct):
+            oid = _place_trailing_stop(symbol, qty, trail_pct)
+            if oid:
                 sym["trailing_stop_placed"] = True
+                sym["stop_order_id"] = oid
                 changed = True
 
         # ── Step B: Partial exit at +partial_trigger (default +15%) ──────────────
@@ -302,12 +331,17 @@ def check_positions() -> None:
                 changed = True
                 _log.info("[monitor] ✓ %s partial exit: sold %d @ $%.2f (+%.1f%%)",
                           symbol, sell_qty, cur_price, pnl_pct * 100)
-                # Replace trailing stop for remaining qty
+                # Replace trailing stop for remaining qty — tighter after locking profits
                 remaining = qty - sell_qty
                 if remaining > 0:
+                    tight_trail = cfg.get("trailing_stop_after_partial", 0.05)
                     _cancel_stop_orders(symbol)
-                    _place_trailing_stop(symbol, remaining, trail_pct)
+                    oid2 = _place_trailing_stop(symbol, remaining, tight_trail)
                     sym["trailing_stop_placed"] = True
+                    if oid2:
+                        sym["stop_order_id"] = oid2
+                    _log.info("[monitor] %s trailing stop tightened to %.0f%% after partial exit",
+                              symbol, tight_trail * 100)
 
         # ── Step C: Move stop to breakeven at +breakeven_trigger (default +8%) ───
         elif pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
@@ -315,8 +349,10 @@ def check_positions() -> None:
             remaining = qty - sym.get("partial_qty", 0)
             if remaining > 0:
                 _cancel_stop_orders(symbol)
-                if _place_stop(symbol, remaining, breakeven):
+                oid3 = _place_stop(symbol, remaining, breakeven)
+                if oid3:
                     sym["breakeven_done"] = True
+                    sym["stop_order_id"] = oid3
                     changed = True
                     _log.info("[monitor] %s stop moved to breakeven $%.2f (+%.1f%%)",
                               symbol, breakeven, pnl_pct * 100)
