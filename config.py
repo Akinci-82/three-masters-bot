@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 """
 Three Masters Bot — Configuration
 API keys and settings. Loaded from environment variables.
