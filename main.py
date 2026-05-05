@@ -407,7 +407,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # ── Layer 3 + Execution: Tudor Jones — Size + Place Orders ────────────────
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
-    from risk_manager import position_size, register_trade
+    from risk_manager import position_size, register_trade, check_can_trade
     from broker import place_buy_stop, place_sell_stop, cancel_all_orders
     from config import RISK
 
