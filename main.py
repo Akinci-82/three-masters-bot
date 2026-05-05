@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 Three Masters Bot — Main Orchestrator
-Runs daily at 22:30 CEST — right after US market close.
-Orders placed are GTC buy-stops for the next trading day.
+Runs daily at 22:30 CEST (after US market close, daily bars finalized).
 
 Flow:
   1. [Simons]      Fetch OHLCV for 500+ stocks, apply Trend Template
   2. [Minervini]   Analyze trend-passed stocks for VCP patterns via Claude AI
   3. [Tudor Jones] Size positions: risk 1-2% of capital per trade
-  4. [Execution]   Place buy-stop orders at breakout levels
+  4. [Execution]   Place GTC buy-stop orders at breakout levels
   5. [Report]      Send Telegram summary + save daily log
+
+Background:
+  - Position monitor runs every 15 min during US market hours
+    (partial exit at +15%, trailing stop 7%, breakeven at +8%)
 """
 from __future__ import annotations
 import json
@@ -18,8 +21,9 @@ import logging.handlers
 import os
 import signal
 import sys
+import threading
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
@@ -27,8 +31,10 @@ sys.path.insert(0, str(BASE_DIR))
 
 from config import (
     LOG_DIR, REPORT_DIR, CHART_DIR,
-    DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     LOG_LEVEL, LOG_MAX_MB, LOG_BACKUPS,
+    MONITOR,
 )
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -56,7 +62,9 @@ def _setup_logging():
     root.addHandler(handler)
     root.addHandler(console)
 
+
 _log = logging.getLogger("three_masters")
+
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 def _tg(msg: str) -> bool:
@@ -75,13 +83,17 @@ def _tg(msg: str) -> bool:
         return False
 
 
-# ── Shutdown flag ─────────────────────────────────────────────────────────────
+# ── Shutdown ──────────────────────────────────────────────────────────────────
 _SHUTDOWN = False
+_monitor_stop = threading.Event()
+
 
 def _signal_handler(sig, frame):
     global _SHUTDOWN
     _log.info("[main] Signal %s — shutting down gracefully.", sig)
     _SHUTDOWN = True
+    _monitor_stop.set()
+
 
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT,  _signal_handler)
@@ -138,7 +150,6 @@ def run_daily():
         _log.info("[simons] Universe: %d symbols", len(symbols))
         screen_results = screen_universe(symbols=symbols)
         trend_passed = [r for r in screen_results if r.passed]
-        trend_failed = len(screen_results) - len(trend_passed)
         report["trend_passed"] = [r.symbol for r in trend_passed]
         _log.info("[simons] %d/%d passed Trend Template", len(trend_passed), len(screen_results))
         _log.info("[simons] Top 10: %s", [r.symbol for r in trend_passed[:10]])
@@ -160,7 +171,7 @@ def run_daily():
     _log.info("\n[LAYER 2 — MINERVINI] VCP pattern analysis...")
     try:
         from vcp_analyzer import batch_analyze
-        # Limit to top 40 by RS rating to control API costs
+        # Limit to top 40 by RS rating — controls Claude API cost
         top_candidates = sorted(trend_passed, key=lambda r: -r.rs_rating)[:40]
         vcp_results = batch_analyze(top_candidates, max_symbols=40)
         vcp_passed  = [r for r in vcp_results if r.passed]
@@ -186,7 +197,7 @@ def run_daily():
     from broker import place_buy_stop, place_sell_stop, cancel_all_orders
     from config import RISK
 
-    # Cancel any stale buy-stops from previous day
+    # Cancel any stale buy-stops from the previous day
     cancelled = cancel_all_orders()
     if cancelled:
         _log.info("[main] Cancelled %d stale orders", cancelled)
@@ -195,8 +206,8 @@ def run_daily():
     held_symbols  = {p["symbol"] for p in positions}
     max_new_pos   = RISK["max_positions"] - len(positions)
 
-    # Sort VCP results by confidence × RS_rating (best quality first)
-    vcp_sorted = sorted(vcp_passed, key=lambda r: -r.confidence)
+    # Sort VCP results: breakout volume + confidence first
+    vcp_sorted = sorted(vcp_passed, key=lambda r: (-(1 if r.breakout_volume else 0), -r.confidence))
 
     for vcp in vcp_sorted:
         if len(orders_placed) >= max_new_pos:
@@ -207,7 +218,7 @@ def run_daily():
             _log.info("[main] %s already held — skipping.", vcp.symbol)
             continue
 
-        # Check risk limits
+        # Check portfolio heat and daily limits
         can, reason = check_can_trade(portfolio_value, RISK["risk_per_trade_pct"])
         if not can:
             _log.warning("[main] Cannot trade: %s", reason)
@@ -225,10 +236,11 @@ def run_daily():
             continue
 
         if sizing["notional"] > cash * 0.95:
-            _log.info("[main] %s notional $%.0f > cash $%.0f — skip", vcp.symbol, sizing["notional"], cash)
+            _log.info("[main] %s notional $%.0f > cash $%.0f — skip",
+                      vcp.symbol, sizing["notional"], cash)
             continue
 
-        # Place buy-stop at breakout level
+        # Place GTC buy-stop at breakout level
         buy_order = place_buy_stop(vcp.symbol, sizing["shares"], vcp.breakout_level)
         if not buy_order:
             continue
@@ -239,26 +251,33 @@ def run_daily():
         register_trade(vcp.symbol, sizing["risk_pct"])
 
         order_rec = {
-            "symbol": vcp.symbol,
-            "shares": sizing["shares"],
-            "buy_stop": vcp.breakout_level,
-            "stop_loss": vcp.stop_loss,
-            "target": sizing["target_price"],
-            "risk_amount": sizing["risk_amount"],
-            "risk_pct": sizing["risk_pct"],
-            "rr_ratio": sizing["rr_ratio"],
-            "vcp_confidence": vcp.confidence,
-            "vcp_notes": vcp.ai_reasoning[:100],
-            "buy_order_id": buy_order.get("id"),
-            "sl_order_id": sl_order.get("id") if sl_order else None,
+            "symbol":        vcp.symbol,
+            "shares":        sizing["shares"],
+            "buy_stop":      vcp.breakout_level,
+            "stop_loss":     vcp.stop_loss,
+            "target":        sizing["target_price"],
+            "risk_amount":   sizing["risk_amount"],
+            "risk_pct":      sizing["risk_pct"],
+            "rr_ratio":      sizing["rr_ratio"],
+            "vcp_confidence":vcp.confidence,
+            "breakout_vol":  vcp.breakout_volume,
+            "last_candle":   vcp.last_candle,
+            "vcp_notes":     vcp.ai_reasoning[:100],
+            "buy_order_id":  buy_order.get("id"),
+            "sl_order_id":   sl_order.get("id") if sl_order else None,
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
         held_symbols.add(vcp.symbol)
 
-        _log.info("[main] ✅ %s | %d sh | buy-stop=$%.2f | SL=$%.2f | TP=$%.2f | risk=$%.0f (%.1f%%)",
-                  vcp.symbol, sizing["shares"], vcp.breakout_level, vcp.stop_loss,
-                  sizing["target_price"], sizing["risk_amount"], sizing["risk_pct"] * 100)
+        vol_tag = " 🔥" if vcp.breakout_volume else ""
+        _log.info(
+            "[main] ✅ %s | %d sh | buy-stop=$%.2f | SL=$%.2f | TP=$%.2f | "
+            "risk=$%.0f (%.1f%%) | candle=%s%s",
+            vcp.symbol, sizing["shares"], vcp.breakout_level, vcp.stop_loss,
+            sizing["target_price"], sizing["risk_amount"], sizing["risk_pct"] * 100,
+            vcp.last_candle, vol_tag,
+        )
 
     report["orders_placed"] = orders_placed
     report["completed_at"] = datetime.utcnow().isoformat()
@@ -286,11 +305,12 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         "",
     ]
     for o in orders:
+        vol_tag = " 🔥" if o.get("breakout_vol") else ""
         lines.append(
-            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}\n"
+            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}{vol_tag}\n"
             f"     SL=${o['stop_loss']:.2f} | TP=${o['target']:.2f} | "
             f"Risk=${o['risk_amount']:.0f} ({o['risk_pct']*100:.1f}%) | {o['rr_ratio']:.1f}R\n"
-            f"     _{o['vcp_notes'][:80]}_"
+            f"     candle={o.get('last_candle','?')} | _{o['vcp_notes'][:80]}_"
         )
     if not orders:
         lines.append("No new orders — conditions not met.")
@@ -301,45 +321,68 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 def _seconds_until_trigger() -> int:
-    """Seconds until next 22:30 CEST trigger (after US market close)."""
+    """Seconds until next 22:30 CEST trigger, skipping weekends."""
     import pytz
     cet = pytz.timezone("Europe/Stockholm")
     now_cet = datetime.now(cet)
-    target  = now_cet.replace(hour=DAILY_TRIGGER_HOUR_CET, minute=DAILY_TRIGGER_MIN_CET, second=0, microsecond=0)
+    target  = now_cet.replace(
+        hour=DAILY_TRIGGER_HOUR_CET,
+        minute=DAILY_TRIGGER_MIN_CET,
+        second=0, microsecond=0,
+    )
     if now_cet >= target:
-        # Already past today's trigger — schedule for next occurrence
-        from datetime import timedelta
         target += timedelta(days=1)
 
-    # Skip weekends: if target lands on Saturday (5) or Sunday (6), push to Monday
-    from datetime import timedelta as _td
-    while target.weekday() in (5, 6):
-        target += _td(days=1)
+    # Skip weekend days (Saturday=5, Sunday=6 in Python weekday())
+    while target.weekday() >= 5:
+        target += timedelta(days=1)
 
     return int((target - now_cet).total_seconds())
 
 
+# ── Position monitor ──────────────────────────────────────────────────────────
+def _start_position_monitor() -> threading.Thread | None:
+    if not MONITOR.get("enabled", True):
+        return None
+    from position_monitor import run_monitor
+    interval = MONITOR.get("interval_minutes", 15)
+    t = threading.Thread(
+        target=run_monitor,
+        args=(interval, _monitor_stop),
+        daemon=True,
+        name="position-monitor",
+    )
+    t.start()
+    _log.info("[main] Position monitor started (every %d min during market hours)", interval)
+    return t
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     _setup_logging()
     _log.info("=" * 70)
-    _log.info("  Three Masters Bot — Starting scheduler")
-    _log.info("  Daily trigger: %02d:00 CET", DAILY_TRIGGER_HOUR_CET)
+    _log.info("  Three Masters Bot — Starting")
+    _log.info("  Daily scan:  %02d:%02d CEST (after US close)",
+              DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET)
+    _log.info("  Position monitor: every %d min during market hours",
+              MONITOR.get("interval_minutes", 15))
     _log.info("=" * 70)
 
-    # Allow --run-now flag for immediate execution (testing / manual trigger)
+    # --run-now: immediate execution for testing / manual trigger
     if "--run-now" in sys.argv:
-        _log.info("[main] --run-now flag detected — running immediately")
+        _log.info("[main] --run-now flag — executing immediately")
         run_daily()
         return
 
+    # Start intraday position monitor background thread
+    _start_position_monitor()
+
     while not _SHUTDOWN:
         wait_sec = _seconds_until_trigger()
-        next_run = datetime.utcnow().replace(microsecond=0)
-        _log.info("[main] Next run in %dh %dm (%s UTC)",
-                  wait_sec // 3600, (wait_sec % 3600) // 60, next_run)
+        _log.info("[main] Next scan in %dh %dm", wait_sec // 3600, (wait_sec % 3600) // 60)
         _tg(f"⏰ Three Masters — next scan in {wait_sec//3600}h {(wait_sec%3600)//60}m")
 
-        # Sleep in 60-second intervals so SIGTERM is handled promptly
+        # Sleep in 60-second chunks so SIGTERM is handled promptly
         elapsed = 0
         while elapsed < wait_sec and not _SHUTDOWN:
             time.sleep(min(60, wait_sec - elapsed))
@@ -351,7 +394,7 @@ def main():
         try:
             run_daily()
         except Exception as e:
-            _log.exception("[main] Daily run failed: %s", e)
+            _log.exception("[main] Daily run crashed: %s", e)
             _tg(f"❌ Three Masters — daily run crashed: {e}")
 
     _log.info("[main] Shutdown complete.")
