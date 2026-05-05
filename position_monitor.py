@@ -188,12 +188,27 @@ def check_positions() -> None:
     if not _market_is_open():
         return
 
-    # Sync bot state with Alpaca before every monitoring cycle
+    # Sync MUST succeed — never manage positions with unverified state.
+    # SyncError means Alpaca is unreachable: skip this cycle entirely.
+    from position_sync import sync_all, SyncError
     try:
-        from position_sync import sync_all
         sync_all()
-    except Exception as e:
-        _log.warning("[monitor] sync_all failed: %s", e)
+    except SyncError as e:
+        _log.error("[monitor] SYNC FAILED — skipping cycle: %s", e)
+        try:
+            import requests, os
+            token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+            if token and chat_id:
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "parse_mode": "Markdown",
+                          "text": f"🚨 *Three Masters — Monitor sync FAILED*\n`{e}`\nCycle skipped — positions NOT managed this tick."},
+                    timeout=8,
+                )
+        except Exception:
+            pass
+        return   # skip entire monitoring cycle — do NOT touch orders
 
     positions = _get_positions()
     if not positions:

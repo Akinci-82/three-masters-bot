@@ -326,10 +326,20 @@ def run_daily():
         _save_report(report)
         return
 
-    # ── Position sync — reconcile bot state with Alpaca before touching risk ──
-    from position_sync import sync_all as _sync_all, log_full_state
-    _sync_all()
-    log_full_state()
+    # ── Position sync — MUST succeed before any trading is allowed ───────────
+    # SyncError means Alpaca is unreachable — abort the scan entirely.
+    # Never proceed with unverified state, especially with real money.
+    from position_sync import sync_all as _sync_all, log_full_state, SyncError
+    try:
+        _sync_all()
+        log_full_state()
+    except SyncError as e:
+        msg = f"SYNC FAILED — scan aborted, no orders placed: {e}"
+        _log.error("[main] %s", msg)
+        _tg(f"🚨 *Three Masters — SYNC FAILURE*\n`{e}`\nScan aborted — no orders placed.")
+        report["errors"].append(f"sync_failed: {e}")
+        _save_report(report)
+        return
 
     # ── Risk state ────────────────────────────────────────────────────────────
     from risk_manager import check_can_trade, daily_reset, get_state
