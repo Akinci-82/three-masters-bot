@@ -343,7 +343,7 @@ def run_daily():
 
     # ── Risk state ────────────────────────────────────────────────────────────
     from risk_manager import check_can_trade, daily_reset, get_state
-    daily_reset()
+    daily_reset(portfolio_value)   # stores day_start_equity for close_trade P&L tracking
     risk_state = get_state()
 
     # ── Hard timeout ceiling: 20 min for the entire scan ─────────────────────

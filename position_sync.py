@@ -160,15 +160,27 @@ def sync_all() -> dict:
         risk["open_risk_pct"] = sum(risk["positions_risk"].values())
         changes["ghost_orders_removed"] = sorted(ghosts)
 
-    orphans = held_syms - tracked
-    if orphans:
-        _log.warning("[sync] ORPHAN positions added to risk_state: %s", orphans)
-        for sym in orphans:
+    # Orphan filled positions: Alpaca has a position, bot has no risk entry
+    orphan_pos = held_syms - tracked
+    if orphan_pos:
+        _log.warning("[sync] ORPHAN positions added to risk_state: %s", orphan_pos)
+        for sym in orphan_pos:
             risk["positions_risk"][sym] = RISK["risk_per_trade_pct"]
         risk["open_risk_pct"] = sum(risk["positions_risk"].values())
-        changes["orphans_added"] = sorted(orphans)
+        changes["orphans_added"] = list(changes.get("orphans_added", [])) + sorted(orphan_pos)
 
-    if ghosts or orphans:
+    # Orphan pending orders: buy-stop exists in Alpaca but not tracked in risk_state.
+    # Happens if bot crashed between place_buy_stop() and register_trade().
+    # Without this, risk budget is under-counted → over-trading possible.
+    orphan_orders = buy_syms - tracked - held_syms
+    if orphan_orders:
+        _log.warning("[sync] ORPHAN buy-orders added to risk_state: %s", orphan_orders)
+        for sym in orphan_orders:
+            risk["positions_risk"][sym] = RISK["risk_per_trade_pct"]
+        risk["open_risk_pct"] = sum(risk["positions_risk"].values())
+        changes["orphans_added"] = sorted(set(changes.get("orphans_added", [])) | orphan_orders)
+
+    if ghosts or orphan_pos or orphan_orders:
         _save_risk(risk)
 
     # ── 2. Reconcile monitor_state ────────────────────────────────────────────

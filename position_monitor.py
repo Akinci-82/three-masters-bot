@@ -241,6 +241,7 @@ def check_positions() -> None:
             "breakeven_done":        False,
             "trailing_stop_placed":  False,
         })
+        sym["last_price"] = cur_price   # keep last known price for close_trade P&L
 
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
                    symbol, qty, avg_cost, cur_price, pnl_pct * 100)
@@ -282,13 +283,23 @@ def check_positions() -> None:
                     _log.info("[monitor] %s stop moved to breakeven $%.2f (+%.1f%%)",
                               symbol, breakeven, pnl_pct * 100)
 
-    # Clean up state for positions that are now closed
+    # Clean up state for positions that are now closed — call close_trade()
+    # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.
     open_syms = {p["symbol"] for p in positions}
     for sym in list(state.keys()):
         if sym not in open_syms:
-            del state[sym]
-            changed = True
-            _log.info("[monitor] %s closed — removed from state", sym)
+            sym_data = state.pop(sym)
+            changed  = True
+            avg_cost  = sym_data.get("avg_cost", 0)
+            last_price = sym_data.get("last_price", avg_cost)
+            pnl_pct   = ((last_price - avg_cost) / avg_cost) if avg_cost > 0 else 0.0
+            try:
+                from risk_manager import close_trade
+                from broker import get_account
+                portfolio_value = get_account()["portfolio_value"]
+                close_trade(sym, pnl_pct, portfolio_value)   # start_value read from risk_state
+            except Exception as e:
+                _log.warning("[monitor] close_trade %s failed: %s", sym, e)
 
     if changed:
         _save_state(state)

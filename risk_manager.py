@@ -155,14 +155,16 @@ def register_trade(symbol: str, risk_pct: float):
     _log.info("[risk] %s opened — open_risk=%.1f%%", symbol, state["open_risk_pct"] * 100)
 
 
-def close_trade(symbol: str, pnl_pct: float, portfolio_value: float, start_value: float):
+def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
+                start_value: float | None = None):
     """Call when a position is closed."""
     state = _load()
     state.get("positions_risk", {}).pop(symbol, None)
     state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
 
-    # Update daily P&L
-    daily_pnl = (portfolio_value - start_value) / start_value if start_value else 0
+    # Use day_start_equity stored at daily_reset() if caller doesn't know it
+    start = start_value or state.get("day_start_equity", portfolio_value)
+    daily_pnl = (portfolio_value - start) / start if start else 0
     state["daily_pnl_pct"] = daily_pnl
 
     if pnl_pct < 0:
@@ -171,19 +173,23 @@ def close_trade(symbol: str, pnl_pct: float, portfolio_value: float, start_value
         state["consecutive_losses"] = 0
 
     _save(state)
+    _log.info("[risk] %s closed | pnl=%.1f%% | heat now=%.1f%% | day_pnl=%.1f%%",
+              symbol, pnl_pct * 100, state["open_risk_pct"] * 100, daily_pnl * 100)
 
 
 def get_state() -> dict:
     return _load()
 
 
-def daily_reset():
+def daily_reset(portfolio_value: float = 0.0):
     """Call at start of each trading day to reset daily counters."""
     state = _load()
     state["date"] = str(date.today())
     state["daily_pnl_pct"] = 0.0
     state["trading_halted"] = False
     state["halt_reason"] = ""
+    if portfolio_value > 0:
+        state["day_start_equity"] = portfolio_value   # used by close_trade for daily P&L
     _save(state)
     _log.info("[risk] Daily reset complete")
 
