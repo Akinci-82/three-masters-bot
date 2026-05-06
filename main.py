@@ -210,6 +210,45 @@ def _send_morning_briefing() -> None:
         else:
             lines.append("\nNo open positions")
 
+        # ── Pre-market gap check: cancel buy-stops that have already gapped up ──
+        from config import MONITOR as _mcfg
+        gap_threshold = _mcfg.get("premarket_gap_pct", 0.02)
+        gapped_out = []
+        if buy_stops:
+            try:
+                import yfinance as _yf
+                for o in list(buy_stops):
+                    sym    = o["symbol"]
+                    stop_p = float(o.get("stop_price", 0))
+                    if stop_p <= 0:
+                        continue
+                    try:
+                        pre = _yf.Ticker(sym).fast_info.get("last_price", None)
+                        if pre and pre > stop_p * (1 + gap_threshold):
+                            # Stock has gapped above stop — cancel to avoid chasing
+                            from broker import cancel_all_orders
+                            from risk_manager import get_state as _grs, _load as _lrs, _save as _srs
+                            cancel_all_orders(sym)
+                            rs = _lrs()
+                            rs.get("positions_risk", {}).pop(sym, None)
+                            rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                            _srs(rs)
+                            buy_stops.remove(o)
+                            gapped_out.append((sym, pre, stop_p))
+                            _log.info("[briefing] PRE-MARKET GAP: %s $%.2f >> stop $%.2f — order cancelled",
+                                      sym, pre, stop_p)
+                    except Exception:
+                        pass
+            except Exception as e:
+                _log.debug("[briefing] Pre-market price check failed: %s", e)
+
+        if gapped_out:
+            lines.append(f"")
+            lines.append(f"*⚡ Gap-cancelled orders:*")
+            for sym, pre, stop in gapped_out:
+                pct = (pre - stop) / stop * 100
+                lines.append(f"  ❌ *{sym}* pre-market ${pre:.2f} (+{pct:.1f}% above stop ${stop:.2f}) — order cancelled")
+
         if buy_stops:
             lines.append(f"\n*Pending buy-stops ({len(buy_stops)}):*")
             for o in buy_stops[:6]:
@@ -268,6 +307,30 @@ def _send_weekly_report(portfolio_value: float) -> None:
             except Exception:
                 pass
 
+        # ── Read all trade journal entries (full history, not just this week) ──
+        total_trades = wins = losses = 0
+        win_r_sum = loss_r_sum = 0.0
+        journal_file = LOG_DIR / "trade_journal.jsonl"
+        if journal_file.exists():
+            for line in journal_file.read_text().splitlines():
+                try:
+                    t = json.loads(line)
+                    total_trades += 1
+                    r = t.get("r_multiple", 0)
+                    if t.get("pnl_pct", 0) >= 0:
+                        wins += 1
+                        win_r_sum += r
+                    else:
+                        losses += 1
+                        loss_r_sum += r
+                except Exception:
+                    pass
+
+        win_rate   = wins / total_trades if total_trades else 0.0
+        avg_win_r  = win_r_sum / wins if wins else 0.0
+        avg_loss_r = loss_r_sum / losses if losses else 0.0
+        expectancy = (win_rate * avg_win_r) + ((1 - win_rate) * avg_loss_r)
+
         ret_line = _equity_return_str(portfolio_value)
         lines = [
             f"📊 *Three Masters — Weekly Summary*",
@@ -280,6 +343,12 @@ def _send_weekly_report(portfolio_value: float) -> None:
         ]
         if errors_total:
             lines.append(f"Errors: {errors_total}")
+        if total_trades > 0:
+            lines.append(f"")
+            lines.append(f"*All-time trade stats ({total_trades} closed):*")
+            lines.append(f"Win rate: {win_rate:.0%}  ({wins}W / {losses}L)")
+            lines.append(f"Avg win: {avg_win_r:+.2f}R  |  Avg loss: {avg_loss_r:+.2f}R")
+            lines.append(f"Expectancy: {expectancy:+.2f}R per trade")
         lines.append(f"")
         if ret_line:
             lines.append(ret_line)
@@ -331,6 +400,50 @@ def _adaptive_risk_pct(confidence: float, base_pct: float) -> float:
     if confidence >= 0.70:
         return min(base_pct * (7 / 6), 0.020)   # good setup → ~1.75%
     return base_pct                               # standard → 1.5%
+
+
+def _consecutive_loss_factor(losses: int) -> float:
+    """Tudor Jones: reduce position size after losing streaks to protect capital."""
+    if losses >= 3:
+        return 0.33   # 3+ losses → 33% of normal size
+    if losses == 2:
+        return 0.50   # 2 losses → 50% of normal size
+    if losses == 1:
+        return 0.75   # 1 loss → 75% of normal size
+    return 1.00       # no streak → full size
+
+
+def _is_correlated(candidate: str, held: set, threshold: float = 0.80) -> bool:
+    """
+    Return True if candidate has pearson r >= threshold with any currently-held symbol
+    based on 60 trading days of returns.  If data fetch fails, returns False (don't block).
+    """
+    if not held:
+        return False
+    try:
+        import yfinance as yf
+        import pandas as pd
+        syms = [candidate] + list(held)
+        df = yf.download(syms, period="3mo", interval="1d",
+                         auto_adjust=True, progress=False)["Close"]
+        if isinstance(df, pd.Series):
+            return False  # only one column
+        rets = df.pct_change().dropna()
+        if candidate not in rets.columns:
+            return False
+        cand_col = rets[candidate]
+        for sym in held:
+            if sym not in rets.columns:
+                continue
+            corr = float(cand_col.corr(rets[sym]))
+            if corr >= threshold:
+                _log.info("[main] %s skipped — corr=%.2f with %s (>= %.0f%%)",
+                          candidate, corr, sym, threshold * 100)
+                return True
+        return False
+    except Exception as e:
+        _log.debug("[main] Correlation check failed for %s: %s", candidate, e)
+        return False
 
 
 def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
@@ -550,6 +663,15 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
     max_per_sector = RISK.get("max_positions_per_sector", 2)
 
+    # Tudor Jones: reduce sizing after losing streaks
+    from risk_manager import get_state as _get_rs
+    _rs_now = _get_rs()
+    loss_streak = _rs_now.get("consecutive_losses", 0)
+    loss_factor = _consecutive_loss_factor(loss_streak)
+    if loss_streak > 0:
+        _log.info("[main] Loss streak %d — sizing factor %.0f%%",
+                  loss_streak, loss_factor * 100)
+
     orders_placed = []
 
     # Sort: RS-line-at-new-high > breakout-volume > confidence > RS rating
@@ -579,9 +701,14 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                       vcp.symbol, sec, sector_counts.get(sec, 0), max_per_sector)
             continue
 
-        # Adaptive risk: scale by VCP confidence, then by market regime
+        # Correlation check: skip if too similar to any held position
+        if _is_correlated(vcp.symbol, held_symbols):
+            _log.info("[main] %s skipped — high correlation with existing position", vcp.symbol)
+            continue
+
+        # Adaptive risk: scale by VCP confidence, market regime, and loss streak
         base_risk = RISK["risk_per_trade_pct"]
-        risk_pct  = _adaptive_risk_pct(vcp.confidence, base_risk) * regime_size_factor
+        risk_pct  = _adaptive_risk_pct(vcp.confidence, base_risk) * regime_size_factor * loss_factor
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:

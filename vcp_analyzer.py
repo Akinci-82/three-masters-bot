@@ -94,6 +94,7 @@ class VCPResult:
     rs_rating: float = 0.0         # RS rating from screener (for final sort priority)
     quality_score: int = 0             # Sonnet quality score 1-5
     rs_line_at_high: bool = False      # RS line at 52-week high (Minervini signal)
+    vol_at_multiweek_low: bool = False  # volume dried up to multi-week lows (ideal VCP)
 
     @property
     def risk_reward(self) -> float:
@@ -220,19 +221,26 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
     vol_last = float(volume.tail(10).mean())
     vol_declining = vol_last < vol_ma * 0.85
 
+    # Volume dry-up to multi-week lows: last 5 days avg < 60% of 100-day avg
+    vol_100d = float(volume.tail(100).mean()) if len(volume) >= 100 else vol_ma
+    vol_5d   = float(volume.tail(5).mean())
+    vol_at_multiweek_low = vol_5d < vol_100d * 0.60
+
     breakout_vol  = _check_breakout_volume(df, cfg.get("breakout_volume_min", 1.5))
     breakout_lvl  = float(high.tail(20).max())
     stop_loss_raw = float(low.tail(20).min())
 
     return True, {
-        "contractions":       n_contractions,
-        "pattern_depth_pct":  depth,
-        "tight_rng_pct":      tight_rng,
-        "seg_ranges":         seg_ranges,
-        "vol_declining":      vol_declining,
-        "breakout_volume":    breakout_vol,
-        "breakout_level":     breakout_lvl,
-        "stop_loss_candidate": stop_loss_raw,
+        "contractions":           n_contractions,
+        "pattern_depth_pct":      depth,
+        "tight_rng_pct":          tight_rng,
+        "seg_ranges":             seg_ranges,
+        "vol_declining":          vol_declining,
+        "vol_at_multiweek_low":   vol_at_multiweek_low,
+        "vol_5d_vs_100d_pct":     round(vol_5d / vol_100d, 3) if vol_100d > 0 else 1.0,
+        "breakout_volume":        breakout_vol,
+        "breakout_level":         breakout_lvl,
+        "stop_loss_candidate":    stop_loss_raw,
     }
 
 
@@ -265,6 +273,8 @@ def _build_haiku_prompt(symbol: str, df: pd.DataFrame, quant: dict,
     vol_note = ""
     if quant.get("breakout_volume"):
         vol_note = " | BREAKOUT VOL surge today (≥1.5x avg)"
+    elif quant.get("vol_at_multiweek_low"):
+        vol_note = " | volume at multi-week lows (ideal VCP dryup)"
     elif quant.get("vol_declining"):
         vol_note = " | volume drying up in tight zone"
 
@@ -332,7 +342,9 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict,
     vol_ctx = ""
     if quant.get("breakout_volume"):
         vol_ctx = "\n- **TODAY'S VOLUME**: Breakout surge ≥1.5× 20-day avg — active breakout"
-    if quant.get("vol_declining"):
+    if quant.get("vol_at_multiweek_low"):
+        vol_ctx += "\n- **VOLUME DRY-UP**: Last 5-day avg <60% of 100-day avg — textbook VCP volume contraction"
+    elif quant.get("vol_declining"):
         vol_ctx += "\n- **VOLUME TREND**: Volume drying up in tight zone (bullish)"
 
     candle_ctx = ""
@@ -483,6 +495,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
     quality   = int(s_data.get("quality_score", 0))
     stop_loss = _atr_adjusted_stop(df, breakout, stop_loss)  # clamp to 1-3 ATR
     passed = confirmed and confidence >= min_conf and breakout > stop_loss
+    vol_multiweek = quant.get("vol_at_multiweek_low", False)
     result = VCPResult(
         symbol=symbol, passed=passed, current_price=price,
         confidence=confidence, breakout_level=breakout, stop_loss=stop_loss,
@@ -494,6 +507,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
         breakout_volume=breakout_vol, last_candle=last_candle,
         tier_used="sonnet",
         quality_score=quality,
+        vol_at_multiweek_low=vol_multiweek,
     )
 
     if passed:

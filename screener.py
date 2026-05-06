@@ -185,7 +185,14 @@ def _check_weekly_context(symbol: str) -> tuple[bool, str]:
             return False, f"weekly_price_below_MA40w(${ma40w:.0f})"
         if ma10w < ma40w:
             return False, "weekly_MA10w_below_MA40w"
-        return True, "weekly_ok"
+        # Tight base check: last 4 weeks H-L range < 15% of price
+        last4w  = df_w.tail(4)
+        wk_high = float(last4w["High"].max())
+        wk_low  = float(last4w["Low"].min())
+        wk_rng  = (wk_high - wk_low) / price_w if price_w > 0 else 1.0
+        if wk_rng > 0.15:
+            return False, f"weekly_base_too_wide_{wk_rng:.1%}"
+        return True, f"weekly_ok_tight_{wk_rng:.1%}"
     except Exception as e:
         return True, f"weekly_check_error:{e}"   # don't block on error
 

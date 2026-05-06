@@ -93,6 +93,11 @@ MONITOR = {
     "trailing_stop_type":     "percent",   # Alpaca native trailing stop type
     # Hard stop upgrade: move stop to breakeven after +8%
     "breakeven_trigger":      0.08,
+    # Time stop: close stagnant positions (Minervini 3-4 week rule)
+    "time_stop_trading_days": 15,     # max holding days with no breakout
+    "time_stop_min_gain_pct":  0.02,  # only close if gain < 2% (not a winner)
+    # Pre-market gap check: cancel buy-stop if stock gaps above stop
+    "premarket_gap_pct":       0.02,  # cancel if stock >2% above stop price
 }
 
 # ── Universe ─────────────────────────────────────────────────────────────────

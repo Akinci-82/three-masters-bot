@@ -243,6 +243,17 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
         _log.warning("[monitor] Journal write failed: %s", e)
 
 
+def _trading_days_held(entry_date_str: str) -> int:
+    """Return number of US trading days since entry_date (excluding weekends, not calendar)."""
+    try:
+        import numpy as np
+        entry = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
+        today = datetime.now(_ET).date()
+        return int(np.busday_count(entry.isoformat(), today.isoformat()))
+    except Exception:
+        return 0
+
+
 def check_positions() -> None:
     """Run one monitoring cycle. Called every 15 min during market hours."""
     if not _market_is_open():
@@ -300,6 +311,7 @@ def check_positions() -> None:
             "partial_done":          False,
             "breakeven_done":        False,
             "trailing_stop_placed":  False,
+            "entry_date":            datetime.now(_ET).strftime("%Y-%m-%d"),
         })
         sym["last_price"] = cur_price   # keep last known price for close_trade P&L
 
@@ -356,6 +368,39 @@ def check_positions() -> None:
                     changed = True
                     _log.info("[monitor] %s stop moved to breakeven $%.2f (+%.1f%%)",
                               symbol, breakeven, pnl_pct * 100)
+
+        # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
+        time_stop_days = cfg.get("time_stop_trading_days", 15)
+        time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
+        entry_date_str = sym.get("entry_date", "")
+        if (entry_date_str
+                and not sym.get("partial_done")
+                and pnl_pct < time_stop_gain):
+            days_held = _trading_days_held(entry_date_str)
+            if days_held >= time_stop_days:
+                remaining = qty - sym.get("partial_qty", 0)
+                _log.warning("[monitor] TIME STOP %s — held %d days, pnl=%.1f%%",
+                             symbol, days_held, pnl_pct * 100)
+                _cancel_stop_orders(symbol)
+                if remaining > 0 and _place_market_sell(symbol, remaining):
+                    sym["time_stopped"] = True
+                    changed = True
+                    try:
+                        import requests as _req, os as _os
+                        tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
+                        cid = _os.getenv("TELEGRAM_CHAT_ID", "")
+                        if tok and cid:
+                            _req.post(
+                                f"https://api.telegram.org/bot{tok}/sendMessage",
+                                json={"chat_id": cid, "parse_mode": "Markdown",
+                                      "text": (f"⏰ *Time Stop — {symbol}*\n"
+                                               f"Held {days_held} trading days, "
+                                               f"gain only {pnl_pct*100:+.1f}%\n"
+                                               f"Minervini rule: exit stagnant positions")},
+                                timeout=8,
+                            )
+                    except Exception:
+                        pass
 
     # Clean up state for positions that are now closed — call close_trade()
     # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.
