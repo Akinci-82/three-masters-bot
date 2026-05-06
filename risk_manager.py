@@ -48,7 +48,8 @@ def _save(data: dict):
 
 
 def position_size(portfolio_value: float, entry_price: float,
-                  stop_loss: float, risk_pct: float | None = None) -> dict:
+                  stop_loss: float, risk_pct: float | None = None,
+                  measured_move_pct: float = 0.0) -> dict:
     """
     Calculate Tudor Jones position size.
 
@@ -79,8 +80,12 @@ def position_size(portfolio_value: float, entry_price: float,
         shares   = notional / entry_price
         risk_amount = shares * risk_per_share
 
-    measured_move = (entry_price - stop_loss) * 3   # 3R target
-    rr_ratio      = measured_move / risk_per_share
+    if 0.05 < measured_move_pct < 1.50:
+        # Use Claude's base height estimate; always at least 2R
+        measured_move = max(entry_price * measured_move_pct, risk_per_share * 2)
+    else:
+        measured_move = risk_per_share * 3  # default 3R when no Claude estimate
+    rr_ratio = measured_move / risk_per_share
 
     return {
         "shares": int(shares),

@@ -280,6 +280,91 @@ def _maybe_morning_briefing() -> None:
     _send_morning_briefing()
 
 
+# Opening range filter: cancel buy-stop if price hasn't confirmed above trigger
+# after 30 minutes of trading (10:00 ET = 16:00 CEST). Prevents gap-and-trap fills.
+_last_or_check_date: date | None = None
+
+
+def _opening_range_check() -> None:
+    """
+    Run 30 minutes after US open (16:00 CEST / 10:00 ET).
+    For each pending GTC buy-stop: if the current price is BELOW the stop trigger,
+    the opening range has not confirmed → cancel the order to avoid trapping.
+    If price is above or already filled, leave it alone.
+    """
+    global _last_or_check_date
+    try:
+        import pytz, yfinance as yf
+        from broker import get_open_orders, cancel_all_orders
+        from risk_manager import get_state as _grs, _load as _lrs, _save as _srs
+
+        buy_stops = [o for o in get_open_orders()
+                     if o.get("side") == "buy" and o.get("type") == "stop"]
+        if not buy_stops:
+            return
+
+        cancelled = []
+        kept      = []
+        for o in buy_stops:
+            sym    = o["symbol"]
+            stop_p = float(o.get("stop_price", 0))
+            if stop_p <= 0:
+                continue
+            try:
+                # Use 1-minute bars to get current intraday price
+                df1 = yf.Ticker(sym).history(period="1d", interval="1m",
+                                              auto_adjust=True)
+                if df1.empty:
+                    kept.append(sym)
+                    continue
+                cur_price = float(df1["Close"].iloc[-1])
+                if cur_price < stop_p * 0.998:  # price is below trigger
+                    cancel_all_orders(sym)
+                    rs = _lrs()
+                    rs.get("positions_risk", {}).pop(sym, None)
+                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                    _srs(rs)
+                    cancelled.append((sym, cur_price, stop_p))
+                    _log.info("[or_check] CANCEL %s — price $%.2f < stop $%.2f "
+                              "(no opening range confirmation)",
+                              sym, cur_price, stop_p)
+                else:
+                    kept.append(sym)
+                    _log.info("[or_check] KEEP %s — price $%.2f ≥ stop $%.2f ✓",
+                              sym, cur_price, stop_p)
+            except Exception as _e:
+                _log.debug("[or_check] %s price fetch failed: %s", sym, _e)
+                kept.append(sym)
+
+        if cancelled or kept:
+            lines = [f"🕙 *Opening Range Check (10:00 ET)*"]
+            for sym, cur, stop in cancelled:
+                pct = (stop - cur) / stop * 100
+                lines.append(f"  ❌ *{sym}* ${cur:.2f} ({pct:.1f}% below ${stop:.2f}) — order cancelled")
+            for sym in kept:
+                lines.append(f"  ✅ *{sym}* — confirmed above breakout level")
+            _tg("\n".join(lines))
+
+    except Exception as e:
+        _log.warning("[or_check] Opening range check failed: %s", e)
+
+
+def _maybe_opening_range_check() -> None:
+    """Trigger opening range filter at 16:00 CEST (10:00 ET), once per day."""
+    global _last_or_check_date
+    import pytz
+    now = datetime.now(pytz.timezone("Europe/Stockholm"))
+    if now.weekday() >= 5:
+        return
+    if not (now.hour == 16 and 0 <= now.minute <= 8):
+        return
+    today = now.date()
+    if _last_or_check_date == today:
+        return
+    _last_or_check_date = today
+    _opening_range_check()
+
+
 # ── Weekly performance report (sent after Friday's daily scan) ────────────────
 def _send_weekly_report(portfolio_value: float) -> None:
     """Summarise the week and send via Telegram."""
@@ -393,13 +478,46 @@ def _check_market_regime() -> tuple[str, float, float, float]:
         return "bull", 0.0, 0.0, 0.0
 
 
-def _adaptive_risk_pct(confidence: float, base_pct: float) -> float:
-    """Scale position risk 1.5-2% based on Sonnet VCP confidence."""
-    if confidence >= 0.85:
-        return min(base_pct * (4 / 3), 0.020)   # high conviction → up to 2%
-    if confidence >= 0.70:
-        return min(base_pct * (7 / 6), 0.020)   # good setup → ~1.75%
-    return base_pct                               # standard → 1.5%
+def _fetch_vix() -> float:
+    """Fetch latest VIX close. Returns 20.0 on failure (neutral assumption)."""
+    try:
+        import yfinance as yf
+        vix = yf.Ticker("^VIX").history(period="5d", interval="1d")
+        if not vix.empty:
+            return float(vix["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 20.0
+
+
+def _vix_size_factor(vix: float) -> float:
+    """Tudor Jones: scale down position sizes when volatility spikes.
+    VIX < 15  → full size (1.00)
+    VIX 15-20 → 0.90
+    VIX 20-25 → 0.80
+    VIX 25-30 → 0.65
+    VIX > 30  → 0.50  (fear regime — protect capital)
+    """
+    if vix < 15:
+        return 1.00
+    elif vix < 20:
+        return 0.90
+    elif vix < 25:
+        return 0.80
+    elif vix < 30:
+        return 0.65
+    return 0.50
+
+
+def _adaptive_risk_pct(composite: float, base_pct: float, vix: float = 20.0) -> float:
+    """Scale position risk 1.5–2% based on composite score, then VIX-adjusted."""
+    if composite >= 8.0:
+        score_factor = min(base_pct * (4 / 3), 0.020)
+    elif composite >= 7.0:
+        score_factor = min(base_pct * (7 / 6), 0.020)
+    else:
+        score_factor = base_pct
+    return score_factor * _vix_size_factor(vix)
 
 
 def _consecutive_loss_factor(losses: int) -> float:
@@ -411,6 +529,134 @@ def _consecutive_loss_factor(losses: int) -> float:
     if losses == 1:
         return 0.75   # 1 loss → 75% of normal size
     return 1.00       # no streak → full size
+
+
+# ── Three Masters composite scoring ──────────────────────────────────────────
+
+def _minervini_score(vcp) -> float:
+    """0–10, weight 60%. VCP setup quality from Haiku→Sonnet→Opus analysis."""
+    q      = min(max(getattr(vcp, "quality_score", 0), 0), 5) * 1.0
+    conf   = getattr(vcp, "confidence", 0.0) * 3.0
+    tight  = getattr(vcp, "tight_pct", 1.0)
+    tight_b = 1.0 if tight < 0.05 else (0.5 if tight < 0.07 else 0.0)
+    vol_b  = 0.5 if getattr(vcp, "vol_at_multiweek_low", False) else 0.0
+    bvol_b = 0.5 if getattr(vcp, "breakout_volume", False) else 0.0
+    rs_b   = 1.0 if getattr(vcp, "rs_line_at_high", False) else 0.0
+    return min(q + conf + tight_b + vol_b + bvol_b + rs_b, 10.0)
+
+
+def _simons_score(trend) -> float:
+    """0–10, weight 30%. Trend quality and relative strength (Simons layer)."""
+    rs     = getattr(trend, "rs_rating", 70.0)
+    rs_pts = min((rs - 70) / 29 * 4.0, 4.0)
+    rs_hi  = 2.0 if getattr(trend, "rs_line_at_high", False) else 0.0
+    rsi    = getattr(trend, "rsi", 65.0)
+    rsi_pts = 2.0 if rsi <= 65 else (1.0 if rsi <= 72 else 0.0)
+    pfh    = abs(getattr(trend, "pct_from_high", -0.25))
+    hi_pts = 1.5 if pfh <= 0.05 else (1.0 if pfh <= 0.10 else (0.5 if pfh <= 0.20 else 0.0))
+    slope  = getattr(trend, "ma200_slope_20d", 0.0)
+    sl_pts = 0.5 if slope > 0.005 else 0.0
+    return min(rs_pts + rs_hi + rsi_pts + hi_pts + sl_pts, 10.0)
+
+
+def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5) -> float:
+    """
+    0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
+    breadth_pct = fraction of screened universe with price > MA50.
+    """
+    reg_pts  = {"bull": 3.0, "neutral": 1.5, "bear": 0.0}.get(regime, 3.0)
+    losses   = risk_state.get("consecutive_losses", 0)
+    loss_pts = 3.0 if losses == 0 else (1.5 if losses == 1 else 0.0)
+    heat     = risk_state.get("open_risk_pct", 0.0)
+    heat_pts = 1.5 if heat < 0.02 else (0.75 if heat < 0.04 else 0.0)
+    # Market breadth: % of screened universe trading above MA50
+    # > 65% → healthy internals (+2), 45-65% → neutral (+1), < 45% → weak (+0)
+    breadth_pts = 2.0 if breadth_pct > 0.65 else (1.0 if breadth_pct > 0.45 else 0.0)
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts, 10.0)
+
+
+def _composite_score(vcp, trend, risk_state: dict, regime: str,
+                     sector_bonus: float = 0.0, breadth_pct: float = 0.5) -> float:
+    """
+    Three Masters weighted composite score (0–10).
+      Minervini 60% — VCP quality, confidence, handle tightness, volume
+      Simons     30% — RS strength, RS line at high, RSI quality, 52w proximity
+      Tudor      10% — market regime, loss streak, heat, market breadth
+      sector_bonus ±0.5 — sector outperforming/underperforming SPY
+    Minimum 5.0 required to place an order.
+    """
+    m = _minervini_score(vcp)
+    s = _simons_score(trend)
+    t = _tudor_score(risk_state, regime, breadth_pct)
+    return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
+
+
+# ── Sector rotation helpers ──────────────────────────────────────────────────
+# Keys are the exact strings yfinance returns for sector info
+_SECTOR_ETF_MAP = {
+    "Technology":             "XLK",
+    "Financial Services":     "XLF",
+    "Financials":             "XLF",   # legacy alias
+    "Healthcare":             "XLV",
+    "Health Care":            "XLV",   # legacy alias
+    "Energy":                 "XLE",
+    "Consumer Cyclical":      "XLY",
+    "Consumer Discretionary": "XLY",   # legacy alias
+    "Industrials":            "XLI",
+    "Basic Materials":        "XLB",
+    "Materials":              "XLB",   # legacy alias
+    "Real Estate":            "XLRE",
+    "Utilities":              "XLU",
+    "Consumer Defensive":     "XLP",
+    "Consumer Staples":       "XLP",   # legacy alias
+    "Communication Services": "XLC",
+}
+
+
+def _sector_momentum_scores() -> dict[str, float]:
+    """Return {etf: 1mo_return_vs_SPY} for all SPDR sector ETFs. Empty dict on failure."""
+    try:
+        import yfinance as yf
+        etfs = list(_SECTOR_ETF_MAP.values()) + ["SPY"]
+        df = yf.download(etfs, period="1mo", interval="1d",
+                         auto_adjust=True, progress=False)["Close"]
+        ret = df.iloc[-1] / df.iloc[0] - 1
+        spy_ret = float(ret.get("SPY", 0.0))
+        scores = {etf: round(float(ret.get(etf, 0.0)) - spy_ret, 4)
+                  for etf in _SECTOR_ETF_MAP.values()}
+        _log.info("[sector] momentum vs SPY: %s",
+                  {k: f"{v:+.1%}" for k, v in sorted(scores.items(), key=lambda x: -x[1])})
+        return scores
+    except Exception as e:
+        _log.debug("[sector] momentum fetch failed: %s", e)
+        return {}
+
+
+def _sector_bonus(symbol: str, sector_scores: dict[str, float]) -> float:
+    """
+    Composite bonus (±0.5) based on whether the stock's sector is outperforming SPY.
+    Uses get_sector() from screener; returns 0.0 silently on any failure.
+    """
+    if not sector_scores:
+        return 0.0
+    try:
+        from screener import get_sector
+        sector = get_sector(symbol)
+        etf = _SECTOR_ETF_MAP.get(sector)
+        if etf is None:
+            return 0.0
+        rel = sector_scores.get(etf, 0.0)
+        if rel > 0.015:
+            return 0.5
+        elif rel > 0.005:
+            return 0.25
+        elif rel < -0.015:
+            return -0.5
+        elif rel < -0.005:
+            return -0.25
+        return 0.0
+    except Exception:
+        return 0.0
 
 
 def _is_correlated(candidate: str, held: set, threshold: float = 0.80) -> bool:
@@ -575,6 +821,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
               cash: float, positions: list) -> None:
     """Inner scan — separated so the hard timeout can wrap it cleanly."""
 
+    _breadth_pct = 0.5   # updated after screener run
+    _current_vix = 20.0  # updated in scoring loop (also needs to be in scope here)
+
     # ── Layer 1: Simons — Trend Template screening ────────────────────────────
     _log.info("\n[LAYER 1 — SIMONS] Trend Template screening...")
     try:
@@ -583,6 +832,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.info("[simons] Universe: %d symbols", len(symbols))
         screen_results = screen_universe(symbols=symbols)
         trend_passed = [r for r in screen_results if r.passed]
+        # Market breadth: % of screened universe above MA50 (Tudor Jones signal)
+        _breadth_pct = (sum(1 for r in screen_results if r.price > r.ma50 > 0)
+                        / max(len(screen_results), 1))
+        _log.info("[tudor] Market breadth: %.0f%% of %d symbols above MA50",
+                  _breadth_pct * 100, len(screen_results))
         report["trend_passed"] = [r.symbol for r in trend_passed]
         _log.info("[simons] %d/%d passed Trend Template",
                   len(trend_passed), len(screen_results))
@@ -605,7 +859,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _log.info("\n[LAYER 2 — MINERVINI] VCP pattern analysis...")
     try:
         from vcp_analyzer import batch_analyze
-        top_candidates = sorted(trend_passed, key=lambda r: -r.rs_rating)[:40]
+        top_candidates = sorted(trend_passed, key=lambda r: -_simons_score(r))[:40]
+        trend_map      = {r.symbol: r for r in top_candidates}
         vcp_results = batch_analyze(top_candidates, max_symbols=40)
         vcp_passed  = [r for r in vcp_results if r.passed]
         report["vcp_passed"] = [r.symbol for r in vcp_passed]
@@ -674,14 +929,39 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     orders_placed = []
 
-    # Sort: RS-line-at-new-high > breakout-volume > confidence > RS rating
-    vcp_sorted = sorted(vcp_passed,
-                        key=lambda r: (-(1 if getattr(r, "rs_line_at_high", False) else 0),
-                                       -(1 if r.breakout_volume else 0),
-                                       -r.confidence,
-                                       -getattr(r, "rs_rating", 0)))
+    # ── Three Masters composite scoring: weight all three layers ─────────────
+    _rs_now = _get_rs()
+    _current_vix = _fetch_vix()
+    _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
+    sector_momentum = _sector_momentum_scores()
+    scored  = []
+    for vcp in vcp_passed:
+        trend_r = trend_map.get(vcp.symbol)
+        if trend_r is None:
+            scored.append((vcp, trend_r, 0.0))
+            continue
+        sec_bonus = _sector_bonus(vcp.symbol, sector_momentum)
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct)
+        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% → composite=%.2f",
+                  vcp.symbol,
+                  _minervini_score(vcp), _simons_score(trend_r),
+                  _tudor_score(_rs_now, regime, _breadth_pct), sec_bonus,
+                  _breadth_pct * 100, cs)
+        scored.append((vcp, trend_r, cs))
 
-    for vcp in vcp_sorted:
+    # Filter: require composite >= 5.0 (guards against weak Simons/Tudor context)
+    _MIN_COMPOSITE = 5.0
+    vcp_scored = [(v, t, cs) for v, t, cs in scored if cs >= _MIN_COMPOSITE]
+    below = [v.symbol for v, t, cs in scored if cs < _MIN_COMPOSITE]
+    if below:
+        _log.info("[score] Filtered out (composite < %.1f): %s", _MIN_COMPOSITE, below)
+
+    # Sort by composite descending — Minervini dominates but Simons/Tudor contribute
+    vcp_scored.sort(key=lambda x: -x[2])
+    _log.info("[score] Order of priority: %s",
+              [(v.symbol, cs) for v, t, cs in vcp_scored])
+
+    for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
             _log.info("[main] Max new positions reached (%d) — stopping.", RISK["max_positions"])
             break
@@ -706,9 +986,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             _log.info("[main] %s skipped — high correlation with existing position", vcp.symbol)
             continue
 
-        # Adaptive risk: scale by VCP confidence, market regime, and loss streak
+        # Adaptive risk: composite score → VIX-adjusted → regime/loss multipliers
         base_risk = RISK["risk_per_trade_pct"]
-        risk_pct  = _adaptive_risk_pct(vcp.confidence, base_risk) * regime_size_factor * loss_factor
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
@@ -716,7 +996,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             break
 
         try:
-            sizing = position_size(portfolio_value, vcp.breakout_level, vcp.stop_loss, risk_pct)
+            sizing = position_size(portfolio_value, vcp.breakout_level, vcp.stop_loss,
+                                   risk_pct, vcp.measured_move_pct)
         except ValueError as e:
             _log.warning("[main] %s sizing error: %s", vcp.symbol, e)
             continue
@@ -763,6 +1044,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "quality_score":  getattr(vcp, "quality_score", 0),
             "rs_line_high":   getattr(vcp, "rs_line_at_high", False),
             "adaptive_risk":  round(risk_pct, 4),
+            "composite_score": composite,
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
@@ -810,9 +1092,10 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         rs_hi    = " ⭐RS-HIGH" if o.get("rs_line_high") else ""
         qs_str   = f" Q{o['quality_score']}/5" if o.get("quality_score") else ""
         rs_str   = f" RS={o['rs_rating']:.0f}" if o.get("rs_rating") else ""
+        cs_str   = f" ⚡{o['composite_score']:.1f}/10" if o.get("composite_score") else ""
         sect     = f" [{o['sector']}]" if o.get("sector") else ""
         lines.append(
-            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}{vol_tag}{rs_hi}{qs_str}{rs_str}\n"
+            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}{vol_tag}{rs_hi}{qs_str}{rs_str}{cs_str}\n"
             f"     SL=${o['stop_loss']:.2f} | TP=${o['target']:.2f} | "
             f"Risk=${o['risk_amount']:.0f} ({o['risk_pct']*100:.1f}%) | {o['rr_ratio']:.1f}R{sect}\n"
             f"     candle={o.get('last_candle','?')} | _{o['vcp_notes'][:80]}_"
@@ -913,6 +1196,7 @@ def main():
             elapsed += 60
             _heartbeat()
             _maybe_morning_briefing()
+            _maybe_opening_range_check()
 
         if _SHUTDOWN:
             break

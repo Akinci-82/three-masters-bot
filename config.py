@@ -21,7 +21,8 @@ ALPACA_BASE_URL   = os.environ.get("THREE_MASTERS_ALPACA_URL", "https://paper-ap
 # ── Claude AI (Minervini VCP layer) ─────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
-CLAUDE_MODEL_DEEP = "claude-sonnet-4-6"
+CLAUDE_MODEL_DEEP  = "claude-sonnet-4-6"
+CLAUDE_MODEL_ULTRA = "claude-opus-4-7"
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -59,8 +60,10 @@ VCP = {
     "min_contraction_ratio":    0.50,
     "max_depth_from_high":      0.35,
     "volume_decline_required":  True,
-    "final_tight_pct":          0.10,
+    "final_tight_pct":          0.08,
     "lookback_days":            60,
+    "min_confidence":           0.65,
+    "min_quality_score":        3,
     "breakout_volume_min":      1.5,   # today's volume ≥ 1.5x avg = breakout confirmed
     # Candlestick confirmation on entry candle
     "require_bullish_candle":   True,  # last candle should be bullish (close > open)

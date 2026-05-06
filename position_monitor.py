@@ -214,8 +214,9 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
     partial_qty = sym_data.get("partial_qty", 0)
     exit_qty    = initial_qty - partial_qty
     pnl_dollar  = (last_price - avg_cost) * exit_qty if avg_cost > 0 else 0.0
-    # Approximate R-multiple using 7% initial risk (trailing stop pct)
-    risk_per_share = avg_cost * 0.07
+    # R-multiple uses actual VCP stop_loss from order report (falls back to 7% approx)
+    stop_loss      = sym_data.get("stop_loss", 0.0)
+    risk_per_share = (avg_cost - stop_loss) if stop_loss > 0 else avg_cost * 0.07
     r_multiple = (last_price - avg_cost) / risk_per_share if risk_per_share > 0 else 0.0
 
     entry = {
@@ -254,6 +255,34 @@ def _trading_days_held(entry_date_str: str) -> int:
         return 0
 
 
+def _lookup_position_metadata(symbol: str) -> dict:
+    """
+    Look up VCP stop_loss, quality_score, composite_score from recent daily reports.
+    Searches up to 10 calendar days back to find the order that opened this position.
+    """
+    from pathlib import Path
+    from datetime import date, timedelta
+    import json as _json
+    report_dir = Path(__file__).parent / "reports"
+    for days_ago in range(10):
+        d = date.today() - timedelta(days=days_ago)
+        rfile = report_dir / f"{d}.json"
+        if not rfile.exists():
+            continue
+        try:
+            data = _json.loads(rfile.read_text())
+            for order in data.get("orders_placed", []):
+                if order.get("symbol") == symbol:
+                    return {
+                        "stop_loss":       float(order.get("stop_loss", 0) or 0),
+                        "quality_score":   int(order.get("quality_score", 0) or 0),
+                        "composite_score": float(order.get("composite_score", 0) or 0),
+                    }
+        except Exception:
+            pass
+    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0}
+
+
 def check_positions() -> None:
     """Run one monitoring cycle. Called every 15 min during market hours."""
     if not _market_is_open():
@@ -288,8 +317,8 @@ def check_positions() -> None:
     from config import MONITOR as cfg
     trail_pct         = cfg.get("trailing_stop_pct", 0.07)
     breakeven_trigger = cfg.get("breakeven_trigger", 0.08)
-    partial_trigger   = cfg.get("partial_exit_trigger", 0.15)
     partial_pct       = cfg.get("partial_exit_pct", 0.50)
+    # composite-adjusted thresholds are set per-position inside the loop
 
     state = _load_state()
     changed = False
@@ -315,22 +344,60 @@ def check_positions() -> None:
         })
         sym["last_price"] = cur_price   # keep last known price for close_trade P&L
 
+        # On first encounter: look up VCP stop loss + quality from daily report
+        if not sym.get("_meta_loaded"):
+            meta = _lookup_position_metadata(symbol)
+            sym["_meta_loaded"]    = True
+            sym["stop_loss"]       = meta["stop_loss"]
+            sym["quality_score"]   = meta["quality_score"]
+            sym["composite_score"] = meta["composite_score"]
+            if meta["stop_loss"] > 0:
+                _log.info("[monitor] %s meta: SL=$%.2f Q%d composite=%.1f",
+                          symbol, meta["stop_loss"], meta["quality_score"],
+                          meta["composite_score"])
+            changed = True
+
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
                    symbol, qty, avg_cost, cur_price, pnl_pct * 100)
 
-        # ── Step A: Initial trailing stop (placed once when position first seen) ──
-        # If we have a saved order ID, verify it still lives in Alpaca before re-placing.
-        if not sym.get("trailing_stop_placed") or (
+        # Quality-adjusted exits: elite setups get more room to run
+        composite      = sym.get("composite_score", 0.0)
+        partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
+        time_stop_days  = 20   if composite >= 8.0 else cfg.get("time_stop_trading_days", 15)
+
+        # ── Step A: Initial stop (placed once when position first seen) ──────────
+        # Use HARD STOP at VCP pivot low if we have the planned stop from the order.
+        # This protects against false breakouts at exactly the level Minervini intends.
+        # Fall back to 7% trailing stop if no metadata (legacy or missing report).
+        stop_loss_level = sym.get("stop_loss", 0.0)
+        use_hard_stop   = (stop_loss_level > 0 and stop_loss_level < avg_cost * 0.99
+                           and not sym.get("breakeven_done")
+                           and not sym.get("partial_done"))
+
+        needs_stop = (not sym.get("trailing_stop_placed") or (
             sym.get("trailing_stop_placed") and
             sym.get("stop_order_id") and
             not _stop_order_alive(sym["stop_order_id"])
-        ):
+        ))
+
+        if needs_stop:
             _cancel_stop_orders(symbol)
-            oid = _place_trailing_stop(symbol, qty, trail_pct)
-            if oid:
-                sym["trailing_stop_placed"] = True
-                sym["stop_order_id"] = oid
-                changed = True
+            if use_hard_stop:
+                oid = _place_stop(symbol, qty, stop_loss_level)
+                if oid:
+                    sym["trailing_stop_placed"] = True
+                    sym["stop_order_id"] = oid
+                    sym["stop_type"] = "hard_pivot"
+                    changed = True
+                    _log.info("[monitor] %s HARD STOP at $%.2f (VCP pivot low)",
+                              symbol, stop_loss_level)
+            else:
+                oid = _place_trailing_stop(symbol, qty, trail_pct)
+                if oid:
+                    sym["trailing_stop_placed"] = True
+                    sym["stop_order_id"] = oid
+                    sym["stop_type"] = "trailing"
+                    changed = True
 
         # ── Step B: Partial exit at +partial_trigger (default +15%) ──────────────
         if pnl_pct >= partial_trigger and not sym.get("partial_done"):
@@ -370,7 +437,6 @@ def check_positions() -> None:
                               symbol, breakeven, pnl_pct * 100)
 
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
-        time_stop_days = cfg.get("time_stop_trading_days", 15)
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
         entry_date_str = sym.get("entry_date", "")
         if (entry_date_str
@@ -401,6 +467,56 @@ def check_positions() -> None:
                             )
                     except Exception:
                         pass
+
+        # ── Step E: Climax run / parabolic exit ────────────────────────────────
+        # If stock has moved ≥ 25% in the last 5 trading days AND we see 3 up-days
+        # in a row → climax run. Minervini sells into strength, not at the stop.
+        if (not sym.get("climax_exited")
+                and not sym.get("partial_done")
+                and pnl_pct >= 0.25):
+            try:
+                import yfinance as _yf
+                _df5 = _yf.Ticker(symbol).history(
+                    period="10d", interval="1d", auto_adjust=True)
+                if len(_df5) >= 5:
+                    _c5 = _df5["Close"]
+                    _v5 = _df5["Volume"]
+                    _vol_avg20 = float(_yf.Ticker(symbol).history(
+                        period="30d", interval="1d")["Volume"].mean())
+                    # 3 consecutive up-days AND last-day volume > 1.5× 20-day avg
+                    _three_up = all(
+                        _c5.iloc[i] > _c5.iloc[i-1]
+                        for i in range(-3, 0)
+                    )
+                    _vol_surge = (float(_v5.iloc[-1]) > _vol_avg20 * 1.5
+                                  if _vol_avg20 > 0 else False)
+                    if _three_up and _vol_surge:
+                        remaining = qty - sym.get("partial_qty", 0)
+                        _log.warning(
+                            "[monitor] CLIMAX RUN %s — +%.1f%% in 5d, 3 up-days, vol surge. "
+                            "Selling into strength (%d sh).",
+                            symbol, pnl_pct * 100, remaining)
+                        _cancel_stop_orders(symbol)
+                        if remaining > 0 and _place_market_sell(symbol, remaining):
+                            sym["climax_exited"] = True
+                            changed = True
+                            try:
+                                import requests as _req, os as _os
+                                tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
+                                cid = _os.getenv("TELEGRAM_CHAT_ID", "")
+                                if tok and cid:
+                                    _req.post(
+                                        f"https://api.telegram.org/bot{tok}/sendMessage",
+                                        json={"chat_id": cid, "parse_mode": "Markdown",
+                                              "text": (f"🚀 *Climax Run Exit — {symbol}*\n"
+                                                       f"3 up-days + volume surge at +{pnl_pct*100:.1f}%\n"
+                                                       f"Selling into strength — Minervini rule")},
+                                        timeout=8,
+                                    )
+                            except Exception:
+                                pass
+            except Exception as _e:
+                _log.debug("[monitor] Climax check %s failed: %s", symbol, _e)
 
     # Clean up state for positions that are now closed — call close_trade()
     # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.
