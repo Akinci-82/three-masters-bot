@@ -27,6 +27,11 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Weekly chart: last 4-week H-L range < 15% of price (tight base filter)
   • RS line (stock/SPY ratio) at 52-week high → priority flag
   • RS line at 52w high while price 3–15% below its high → rs_line_leading (strongest VCP signal)
+  • Weekly RS confirmation: resampled daily RS/SPY to weekly bars; daily+weekly both at 52w high
+    = institutional O'Neil confirmation → +3.0 Simons pts (vs +2.5 daily only)
+  • A/D ratio: up-volume / down-volume last 50 bars → >1.5×=+0.5 pts, >1.2×=+0.25 pts
+  • Short ratio (days-to-cover): ≥5d=+0.5 pts, ≥3d=+0.25 pts (squeeze fuel at breakout)
+  • Pre-earnings sweet spot: 4–8 weeks before report AND EPS growth ≥25% → +0.5 Simons pts
   • Fundamentals: reject if quarterly EPS decline > 10% (Minervini SEPA filter)
     Revenue + EPS growth data passed to Claude Sonnet prompt for context
     │
@@ -51,9 +56,11 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Bull (SPY ≥ MA200):         full sizing
   • Neutral (SPY 3–8% below):  ×0.75
   • Bear (SPY >8% below):       no new orders
-  • Sector momentum: 1-month return of 11 SPDR sector ETFs vs SPY
-    → sector outperforming >+1.5%:   +0.5 composite bonus
-    → sector underperforming <−1.5%: −0.5 composite penalty
+  • Sector momentum: 21-day return of 11 SPDR sector ETFs vs SPY
+    → Stage 2 required (sector ETF above MA200) for full positive bonus
+    → sector outperforming >+1.5% AND Stage 2:   +0.5 composite bonus
+    → sector outperforming >+1.5% NOT Stage 2:   +0.25 (muted bonus)
+    → sector underperforming <−1.5%:             −0.5 composite penalty
   • Market breadth: % of screened universe above MA50 (Tudor Jones signal)
     → >65% above MA50: +2 T-score pts  (healthy internals)
     → 45–65%: +1 pt                     (neutral)
@@ -62,14 +69,17 @@ A systematic swing trading bot combining three legendary investment philosophies
     ▼
 [Three Masters Composite Score (0–10)]
   • Minervini 60%: quality_score + confidence×3 + tight_bonus + vol_dryup + breakout_vol + rs_line_bonus
-  • Simons     30%: RS rating, RS line at high, RSI quality, 52w proximity, MA200 slope
-  • Tudor Jones 10%: regime, consecutive losses, portfolio heat, market breadth
-  • Sector bonus ±0.25/±0.5 added to composite
-  • Minimum composite 5.0 to place any order
+  • Simons     30%: RS rating, RS line at high, RSI quality, 52w proximity, MA200 slope,
+                    A/D ratio, short interest, weekly RS, pre-earnings sweet spot
+  • Tudor Jones 10%: regime, consecutive losses, portfolio heat, market breadth, PCR
+  • Sector bonus ±0.25/±0.5 added to composite (Stage 2 required for full positive)
+  • PCR (CBOE Put/Call ratio): >1.0 fear=+0.5 Tudor pts; <0.6 greed=−0.5 Tudor pts
+  • Minimum composite 5.0 (dynamic: auto-raised to 6.5 if low-score bucket negative)
     │
     ▼
 [Tudor Jones] Position Sizing + Risk Checks
   • Adaptive risk: composite ≥8.0 → 2%, ≥7.0 → 1.75%, else 1.5%
+  • Half-Kelly sizing: risk × Kelly(win_rate, avg_R) / 2; clamped [0.5×, 1.0×] (min 10 trades)
   • VIX scaling:  VIX <15 → 100%, 15–20 → 90%, 20–25 → 80%, 25–30 → 65%, >30 → 50%
   • Consecutive loss factor: 1 loss=75%, 2=50%, 3+=33% of base risk
   • Market regime size factor: neutral=×0.75
@@ -83,6 +93,8 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Smart order management: keeps valid unchanged orders, cancels stale/moved ones
   • Morning briefing (09:15 ET): pre-market gap check — cancel if stock >2% above stop
   • Opening range filter (10:00 ET): cancel if stock still below breakout after 30 min
+  • Fill-slippage guard: on first monitor cycle after fill — >2% above planned buy-stop = close
+    immediately; >1% = warning only (Tudor Jones discipline)
 ```
 
 ## Exit Rules (position_monitor.py — every 15 min during market hours)
@@ -118,8 +130,15 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | Component | Points |
 |-----------|--------|
 | RS rating 70–99 | 0–4.0 |
-| RS line at 52-week high | +1.5 |
-| RS line leading price (at high while price 3–15% below) | +2.5 |
+| RS line leading price + weekly confirmed | +3.0 |
+| RS line leading price only | +2.5 |
+| RS line at 52-week high + weekly confirmed | +2.0 |
+| RS line at 52-week high only | +1.5 |
+| A/D ratio ≥ 1.5× (strong accumulation) | +0.5 |
+| A/D ratio ≥ 1.2× | +0.25 |
+| Short ratio ≥ 5 days-to-cover | +0.5 |
+| Short ratio ≥ 3 days-to-cover | +0.25 |
+| Pre-earnings sweet spot (4–8w + EPS ≥25%) | +0.5 |
 | EPS quarterly growth ≥ 25% | +1.0 |
 | EPS quarterly growth ≥ 10% | +0.5 |
 | RSI ≤ 65 | +2.0 (→ +1.0 if ≤ 72) |
@@ -133,12 +152,15 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | Zero consecutive losses | +3.0 (→ +1.5 after 1 loss) |
 | Portfolio heat < 2% | +1.5 (→ +0.75 if < 4%) |
 | Market breadth > 65% above MA50 | +2.0 (→ +1.0 if > 45%) |
+| PCR > 1.0 (fear/contrarian buy signal) | +0.5 |
+| PCR < 0.6 (greed/complacency) | −0.5 |
 
 ## Risk Parameters
 
 | Rule | Value |
 |------|-------|
 | Base risk per trade | 1.5% (→ 1.75% at composite ≥ 7.0, → 2% at composite ≥ 8.0) |
+| Kelly factor | Half-Kelly from journal win rate + avg R; clamped [0.5×, 1.0×] |
 | VIX scaling | 50–100% of position size (steps: <15, 15–20, 20–25, 25–30, >30) |
 | Max positions | 8 |
 | Max per sector | 2 |
