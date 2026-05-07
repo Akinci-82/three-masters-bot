@@ -26,6 +26,9 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Weekly chart: price above MA10w + MA40w
   • Weekly chart: last 4-week H-L range < 15% of price (tight base filter)
   • RS line (stock/SPY ratio) at 52-week high → priority flag
+  • RS line at 52w high while price 3–15% below its high → rs_line_leading (strongest VCP signal)
+  • Fundamentals: reject if quarterly EPS decline > 10% (Minervini SEPA filter)
+    Revenue + EPS growth data passed to Claude Sonnet prompt for context
     │
     ▼  (typically 20–60 stocks pass)
 [Minervini — 60%] VCP Analysis — Tier 0 → 1 → 2 → 3
@@ -86,13 +89,17 @@ A systematic swing trading bot combining three legendary investment philosophies
 
 | Step | Trigger | Action |
 |------|---------|--------|
+| **0** | ≤ 5 days to earnings AND profitable | Move stop to breakeven (earnings protection) |
+| **0** | ≤ 3 days to earnings AND flat/loss | **Close position** (earnings protection) |
 | **A** | Position first seen | **Hard stop at VCP pivot low**; fallback to 7% trailing if no pivot data |
-| **B** | Gain ≥ +15% (or +20% for composite ≥ 8.0) | Sell 50%, tighten trailing stop to 5% |
-| **C** | Gain ≥ +8% | Move stop to breakeven |
+| **B1** | Gain ≥ +10% | Sell 33%, hold runner |
+| **B2** | Gain ≥ measured move (floor +20%) | Sell another 33%, tighten trailing stop to 5% for remaining 34% |
+| **C** | Gain ≥ +8% (if B1 not done yet) | Move stop to breakeven |
 | **D** | Held ≥ 15 days (20 days if composite ≥ 8.0) AND gain < +2% | **Time stop — exit stagnant position** |
-| **E** | Gain ≥ +25% AND 3 consecutive up-days AND volume >1.5× avg | **Climax run — sell into strength** |
+| **E** | Gain ≥ +25% AND 3 consecutive up-days AND volume >1.5× avg | **Climax run — sell all into strength** |
+| **F** | Gain ≥ +4% AND not yet pyramided | **Add 25% shares at confirmation** — same pivot stop, subject to heat cap |
 
-Quality-adjusted exits: elite setups (composite ≥ 8.0) get wider room — partial at +20%, time stop at 20 days.
+Three-stage exit: lock 33% early, capture measured move with second 33%, ride runner with 5% trail.
 
 ## Composite Scoring Details
 
@@ -111,7 +118,10 @@ Quality-adjusted exits: elite setups (composite ≥ 8.0) get wider room — part
 | Component | Points |
 |-----------|--------|
 | RS rating 70–99 | 0–4.0 |
-| RS line at 52-week high | +2.0 |
+| RS line at 52-week high | +1.5 |
+| RS line leading price (at high while price 3–15% below) | +2.5 |
+| EPS quarterly growth ≥ 25% | +1.0 |
+| EPS quarterly growth ≥ 10% | +0.5 |
 | RSI ≤ 65 | +2.0 (→ +1.0 if ≤ 72) |
 | Within 5% of 52w high | +1.5 (→ +1.0 / +0.5 further out) |
 | MA200 slope positive | +0.5 |
@@ -201,7 +211,8 @@ Reads all-time `trade_journal.jsonl` and reports:
 
 | Hash | Description |
 |------|-------------|
-| *(latest)* | Composite scoring, VCP Opus tier, sector rotation, VIX scaling, breadth, climax exit, opening range filter, measured move |
+| `124857a` | EPS filter (SEPA), RS-line-leading signal, three-stage exit (33/33/34), pyramiding at +4%, earnings protection |
+| `ced84e2` | Composite scoring, VCP Opus tier, sector rotation, VIX scaling, breadth, climax exit, opening range filter, measured move |
 | `0f8a934` | 7 Minervini/Tudor Jones optimizations: time stop, loss sizing, win stats, gap check, vol dry-up, correlation, weekly base |
 | `fe05a3a` | Fix Stream API v3, dashboard port 5002 |
 | `e6e9cda` | Fill notifications, Telegram commands, dashboard, ATR stops, RS-line filter |
