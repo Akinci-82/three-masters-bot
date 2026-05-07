@@ -23,6 +23,8 @@ A systematic swing trading bot combining three legendary investment philosophies
   • RS rating ≥ 70 vs SPY
   • RSI ≤ 75 (not chasing extended stocks)
   • Earnings ≥ 7 days away
+  • IPO age: ≥ 240 trading bars required (≈1 year) — avoids thin history on recent listings
+  • Monthly Stage 2: price > MA10m + MA40m on 5-year monthly data → soft filter + +0.5 Simons pts
   • Weekly chart: price above MA10w + MA40w
   • Weekly chart: last 4-week H-L range < 15% of price (tight base filter)
   • RS line (stock/SPY ratio) at 52-week high → priority flag
@@ -32,6 +34,8 @@ A systematic swing trading bot combining three legendary investment philosophies
   • A/D ratio: up-volume / down-volume last 50 bars → >1.5×=+0.5 pts, >1.2×=+0.25 pts
   • Short ratio (days-to-cover): ≥5d=+0.5 pts, ≥3d=+0.25 pts (squeeze fuel at breakout)
   • Pre-earnings sweet spot: 4–8 weeks before report AND EPS growth ≥25% → +0.5 Simons pts
+  • EPS revision: forwardEps / trailingEps − 1 ≥ 15% → +0.5 Simons pts (analyst upgrading estimates)
+  • RS vs sector: stock outperformance vs own sector ETF >+5% → +0.5 Simons pts (sector leader)
   • Fundamentals: reject if quarterly EPS decline > 10% (Minervini SEPA filter)
     Revenue + EPS growth data passed to Claude Sonnet prompt for context
     │
@@ -74,6 +78,10 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Tudor Jones 10%: regime, consecutive losses, portfolio heat, market breadth, PCR
   • Sector bonus ±0.25/±0.5 added to composite (Stage 2 required for full positive)
   • PCR (CBOE Put/Call ratio): >1.0 fear=+0.5 Tudor pts; <0.6 greed=−0.5 Tudor pts
+  • 10Y yield slope: 20-day change >+50 bps = rates rising fast → −1.0 Tudor pts
+  • VIX slope: 5-day change >+3 pts = fear building → −0.5 Tudor pts
+  • Consecutive wins factor: 2 wins=×1.10, 3+ wins=×1.25 sizing (press winners)
+  • Super-sector concentration guard: max 60% of positions in one super-sector (growth/cyclical/defensive/financial)
   • Minimum composite 5.0 (dynamic: auto-raised to 6.5 if low-score bucket negative)
     │
     ▼
@@ -89,8 +97,9 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Correlation guard: skip if r ≥ 0.80 with any held position (60-day returns)
     │
     ▼
-[Execution] GTC buy-stop orders at VCP breakout level
+[Execution] GTC buy-stop-limit orders at VCP breakout level (limit = stop × 1.005 — caps fill slippage)
   • Smart order management: keeps valid unchanged orders, cancels stale/moved ones
+  • Stale composite cancel: retained orders whose symbol's composite drops below MIN_COMPOSITE are cancelled that evening
   • Morning briefing (09:15 ET): pre-market gap check — cancel if stock >2% above stop
   • Opening range filter (10:00 ET): cancel if stock still below breakout after 30 min
   • Fill-slippage guard: on first monitor cycle after fill — >2% above planned buy-stop = close
@@ -103,7 +112,9 @@ A systematic swing trading bot combining three legendary investment philosophies
 |------|---------|--------|
 | **0** | ≤ 5 days to earnings AND profitable | Move stop to breakeven (earnings protection) |
 | **0** | ≤ 3 days to earnings AND flat/loss | **Close position** (earnings protection) |
+| **G** | Overnight gap ≥ 12% AND in profit AND partial1 not done | Sell 50% into gap strength (mean-reversion protection) |
 | **A** | Position first seen | **Hard stop at VCP pivot low**; fallback to 7% trailing if no pivot data |
+| **A-trail** | 5+ trading days held, open profit >1%, stop not yet at breakeven | Ratchet stop up to most recent swing low − 1% (pivot trail, never widen) |
 | **B1** | Gain ≥ +10% | Sell 33%, hold runner |
 | **B2** | Gain ≥ measured move (floor +20%) | Sell another 33%, tighten trailing stop to 5% for remaining 34% |
 | **C** | Gain ≥ +8% (if B1 not done yet) | Move stop to breakeven |
@@ -144,6 +155,9 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | RSI ≤ 65 | +2.0 (→ +1.0 if ≤ 72) |
 | Within 5% of 52w high | +1.5 (→ +1.0 / +0.5 further out) |
 | MA200 slope positive | +0.5 |
+| Monthly Stage 2 (price > MA10m + MA40m) | +0.5 |
+| EPS revision (forwardEps/trailingEps − 1 ≥ 15%) | +0.5 |
+| RS vs sector outperformance > +5% | +0.5 |
 
 ### Tudor Jones score (0–10, weight 10%)
 | Component | Points |
@@ -154,6 +168,8 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | Market breadth > 65% above MA50 | +2.0 (→ +1.0 if > 45%) |
 | PCR > 1.0 (fear/contrarian buy signal) | +0.5 |
 | PCR < 0.6 (greed/complacency) | −0.5 |
+| 10Y yield slope > +50 bps (20-day) | −1.0 |
+| VIX slope > +3 pts (5-day) | −0.5 |
 
 ## Risk Parameters
 
@@ -172,6 +188,8 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | Breakeven stop | at +8% |
 | Time stop | 15 trading days with < +2% gain (20 days for elite setups) |
 | Climax run exit | +25% gain + 3 up-days + volume >1.5× avg |
+| Consecutive wins factor | 2 wins=×1.10, 3+ wins=×1.25 base risk (press winners) |
+| Super-sector guard | max 60% of positions in one super-sector (growth/cyclical/defensive/financial) |
 
 ## Daily Schedule
 
@@ -181,7 +199,7 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | 22:30 | FOMC/CPI check — if macro event within 2 days: scan runs but no orders placed |
 | 15:15 (09:15 ET) | Morning briefing — equity, positions, pre-market gap check |
 | 16:00 (10:00 ET) | Opening range filter — cancel unconfirmed buy-stops |
-| Market hours | Position monitor every 15 min — Steps 0/A/A+/B1/B2/C/D/E/F |
+| Market hours | Position monitor every 15 min — Steps 0/G/A/A-trail/A+/B1/B2/C/D/E/F |
 
 ## Telegram Commands
 
@@ -234,10 +252,37 @@ Results saved to `logs/feedback_state.json` for long-term calibration of scoring
 - **Dashboard**: http://docker-nuc:5002 (auto-refresh 60s)
 - **Paper account**: `THREE_MASTERS_ALPACA_API_KEY` (separate from other bots)
 
+## Patch 8 upgrades
+- **IPO age filter**: screener requires ≥240 daily bars (≈1 year); avoids thin-history stocks
+- **Monthly Stage 2**: 5-year monthly chart — price > MA10m + MA40m → soft filter + +0.5 Simons pts
+- **Rate slope**: 10Y yield (^TNX) 20-day change >+50 bps → −1.0 Tudor pts (tightening risk)
+- **Stop-limit orders**: buy-stop upgraded to buy-stop-limit (limit = stop × 1.005) — caps slippage on breakout gaps
+- **Stale composite cancel**: orders retained from previous nights cancelled if composite drops below MIN_COMPOSITE
+- **Pivot trailing stop (Step A-trail)**: after 5+ days with open profit, ratchet stop to most recent swing low − 1%
+- **Gap-up harvest (Step G)**: sell 50% if stock gaps up ≥12% overnight while profitable (mean-reversion protection)
+
+## Patch 9 upgrades
+- **VIX slope**: ^VIX 5-day change >+3 pts → −0.5 Tudor pts (fear building signal)
+- **EPS revision**: forwardEps/trailingEps − 1 ≥ 15% → +0.5 Simons pts (analyst estimate upgrades)
+- **RS vs sector**: stock outperformance vs own sector ETF >+5% → +0.5 Simons pts (sector leadership)
+- **Consecutive wins factor**: 2 wins=×1.10, 3+=×1.25 position sizing (press winners, mirrors loss-factor logic)
+- **Super-sector concentration guard**: groups sectors into growth/cyclical/defensive/financial; max 60% of max_positions in one super-sector
+- **Limit exits**: partial sales (B1/B2) use limit @ cur_price×0.999 with market-order fallback (better fills)
+- **Telegram proximity alerts**: once/day/position — ⚠️ within 2% of stop, 🎯 approaching +10% target, 📅 earnings 3–7 days
+
 ## Commit History
 
 | Hash | Description |
 |------|-------------|
+| `daed90c` | Patch 9: VIX slope, EPS revision, RS vs sector, win streak, super-sector, limit exits, Telegram alerts |
+| `dce9cef` | Patch 8: IPO filter, monthly Stage 2, rate slope, stop-limit orders, pivot trail stop, gap-up harvest |
+| `17e5639` | fix: remove market cap upper cap — $500M floor only |
+| `ce288cd` | docs: README update for Patch 7 (A/D ratio, weekly RS, PCR, Kelly, slippage guard) |
+| `5a87d18` | Patch 7 (cont): position monitor buy_stop, slippage guard, Kelly sizing |
+| `901473d` | Patch 7: A/D ratio, weekly RS, PCR, Kelly, dynamic threshold, sector Stage 2 |
+| `8ca809b` | docs: README for Patch 6 (market cap, power trend, FOMC blackout, MA20 trail, CwH) |
+| `d38697f` | Patch 6: market cap filter, power trend, FOMC blackout, choppy market, MA20 trail, CwH |
+| `f22c00b` | docs: README for Patch 5 (EPS filter, RS-leading, three-stage exit, pyramiding) |
 | `124857a` | EPS filter (SEPA), RS-line-leading signal, three-stage exit (33/33/34), pyramiding at +4%, earnings protection |
 | `ced84e2` | Composite scoring, VCP Opus tier, sector rotation, VIX scaling, breadth, climax exit, opening range filter, measured move |
 | `0f8a934` | 7 Minervini/Tudor Jones optimizations: time stop, loss sizing, win stats, gap check, vol dry-up, correlation, weekly base |
