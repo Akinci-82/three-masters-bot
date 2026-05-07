@@ -27,8 +27,6 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Weekly chart: last 4-week H-L range < 15% of price (tight base filter)
   • RS line (stock/SPY ratio) at 52-week high → priority flag
   • RS line at 52w high while price 3–15% below its high → rs_line_leading (strongest VCP signal)
-  • RS line slope improving 4w > 8w > 12w → rs_trending (+0.5 Simons pts)
-  • Market cap filter: $200M–$25B (Minervini sweet spot — exclude mega-caps)
   • Fundamentals: reject if quarterly EPS decline > 10% (Minervini SEPA filter)
     Revenue + EPS growth data passed to Claude Sonnet prompt for context
     │
@@ -42,7 +40,6 @@ A systematic swing trading bot combining three legendary investment philosophies
                          Volume per contraction, Handle identification,
                          Entry precision (handle HIGH + $0.01), Stop (handle LOW − $0.01),
                          Quality score 1–5, Measured move (base height / current price)
-                         Pattern type: VCP | Cup-with-Handle | Both
   • Tier 3 (Opus):   Final validation for quality_score ≥ 4 — confirms or vetoes Sonnet
   • Breakout level = handle HIGH + $0.01  (pivot, not 20-day high)
   • Stop loss       = handle LOW  − $0.01  (pivot, not 20-day low)
@@ -66,8 +63,7 @@ A systematic swing trading bot combining three legendary investment philosophies
 [Three Masters Composite Score (0–10)]
   • Minervini 60%: quality_score + confidence×3 + tight_bonus + vol_dryup + breakout_vol + rs_line_bonus
   • Simons     30%: RS rating, RS line at high, RSI quality, 52w proximity, MA200 slope
-  • Tudor Jones 10%: regime, consecutive losses, portfolio heat, breadth, power trend
-  • Power Trend bonus: SPY 21d EMA > 50d EMA ≥8 days → +1.0 Tudor pts
+  • Tudor Jones 10%: regime, consecutive losses, portfolio heat, market breadth
   • Sector bonus ±0.25/±0.5 added to composite
   • Minimum composite 5.0 to place any order
     │
@@ -78,9 +74,7 @@ A systematic swing trading bot combining three legendary investment philosophies
   • Consecutive loss factor: 1 loss=75%, 2=50%, 3+=33% of base risk
   • Market regime size factor: neutral=×0.75
   • Profit target: Claude's measured move estimate (base height / entry); floor at 2R
-  • Max positions: 8 | Max per sector: 2 (halved to 4 in choppy market)
-  • FOMC/CPI blackout: no new orders within 2 calendar days of macro event
-  • Choppy market: SPY ATR/price < 0.6% for 10 days → max_positions halved
+  • Max positions: 8 | Max per sector: 2
   • Portfolio heat cap: 8%
   • Correlation guard: skip if r ≥ 0.80 with any held position (60-day returns)
     │
@@ -98,7 +92,6 @@ A systematic swing trading bot combining three legendary investment philosophies
 | **0** | ≤ 5 days to earnings AND profitable | Move stop to breakeven (earnings protection) |
 | **0** | ≤ 3 days to earnings AND flat/loss | **Close position** (earnings protection) |
 | **A** | Position first seen | **Hard stop at VCP pivot low**; fallback to 7% trailing if no pivot data |
-| **A+** | Day 10+ with profit >2%, stop not yet at breakeven | **MA20 dynamic trail**: stop moved to MA20×0.98 (ratchet up only, once per day) |
 | **B1** | Gain ≥ +10% | Sell 33%, hold runner |
 | **B2** | Gain ≥ measured move (floor +20%) | Sell another 33%, tighten trailing stop to 5% for remaining 34% |
 | **C** | Gain ≥ +8% (if B1 not done yet) | Move stop to breakeven |
@@ -127,7 +120,6 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | RS rating 70–99 | 0–4.0 |
 | RS line at 52-week high | +1.5 |
 | RS line leading price (at high while price 3–15% below) | +2.5 |
-| RS trending up (slope improving 4w > 8w > 12w) | +0.5 |
 | EPS quarterly growth ≥ 25% | +1.0 |
 | EPS quarterly growth ≥ 10% | +0.5 |
 | RSI ≤ 65 | +2.0 (→ +1.0 if ≤ 72) |
@@ -141,7 +133,6 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | Zero consecutive losses | +3.0 (→ +1.5 after 1 loss) |
 | Portfolio heat < 2% | +1.5 (→ +0.75 if < 4%) |
 | Market breadth > 65% above MA50 | +2.0 (→ +1.0 if > 45%) |
-| Power Trend: SPY 21d EMA > 50d EMA ≥8 days (O'Neil) | +1.0 |
 
 ## Risk Parameters
 
@@ -149,7 +140,7 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 |------|-------|
 | Base risk per trade | 1.5% (→ 1.75% at composite ≥ 7.0, → 2% at composite ≥ 8.0) |
 | VIX scaling | 50–100% of position size (steps: <15, 15–20, 20–25, 25–30, >30) |
-| Max positions | 8 (halved to 4 in choppy market) |
+| Max positions | 8 |
 | Max per sector | 2 |
 | Portfolio heat cap | 8% |
 | Daily loss halt | −4% |
@@ -165,9 +156,10 @@ Three-stage exit: lock 33% early, capture measured move with second 33%, ride ru
 | Time (CEST) | Event |
 |-------------|-------|
 | 22:30 | Daily scan — Simons → Minervini → Tudor Jones → GTC orders placed |
+| 22:30 | FOMC/CPI check — if macro event within 2 days: scan runs but no orders placed |
 | 15:15 (09:15 ET) | Morning briefing — equity, positions, pre-market gap check |
 | 16:00 (10:00 ET) | Opening range filter — cancel unconfirmed buy-stops |
-| Market hours | Position monitor every 15 min — Steps A–E |
+| Market hours | Position monitor every 15 min — Steps 0/A/A+/B1/B2/C/D/E/F |
 
 ## Telegram Commands
 
@@ -187,7 +179,7 @@ three-masters-bot/
 ├── screener.py           # Simons: Trend Template + RS-line + weekly tight base
 ├── vcp_analyzer.py       # Minervini: VCP Tier 0→1→2→3, measured move, pivot levels
 ├── risk_manager.py       # Tudor Jones: VIX-scaled sizing, circuit breakers, trade journal
-├── position_monitor.py   # Exit engine: Steps A–E (pivot stop → partial → BE → time → climax)
+├── position_monitor.py   # Exit engine: Steps 0/A/A+/B1/B2/C/D/E/F (earnings guard → pivot stop → MA20 trail → partials → time → climax → pyramid)
 ├── position_sync.py      # Bulletproof Alpaca↔state sync (SyncError blocks all trading)
 ├── broker.py             # Alpaca order execution
 ├── telegram_commands.py  # Two-way Telegram bot
@@ -198,6 +190,7 @@ three-masters-bot/
     ├── risk_state.json       # Live heat, losses, daily P&L
     ├── monitor_state.json    # Per-position tracking (entry_date, stop IDs)
     ├── trade_journal.jsonl   # Completed trades with R-multiples
+    ├── feedback_state.json   # Weekly score-bucket stats (avg R / win rate per composite range)
     └── sync_audit.jsonl      # Every sync run (audit trail)
 ```
 
@@ -208,6 +201,9 @@ Reads all-time `trade_journal.jsonl` and reports:
 - Avg win R, avg loss R
 - Expectancy per trade (in R-multiples)
 - Scan stats for the week
+- **Score-bucket breakdown**: avg R and win rate per composite range (5–6, 6–7, 7–8, 8+)
+
+Results saved to `logs/feedback_state.json` for long-term calibration of scoring thresholds.
 
 ## Infrastructure
 
@@ -220,7 +216,6 @@ Reads all-time `trade_journal.jsonl` and reports:
 
 | Hash | Description |
 |------|-------------|
-| `d38697f` | Market cap filter, power trend, FOMC/CPI blackout, choppy market, MA20 trail, Cup-with-Handle |
 | `124857a` | EPS filter (SEPA), RS-line-leading signal, three-stage exit (33/33/34), pyramiding at +4%, earnings protection |
 | `ced84e2` | Composite scoring, VCP Opus tier, sector rotation, VIX scaling, breadth, climax exit, opening range filter, measured move |
 | `0f8a934` | 7 Minervini/Tudor Jones optimizations: time stop, loss sizing, win stats, gap check, vol dry-up, correlation, weekly base |
