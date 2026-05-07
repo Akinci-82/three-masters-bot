@@ -568,6 +568,35 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     lines.append(
                         f"  Score {bkt}: {len(rs_list)} trades  "
                         f"avg {_avg_r:+.2f}R  WR={_wr:.0%}")
+        # ── This week's closed trades ─────────────────────────────────────────
+        _week_ago  = today - timedelta(days=7)
+        _wk_trades = []
+        if journal_file.exists():
+            for _wkl in journal_file.read_text().splitlines():
+                try:
+                    _wkt = json.loads(_wkl)
+                    _wkts = _wkt.get("ts", "")
+                    if _wkts and date.fromisoformat(_wkts[:10]) >= _week_ago:
+                        _wk_trades.append(_wkt)
+                except Exception:
+                    pass
+        if _wk_trades:
+            lines.append(f"")
+            _w_sorted = sorted(_wk_trades, key=lambda x: x.get("r_multiple", 0), reverse=True)
+            lines.append(f"*This week's {len(_wk_trades)} closed trades:*")
+            for _wt in _w_sorted:
+                _wi = "✅" if _wt.get("r_multiple", 0) > 0 else "❌"
+                _wcs = _wt.get("composite_score")
+                _cs_str = f" (score={_wcs:.1f})" if _wcs else ""
+                lines.append(
+                    f"  {_wi} {_wt.get('symbol','?')}: "
+                    f"{_wt.get('r_multiple', 0):+.2f}R "
+                    f"({_wt.get('pnl_pct', 0):+.1f}%){_cs_str}"
+                )
+            _wk_wins = sum(1 for t in _wk_trades if t.get("r_multiple", 0) > 0)
+            _wk_avg  = sum(t.get("r_multiple", 0) for t in _wk_trades) / len(_wk_trades)
+            lines.append(f"  Week: {_wk_wins}W/{len(_wk_trades)-_wk_wins}L  avg {_wk_avg:+.2f}R")
+
         try:
             _fb = {
                 "updated": today.isoformat(),
@@ -905,9 +934,12 @@ def _simons_score(trend) -> float:
     inst_val = getattr(trend, "inst_pct", None)
     inst_pts = (0.5 if inst_val is not None and inst_val >= 0.60
                 else (0.25 if inst_val is not None and inst_val >= 0.40 else 0.0))
+    # EPS beat history: consistent positive earnings surprises = management execution quality
+    beat_cnt  = getattr(trend, "eps_beat_count", 0)
+    beat_pts  = 0.25 if beat_cnt >= 2 else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
-               + adx_pts + fr_pts + inst_pts, 10.0)
+               + adx_pts + fr_pts + inst_pts + beat_pts, 10.0)
 
 
 def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
@@ -973,11 +1005,38 @@ def _fetch_nh_nl_ratio() -> float:
     return 1.0   # neutral fallback when data unavailable
 
 
+def _compute_ad_divergence(breadth_pct: float) -> bool:
+    """True when SPY is rising but market breadth is falling — classic distribution signal.
+    Compares today's breadth to 10-scan-ago breadth vs SPY 10-day price return.
+    Uses breadth_history.json built during daily scans.
+    """
+    try:
+        import json as _json_ad, os as _os_ad
+        import yfinance as _yf_ad
+        _bh_path = str(BASE_DIR / "logs" / "breadth_history.json")
+        if not _os_ad.path.exists(_bh_path):
+            return False
+        with open(_bh_path) as _f_ad:
+            _bh = _json_ad.load(_f_ad)
+        if len(_bh) < 10:
+            return False
+        _breadth_chg = breadth_pct - float(_bh[-10])  # negative = breadth shrinking
+        if _breadth_chg >= -0.03:                       # need ≥3pp breadth decline
+            return False
+        _spy_hist = _yf_ad.Ticker("SPY").history(period="20d", interval="1d", auto_adjust=True)["Close"]
+        if len(_spy_hist) < 11:
+            return False
+        _spy_10d = float(_spy_hist.iloc[-1] / _spy_hist.iloc[-10] - 1)
+        return _spy_10d >= 0.01   # SPY up ≥1% while breadth fell ≥3pp = hidden weakness
+    except Exception:
+        return False
+
+
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
                   power_trend: bool = False, pcr: float = 0.7,
                   rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
                   dist_days: int = 0, nh_nl_ratio: float = 1.0,
-                  breadth_trend: int = 0) -> float:
+                  breadth_trend: int = 0, ad_divergence: bool = False) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
     power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
@@ -1008,7 +1067,9 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     nh_nl_pts = 0.5 if nh_nl_ratio >= 1.5 else (-1.0 if nh_nl_ratio < 0.5 else 0.0)
     # Breadth trend direction: is market breadth rising or falling vs recent average?
     breadth_dir_pts = 0.5 if breadth_trend > 0 else (-0.5 if breadth_trend < 0 else 0.0)
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts, 10.0)
+    # A/D divergence: SPY rising while breadth declining = distribution under the surface
+    ad_div_pts = -0.5 if ad_divergence else 0.0
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts + ad_div_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
@@ -1016,7 +1077,7 @@ def _composite_score(vcp, trend, risk_state: dict, regime: str,
                      power_trend: bool = False, pcr: float = 0.7,
                      rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
                      dist_days: int = 0, nh_nl_ratio: float = 1.0,
-                     breadth_trend: int = 0) -> float:
+                     breadth_trend: int = 0, ad_divergence: bool = False) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
@@ -1027,7 +1088,7 @@ def _composite_score(vcp, trend, risk_state: dict, regime: str,
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope, dist_days, nh_nl_ratio, breadth_trend)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope, dist_days, nh_nl_ratio, breadth_trend, ad_divergence)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
@@ -1120,14 +1181,25 @@ def _sector_bonus(symbol: str, sector_scores: dict[str, float],
         rel      = sector_scores.get(etf, 0.0)
         in_s2    = (stage2 or {}).get(etf, True)  # default True if no stage2 data
         if rel > 0.015:
-            return 0.5 if in_s2 else 0.25  # outperforming but below MA200 = muted bonus
+            base = 0.5 if in_s2 else 0.25
         elif rel > 0.005:
-            return 0.25
+            base = 0.25
         elif rel < -0.015:
-            return -0.5
+            base = -0.5
         elif rel < -0.005:
-            return -0.25
-        return 0.0
+            base = -0.25
+        else:
+            base = 0.0
+        # Rank modifier: top-3 sectors get amplified bonus; bottom-3 get forced penalty
+        if sector_scores:
+            _sorted_etfs = sorted(sector_scores, key=lambda e: -sector_scores[e])
+            _n    = len(_sorted_etfs)
+            _rank = (_sorted_etfs.index(etf) + 1) if etf in _sorted_etfs else _n // 2
+            if _rank <= 3 and base > 0:
+                base = min(base + 0.25, 0.5)    # top-3: amplify positive momentum
+            elif _n >= 5 and _rank > _n - 2 and base >= 0:
+                base = -0.25                     # bottom-3: minimum penalty even if "neutral"
+        return base
     except Exception:
         return 0.0
 
@@ -1294,9 +1366,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
               cash: float, positions: list) -> None:
     """Inner scan — separated so the hard timeout can wrap it cleanly."""
 
-    _breadth_pct   = 0.5   # updated after screener run
-    _breadth_trend = 0     # +1=rising -1=falling 0=flat vs 3-day avg
-    _current_vix   = 20.0  # updated in scoring loop (also needs to be in scope here)
+    _breadth_pct    = 0.5   # updated after screener run
+    _breadth_trend  = 0     # +1=rising -1=falling 0=flat vs 3-day avg
+    _ad_divergence  = False # True if SPY up but breadth falling (computed after screener)
+    _current_vix    = 20.0  # updated in scoring loop (also needs to be in scope here)
 
     # ── Layer 1: Simons — Trend Template screening ────────────────────────────
     _log.info("\n[LAYER 1 — SIMONS] Trend Template screening...")
@@ -1332,6 +1405,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 _json_bt.dump(_bh, _f_bt)
         except Exception as _bte:
             _log.debug("[tudor] Breadth history error: %s", _bte)
+        # A/D divergence: SPY rising while breadth deteriorating
+        _ad_divergence = _compute_ad_divergence(_breadth_pct)
+        if _ad_divergence:
+            _log.info("[tudor] A/D DIVERGENCE detected: SPY rising but breadth declining — −0.5 T-pts")
         report["trend_passed"] = [r.symbol for r in trend_passed]
         _log.info("[simons] %d/%d passed Trend Template",
                   len(trend_passed), len(screen_results))
@@ -1513,11 +1590,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             scored.append((vcp, trend_r, 0.0))
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend)
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend, _ad_divergence)
         _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f rate=%+.0fbps vix_sl=%.1f → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend), sec_bonus,
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend, _ad_divergence), sec_bonus,
                   _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, _rate_slope_bps, _vix_slope, cs)
         scored.append((vcp, trend_r, cs))
 

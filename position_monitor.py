@@ -254,6 +254,7 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
         "pnl_pct":         round(pnl_pct * 100, 2),
         "pnl_dollar":      round(pnl_dollar, 2),
         "r_multiple":      round(r_multiple, 2),
+        "composite_score": round(float(sym_data.get("composite_score", 0.0) or 0.0), 2),
         "portfolio_after": round(portfolio_value, 2),
     }
     journal = os.path.join(os.path.dirname(__file__), "logs", "trade_journal.jsonl")
@@ -741,6 +742,83 @@ def check_positions() -> None:
                     changed = True
                     _log.info("[monitor] %s RUNNER UPGRADE: trail 5%%→8%% at 2×mm (pnl=+%.1f%%)",
                               symbol, pnl_pct * 100)
+
+        # ── Step V: Volume climax exit — monster-volume day after ≥20% gain ────────
+        # Blow-off top signal: churning on extreme volume = likely institutional exit.
+        # Minervini explicitly warns: "when everyone wants in on huge volume, take profits."
+        if (not sym.get("climax_exit_done")
+                and pnl_pct >= 0.20):
+            _vc_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_vc_check_date") != _vc_today:
+                sym["_vc_check_date"] = _vc_today
+                try:
+                    import yfinance as _yf_vc
+                    _dfvc = _yf_vc.Ticker(symbol).history(
+                        period="90d", interval="1d", auto_adjust=True)
+                    if len(_dfvc) >= 50:
+                        _vol_cur  = float(_dfvc["Volume"].iloc[-1])
+                        _vol_avg  = float(_dfvc["Volume"].tail(51).iloc[:-1].mean())
+                        if _vol_avg > 0 and _vol_cur >= _vol_avg * 3.0:
+                            _vc_qty = max(1, round(qty * 0.50))
+                            _log.warning(
+                                "[monitor] %s VOLUME CLIMAX: %.1f× avg vol, pnl=+%.1f%% — "
+                                "selling 50%% (%d sh) at $%.2f",
+                                symbol, _vol_cur / _vol_avg, pnl_pct * 100,
+                                _vc_qty, cur_price)
+                            if _place_market_sell(symbol, _vc_qty):
+                                sym["climax_exit_done"] = True
+                                # Mark partial1 only if not already done
+                                if not sym.get("partial1_done"):
+                                    sym["partial1_done"] = True
+                                    sym["partial_done"]  = True
+                                sym["partial_qty"] = sym.get("partial_qty", 0) + _vc_qty
+                                changed = True
+                                try:
+                                    import requests as _rqv, os as _osv
+                                    _tv = _osv.getenv("TELEGRAM_BOT_TOKEN", "")
+                                    _cv = _osv.getenv("TELEGRAM_CHAT_ID", "")
+                                    if _tv and _cv:
+                                        _rqv.post(
+                                            f"https://api.telegram.org/bot{_tv}/sendMessage",
+                                            json={"chat_id": _cv, "parse_mode": "Markdown",
+                                                  "text": (f"🔥 *Volume Climax — {symbol}*\n"
+                                                           f"{_vol_cur/_vol_avg:.1f}× avg vol, "
+                                                           f"pnl=+{pnl_pct*100:.1f}%\n"
+                                                           f"Sold 50% — Minervini blow-off top")},
+                                            timeout=8)
+                                except Exception:
+                                    pass
+                except Exception as _vce:
+                    _log.debug("[monitor] volume climax %s: %s", symbol, _vce)
+
+        # ── Step LH/LL: Lower-high + lower-low on daily = trend reversal ─────────────
+        # After all partials are done, if the runner shows a structural trend break exit.
+        # Minervini: "sell when the stock starts acting abnormally — lower highs confirm weakness."
+        if (sym.get("partial2_done")
+                and not sym.get("lhll_stopped")):
+            try:
+                import yfinance as _yf_ll
+                _dfll = _yf_ll.Ticker(symbol).history(
+                    period="15d", interval="1d", auto_adjust=True)
+                if len(_dfll) >= 4:
+                    _hh = _dfll["High"].values
+                    _ll = _dfll["Low"].values
+                    _cc = _dfll["Close"].values
+                    # Lower high: bar[-2].high < bar[-3].high  (completed bars)
+                    # Lower low:  bar[-1].close < bar[-2].low  (today closed below yesterday low)
+                    if _hh[-2] < _hh[-3] and _cc[-1] < _ll[-2]:
+                        _runner_ll = qty - sym.get("partial_qty", 0)
+                        if _runner_ll > 0:
+                            _log.warning(
+                                "[monitor] %s LH/LL trend reversal — closing runner "
+                                "(%d sh) at $%.2f (pnl=%.1f%%)",
+                                symbol, _runner_ll, cur_price, pnl_pct * 100)
+                            _cancel_stop_orders(symbol)
+                            if _place_market_sell(symbol, _runner_ll):
+                                sym["lhll_stopped"] = True
+                                changed = True
+            except Exception as _lle:
+                _log.debug("[monitor] LH/LL %s: %s", symbol, _lle)
 
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)

@@ -338,6 +338,7 @@ class TrendResult:
     adx: float               = 0.0    # Average Directional Index — trend strength (>25 = trending)
     float_rotation: float | None = None  # base vol / float shares (>1.0 = full float turned over)
     inst_pct: float | None   = None   # % held by institutions (sponsorship quality)
+    eps_beat_count: int       = 0      # consecutive EPS beats in last 3 quarters
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -377,6 +378,30 @@ def _get_fundamentals(ticker) -> tuple:
         )
     except Exception:
         return None, None, None, None, None, None, None, None
+
+
+def _count_eps_beats(ticker) -> int:
+    """Count how many of last 3 quarters the stock beat EPS estimates.
+    Returns 0 if data unavailable.
+    """
+    try:
+        cal = ticker.earnings_dates
+        if cal is None or cal.empty:
+            return 0
+        needed = [c for c in cal.columns if "estimate" in c.lower() or "reported" in c.lower()]
+        if len(needed) < 2:
+            return 0
+        est_col = next(c for c in needed if "estimate" in c.lower())
+        rep_col = next(c for c in needed if "reported" in c.lower())
+        recent  = cal[[est_col, rep_col]].dropna().head(3)
+        if recent.empty:
+            return 0
+        return int(sum(
+            1 for _, row in recent.iterrows()
+            if float(row[rep_col]) > float(row[est_col])
+        ))
+    except Exception:
+        return 0
 
 
 def _compute_adx(df: pd.DataFrame, period: int = 14) -> float:
@@ -424,6 +449,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         avg_vol = float(volume.tail(50).mean())
         if avg_vol < cfg.get("min_avg_volume", 500_000):
             return TrendResult(symbol=symbol, passed=False, price=price, fail_reason="volume_too_low")
+        if price * avg_vol < cfg.get("min_dollar_volume", 5_000_000):
+            return TrendResult(symbol=symbol, passed=False, price=price, fail_reason="dollar_volume_too_low")
 
         ma20  = float(close.rolling(20).mean().iloc[-1])
         ma50  = float(close.rolling(50).mean().iloc[-1])
@@ -537,6 +564,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         result.roe            = roe
         result.adx            = adx_val
         result.inst_pct       = inst_pct
+        result.eps_beat_count = _count_eps_beats(ticker)
         if float_sh and float_sh > 0:
             result.float_rotation = round(float(df.tail(40)["Volume"].sum()) / float_sh, 3)
         # Liquidity floor: $500M+ to avoid thin-volume micro-caps
