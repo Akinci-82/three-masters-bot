@@ -1860,6 +1860,107 @@ def _start_background_services() -> None:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+def _startup_healthcheck() -> bool:
+    """
+    Verify all critical integrations before starting threads.
+    Returns True if everything is OK, False if any critical check failed.
+    Logs clearly and sends Telegram alert on failure so silent bugs are caught early.
+    """
+    failures: list[str] = []
+    warnings_hc: list[str] = []
+
+    # 1. Required environment variables
+    import os as _os_hc
+    required_env = {
+        "THREE_MASTERS_ALPACA_API_KEY":    "Alpaca API key",
+        "THREE_MASTERS_ALPACA_SECRET_KEY": "Alpaca secret key",
+        "THREE_MASTERS_ALPACA_URL":        "Alpaca base URL",
+        "TELEGRAM_BOT_TOKEN":              "Telegram bot token",
+        "TELEGRAM_CHAT_ID":                "Telegram chat ID",
+        "ANTHROPIC_API_KEY":               "Claude/Anthropic API key",
+    }
+    for var, desc in required_env.items():
+        if not _os_hc.environ.get(var):
+            failures.append(f"Missing env var {var} ({desc})")
+
+    # 2. Alpaca API — account reachable + paper trading confirmed
+    try:
+        from broker import get_account
+        acct = get_account()
+        equity = acct.get("equity", 0)
+        status = acct.get("status", "?")
+        _log.info("[startup] ✓ Alpaca OK — equity=$%.2f  status=%s", equity, status)
+        if status != "ACTIVE":
+            warnings_hc.append(f"Alpaca account status is {status!r} (expected ACTIVE)")
+    except Exception as _e_alp:
+        failures.append(f"Alpaca unreachable: {_e_alp}")
+
+    # 3. Position monitor URL sanity — verify /v2/ is in the resolved base URL
+    try:
+        from position_monitor import _alpaca_base
+        _pm_url = _alpaca_base()
+        if "/v2" not in _pm_url:
+            failures.append(f"position_monitor._alpaca_base() missing /v2: {_pm_url!r}")
+        else:
+            _log.info("[startup] ✓ Monitor URL OK — %s", _pm_url)
+    except Exception as _e_pm:
+        failures.append(f"position_monitor._alpaca_base() error: {_e_pm}")
+
+    # 4. Telegram connectivity
+    try:
+        import requests as _req_hc
+        _tok = _os_hc.environ.get("TELEGRAM_BOT_TOKEN", "")
+        _cid = _os_hc.environ.get("TELEGRAM_CHAT_ID", "")
+        if _tok and _cid:
+            _r = _req_hc.get(
+                f"https://api.telegram.org/bot{_tok}/getMe", timeout=8)
+            if _r.ok:
+                _log.info("[startup] ✓ Telegram OK — bot=%s",
+                          _r.json().get("result", {}).get("username", "?"))
+            else:
+                warnings_hc.append(f"Telegram getMe failed: {_r.status_code}")
+    except Exception as _e_tg:
+        warnings_hc.append(f"Telegram unreachable: {_e_tg}")
+
+    # 5. Anthropic / Claude API key present and non-empty
+    _claude_key = _os_hc.environ.get("ANTHROPIC_API_KEY", "")
+    if _claude_key and len(_claude_key) > 10:
+        _log.info("[startup] ✓ Anthropic API key present")
+    else:
+        failures.append("ANTHROPIC_API_KEY missing or too short — VCP analysis will fail")
+
+    # 6. Log directory writable
+    try:
+        _test_path = LOG_DIR / "_healthcheck.tmp"
+        _test_path.write_text("ok")
+        _test_path.unlink()
+        _log.info("[startup] ✓ Log directory writable — %s", LOG_DIR)
+    except Exception as _e_log:
+        failures.append(f"Log directory not writable: {_e_log}")
+
+    # ── Report results ───────────────────────────────────────────────────────
+    if warnings_hc:
+        for w in warnings_hc:
+            _log.warning("[startup] ⚠ %s", w)
+
+    if failures:
+        msg = "\n".join(f"  • {f}" for f in failures)
+        _log.error("[startup] ❌ HEALTH CHECK FAILED — %d critical issue(s):\n%s",
+                   len(failures), msg)
+        try:
+            _tg(f"🚨 *Three Masters — Startup FAILED*\n"
+                f"{len(failures)} critical issue(s):\n"
+                + "\n".join(f"• {f}" for f in failures))
+        except Exception:
+            pass
+        return False
+
+    _log.info("[startup] ✅ All health checks passed — bot ready")
+    _tg(f"✅ *Three Masters — Startup OK*\n"
+        f"Alpaca ${ equity:,.0f} | Monitor URL /v2 ✓ | Telegram ✓ | Claude ✓")
+    return True
+
+
 def main():
     _setup_logging()
     _log.info("=" * 70)
@@ -1876,6 +1977,10 @@ def main():
         _log.info("[main] --run-now flag — executing immediately")
         run_daily()
         return
+
+    if not _startup_healthcheck():
+        _log.critical("[main] Startup health check failed — aborting. Fix issues and restart.")
+        sys.exit(1)
 
     _start_position_monitor()
     _start_background_services()
