@@ -287,22 +287,49 @@ _last_or_check_date: date | None = None
 
 def _opening_range_check() -> None:
     """
-    Run 30 minutes after US open (16:00 CEST / 10:00 ET).
-    For each pending GTC buy-stop: if the current price is BELOW the stop trigger,
-    the opening range has not confirmed → cancel the order to avoid trapping.
-    If price is above or already filled, leave it alone.
+    Run 30 minutes after US open (16:00 CEST / 10:00 ET). Three checks:
+    1. SPY/QQQ strength: if both down >0.5%, cancel ALL orders (bad market day)
+    2. Price confirmation: cancel if price still below breakout level
+    3. Volume confirmation: cancel if first-30-min volume < 20% of daily average
     """
     global _last_or_check_date
     try:
         import pytz, yfinance as yf
         from broker import get_open_orders, cancel_all_orders
-        from risk_manager import get_state as _grs, _load as _lrs, _save as _srs
+        from risk_manager import _load as _lrs, _save as _srs
 
         buy_stops = [o for o in get_open_orders()
                      if o.get("side") == "buy" and o.get("type") == "stop"]
         if not buy_stops:
             return
 
+        # ── Check 1: Market strength — cancel all if SPY + QQQ both down ────
+        try:
+            spy_1m = yf.Ticker("SPY").history(period="1d", interval="1m", auto_adjust=True)
+            qqq_1m = yf.Ticker("QQQ").history(period="1d", interval="1m", auto_adjust=True)
+            spy_chg = float(spy_1m["Close"].iloc[-1] / spy_1m["Close"].iloc[0] - 1) if len(spy_1m) > 1 else 0.0
+            qqq_chg = float(qqq_1m["Close"].iloc[-1] / qqq_1m["Close"].iloc[0] - 1) if len(qqq_1m) > 1 else 0.0
+        except Exception:
+            spy_chg = qqq_chg = 0.0
+
+        if spy_chg < -0.005 and qqq_chg < -0.005:
+            mkt_cancelled = []
+            for o in buy_stops:
+                sym = o["symbol"]
+                cancel_all_orders(sym)
+                rs = _lrs()
+                rs.get("positions_risk", {}).pop(sym, None)
+                rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                _srs(rs)
+                mkt_cancelled.append(sym)
+            _log.info("[or_check] MARKET WEAK (SPY %.1f%% QQQ %.1f%%) — cancelled: %s",
+                      spy_chg * 100, qqq_chg * 100, mkt_cancelled)
+            _tg(f"🔴 *Opening Range — Market Weak*\n"
+                f"SPY {spy_chg:+.1%} | QQQ {qqq_chg:+.1%}\n"
+                f"All orders cancelled: {chr(10).join(mkt_cancelled)}")
+            return
+
+        # ── Check 2 + 3: Per-symbol price + volume confirmation ─────────────
         cancelled = []
         kept      = []
         for o in buy_stops:
@@ -311,38 +338,57 @@ def _opening_range_check() -> None:
             if stop_p <= 0:
                 continue
             try:
-                # Use 1-minute bars to get current intraday price
-                df1 = yf.Ticker(sym).history(period="1d", interval="1m",
-                                              auto_adjust=True)
+                df1 = yf.Ticker(sym).history(period="1d", interval="1m", auto_adjust=True)
                 if df1.empty:
-                    kept.append(sym)
+                    kept.append((sym, "no_data"))
                     continue
-                cur_price = float(df1["Close"].iloc[-1])
-                if cur_price < stop_p * 0.998:  # price is below trigger
+                cur_price  = float(df1["Close"].iloc[-1])
+                vol_30min  = float(df1["Volume"].sum())
+
+                # Volume threshold: first 30 min must be ≥ 20% of 30-day daily average
+                try:
+                    vol_daily = float(yf.Ticker(sym).history(
+                        period="30d", interval="1d")["Volume"].mean())
+                    vol_ok = vol_daily <= 0 or vol_30min >= vol_daily * 0.20
+                except Exception:
+                    vol_ok = True
+
+                if cur_price < stop_p * 0.998:
                     cancel_all_orders(sym)
                     rs = _lrs()
                     rs.get("positions_risk", {}).pop(sym, None)
                     rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
                     _srs(rs)
-                    cancelled.append((sym, cur_price, stop_p))
-                    _log.info("[or_check] CANCEL %s — price $%.2f < stop $%.2f "
-                              "(no opening range confirmation)",
+                    cancelled.append((sym, "no_price_confirm", cur_price, stop_p, 0))
+                    _log.info("[or_check] CANCEL %s — price $%.2f below stop $%.2f",
                               sym, cur_price, stop_p)
+                elif not vol_ok:
+                    cancel_all_orders(sym)
+                    rs = _lrs()
+                    rs.get("positions_risk", {}).pop(sym, None)
+                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                    _srs(rs)
+                    vol_pct = vol_30min / vol_daily if vol_daily > 0 else 0
+                    cancelled.append((sym, "low_volume", cur_price, stop_p, vol_pct))
+                    _log.info("[or_check] CANCEL %s — weak volume %.0f%% of daily avg",
+                              sym, vol_pct * 100)
                 else:
-                    kept.append(sym)
-                    _log.info("[or_check] KEEP %s — price $%.2f ≥ stop $%.2f ✓",
-                              sym, cur_price, stop_p)
+                    vol_pct = vol_30min / vol_daily if vol_daily > 0 else 0
+                    kept.append((sym, vol_pct))
+                    _log.info("[or_check] KEEP %s — price $%.2f ✓ vol=%.0f%% of daily ✓",
+                              sym, cur_price, vol_pct * 100)
             except Exception as _e:
-                _log.debug("[or_check] %s price fetch failed: %s", sym, _e)
-                kept.append(sym)
+                _log.debug("[or_check] %s check failed: %s", sym, _e)
+                kept.append((sym, 0))
 
         if cancelled or kept:
-            lines = [f"🕙 *Opening Range Check (10:00 ET)*"]
-            for sym, cur, stop in cancelled:
-                pct = (stop - cur) / stop * 100
-                lines.append(f"  ❌ *{sym}* ${cur:.2f} ({pct:.1f}% below ${stop:.2f}) — order cancelled")
-            for sym in kept:
-                lines.append(f"  ✅ *{sym}* — confirmed above breakout level")
+            lines = [f"🕙 *Opening Range Check (10:00 ET)*",
+                     f"SPY {spy_chg:+.1%} | QQQ {qqq_chg:+.1%}"]
+            for sym, reason, cur, stop, vol in cancelled:
+                tag = "no price confirm" if reason == "no_price_confirm" else f"weak vol {vol:.0%}"
+                lines.append(f"  ❌ *{sym}* ${cur:.2f} — {tag}")
+            for sym, vol in kept:
+                lines.append(f"  ✅ *{sym}* — price + vol ({vol:.0%}) confirmed")
             _tg("\n".join(lines))
 
     except Exception as e:
@@ -546,17 +592,27 @@ def _minervini_score(vcp) -> float:
 
 
 def _simons_score(trend) -> float:
-    """0–10, weight 30%. Trend quality and relative strength (Simons layer)."""
+    """
+    0–10, weight 30%. Trend quality, RS strength, fundamentals (Simons layer).
+    rs_line_leading (RS at high while price in base) = strongest Minervini signal.
+    """
     rs     = getattr(trend, "rs_rating", 70.0)
     rs_pts = min((rs - 70) / 29 * 4.0, 4.0)
-    rs_hi  = 2.0 if getattr(trend, "rs_line_at_high", False) else 0.0
+    # RS line signal: leading > at_high_only > neither
+    rs_leading = getattr(trend, "rs_line_leading", False)
+    rs_at_high = getattr(trend, "rs_line_at_high", False)
+    rs_sig  = 2.5 if rs_leading else (1.5 if rs_at_high else 0.0)
     rsi    = getattr(trend, "rsi", 65.0)
     rsi_pts = 2.0 if rsi <= 65 else (1.0 if rsi <= 72 else 0.0)
     pfh    = abs(getattr(trend, "pct_from_high", -0.25))
     hi_pts = 1.5 if pfh <= 0.05 else (1.0 if pfh <= 0.10 else (0.5 if pfh <= 0.20 else 0.0))
     slope  = getattr(trend, "ma200_slope_20d", 0.0)
     sl_pts = 0.5 if slope > 0.005 else 0.0
-    return min(rs_pts + rs_hi + rsi_pts + hi_pts + sl_pts, 10.0)
+    # Fundamental quality bonus: EPS growth (Minervini SEPA requirement)
+    eps_g   = getattr(trend, "eps_growth", None)
+    eps_pts = (1.0 if eps_g is not None and eps_g >= 0.25
+               else (0.5 if eps_g is not None and eps_g >= 0.10 else 0.0))
+    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts, 10.0)
 
 
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5) -> float:
@@ -1044,7 +1100,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "quality_score":  getattr(vcp, "quality_score", 0),
             "rs_line_high":   getattr(vcp, "rs_line_at_high", False),
             "adaptive_risk":  round(risk_pct, 4),
-            "composite_score": composite,
+            "composite_score":   composite,
+            "measured_move_pct": round(getattr(vcp, "measured_move_pct", 0.0), 4),
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]

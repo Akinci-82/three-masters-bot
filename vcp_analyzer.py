@@ -566,7 +566,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
 
     # ── Tier 2: Sonnet deep analysis ─────────────────────────────────────────
     _log.info("[vcp] %s → Sonnet tier-2 (Haiku score=%d)", symbol, h_score)
-    s_prompt = _build_sonnet_prompt(symbol, df, quant, last_candle)
+    s_prompt = _build_sonnet_prompt(symbol, df, quant, last_candle, fundamentals)
     s_data   = _call_sonnet(symbol, s_prompt)
 
     if not s_data:
@@ -678,7 +678,9 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50) -> list[VCPResult]:
     for i, trend in enumerate(candidates, 1):
         _log.info("[vcp] %d/%d: %s", i, len(candidates), trend.symbol)
         last_candle = getattr(trend, "last_candle", "neutral")
-        result = analyze(trend.symbol, trend.df, last_candle=last_candle)
+        fund = {"eps_growth": getattr(trend, "eps_growth", None),
+                "revenue_growth": getattr(trend, "revenue_growth", None)}
+        result = analyze(trend.symbol, trend.df, last_candle=last_candle, fundamentals=fund)
         result.rs_rating       = getattr(trend, "rs_rating", 0.0)
         result.rs_line_at_high = getattr(trend, "rs_line_at_high", False)
         results.append(result)

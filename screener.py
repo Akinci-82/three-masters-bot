@@ -297,6 +297,9 @@ class TrendResult:
     days_to_earnings: int | None = None
     last_candle: str          = ""
     rs_line_at_high: bool     = False  # RS line making 52-week high today
+    rs_line_leading: bool     = False  # RS line at high while price still in base (strongest signal)
+    eps_growth: float | None  = None   # trailing quarterly EPS growth (yfinance)
+    revenue_growth: float | None = None  # trailing revenue growth (yfinance)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -306,6 +309,20 @@ class TrendResult:
         return (f"{status} {self.symbol:<6} ${self.price:.2f}  "
                 f"RSI={self.rsi:.0f}  RS={self.rs_rating:.0f}  "
                 f"MA20={self.ma20:.0f}/{self.ma50:.0f}/{self.ma200:.0f}{earn}")
+
+
+def _get_fundamentals(ticker) -> tuple[float | None, float | None]:
+    """Return (eps_quarterly_growth, revenue_growth) from yfinance. None = unavailable."""
+    try:
+        info = ticker.info
+        eps_g = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
+        rev_g = info.get("revenueGrowth")
+        return (
+            float(eps_g) if eps_g is not None else None,
+            float(rev_g) if rev_g is not None else None,
+        )
+    except Exception:
+        return None, None
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
@@ -405,9 +422,26 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 result.fail_reason = weekly_note
                 return result
 
+        # 6. Fundamental filter — fetch only for stocks that passed all technical checks
+        # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
+        eps_g, rev_g = _get_fundamentals(ticker)
+        result.eps_growth     = eps_g
+        result.revenue_growth = rev_g
+        if eps_g is not None and eps_g < -0.10:
+            result.fail_reason = f"eps_declining({eps_g:.0%})"
+            return result
+
         result.rs_line_at_high = _rs_line_new_high(close, spy_close)
         if result.rs_line_at_high:
             _log.debug("[screen] %s RS line at 52-week high — strong signal", symbol)
+        # RS line LEADING price = RS at high while price still 3–15% below 52w high
+        # This is Minervini's strongest early signal: RS breaks out before price does
+        result.rs_line_leading = (
+            result.rs_line_at_high
+            and -0.15 <= pct_from_high <= -0.03
+        )
+        if result.rs_line_leading:
+            _log.info("[screen] %s RS LINE LEADING price breakout — elite setup", symbol)
         result.passed = True
         return result
 

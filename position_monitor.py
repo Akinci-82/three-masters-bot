@@ -274,13 +274,14 @@ def _lookup_position_metadata(symbol: str) -> dict:
             for order in data.get("orders_placed", []):
                 if order.get("symbol") == symbol:
                     return {
-                        "stop_loss":       float(order.get("stop_loss", 0) or 0),
-                        "quality_score":   int(order.get("quality_score", 0) or 0),
-                        "composite_score": float(order.get("composite_score", 0) or 0),
+                        "stop_loss":         float(order.get("stop_loss", 0) or 0),
+                        "quality_score":     int(order.get("quality_score", 0) or 0),
+                        "composite_score":   float(order.get("composite_score", 0) or 0),
+                        "measured_move_pct": float(order.get("measured_move_pct", 0) or 0),
                     }
         except Exception:
             pass
-    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0}
+    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0, "measured_move_pct": 0.0}
 
 
 def check_positions() -> None:
@@ -347,10 +348,11 @@ def check_positions() -> None:
         # On first encounter: look up VCP stop loss + quality from daily report
         if not sym.get("_meta_loaded"):
             meta = _lookup_position_metadata(symbol)
-            sym["_meta_loaded"]    = True
-            sym["stop_loss"]       = meta["stop_loss"]
-            sym["quality_score"]   = meta["quality_score"]
-            sym["composite_score"] = meta["composite_score"]
+            sym["_meta_loaded"]       = True
+            sym["stop_loss"]          = meta["stop_loss"]
+            sym["quality_score"]      = meta["quality_score"]
+            sym["composite_score"]    = meta["composite_score"]
+            sym["measured_move_pct"]  = meta["measured_move_pct"]
             if meta["stop_loss"] > 0:
                 _log.info("[monitor] %s meta: SL=$%.2f Q%d composite=%.1f",
                           symbol, meta["stop_loss"], meta["quality_score"],
@@ -364,6 +366,66 @@ def check_positions() -> None:
         composite      = sym.get("composite_score", 0.0)
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
         time_stop_days  = 20   if composite >= 8.0 else cfg.get("time_stop_trading_days", 15)
+
+        # ── Earnings protection — tighten or close before earnings report ────────
+        _earn_check_date = sym.get("_earnings_checked_date", "")
+        _today_str = datetime.now(_ET).strftime("%Y-%m-%d")
+        if _earn_check_date != _today_str:
+            sym["_earnings_checked_date"] = _today_str
+            try:
+                from screener import _days_to_earnings
+                _days_earn = _days_to_earnings(symbol)
+                if _days_earn is not None:
+                    sym["days_to_earnings"] = _days_earn
+                    if _days_earn <= 5:
+                        _remaining = qty - sym.get("partial_qty", 0) - sym.get("partial2_qty", 0)
+                        if pnl_pct >= 0.03 and not sym.get("breakeven_done"):
+                            # Profitable → protect with breakeven stop
+                            _cancel_stop_orders(symbol)
+                            _be_oid = _place_stop(symbol, _remaining, round(avg_cost, 2))
+                            if _be_oid:
+                                sym["breakeven_done"] = True
+                                sym["stop_order_id"] = _be_oid
+                                changed = True
+                                _log.warning("[monitor] EARNINGS GUARD %s — %dd to report, "
+                                             "stop moved to breakeven $%.2f",
+                                             symbol, _days_earn, avg_cost)
+                                try:
+                                    import requests as _rq, os as _os
+                                    tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
+                                    cid = _os.getenv("TELEGRAM_CHAT_ID", "")
+                                    if tok and cid:
+                                        _rq.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                                 json={"chat_id": cid, "parse_mode": "Markdown",
+                                                       "text": (f"🛡️ *Earnings Guard — {symbol}*\n"
+                                                                f"{_days_earn} days to earnings report\n"
+                                                                f"Stop moved to breakeven ${avg_cost:.2f}")},
+                                                 timeout=8)
+                                except Exception:
+                                    pass
+                        elif pnl_pct < 0.01 and _days_earn <= 3 and _remaining > 0:
+                            # Flat/losing with report in 3 days → exit now
+                            _cancel_stop_orders(symbol)
+                            if _place_market_sell(symbol, _remaining):
+                                sym["earnings_closed"] = True
+                                changed = True
+                                _log.warning("[monitor] EARNINGS CLOSE %s — %dd to report, "
+                                             "flat/loss %.1f%%", symbol, _days_earn, pnl_pct*100)
+                                try:
+                                    import requests as _rq, os as _os
+                                    tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
+                                    cid = _os.getenv("TELEGRAM_CHAT_ID", "")
+                                    if tok and cid:
+                                        _rq.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                                 json={"chat_id": cid, "parse_mode": "Markdown",
+                                                       "text": (f"📅 *Earnings Close — {symbol}*\n"
+                                                                f"{_days_earn} days to report, gain {pnl_pct*100:+.1f}%\n"
+                                                                f"Exiting before earnings risk")},
+                                                 timeout=8)
+                                except Exception:
+                                    pass
+            except Exception as _e:
+                _log.debug("[monitor] earnings check %s: %s", symbol, _e)
 
         # ── Step A: Initial stop (placed once when position first seen) ──────────
         # Use HARD STOP at VCP pivot low if we have the planned stop from the order.
@@ -399,30 +461,48 @@ def check_positions() -> None:
                     sym["stop_type"] = "trailing"
                     changed = True
 
-        # ── Step B: Partial exit at +partial_trigger (default +15%) ──────────────
-        if pnl_pct >= partial_trigger and not sym.get("partial_done"):
-            sell_qty = max(1, round(qty * partial_pct))
+        # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
+        initial_qty = sym.get("initial_qty", qty)
+        partial1_trigger = 0.10
+        mm_pct = sym.get("measured_move_pct", 0.0) or 0.0
+        partial2_trigger = max(mm_pct, 0.20) if mm_pct > 0.05 else 0.20
+
+        if pnl_pct >= partial1_trigger and not sym.get("partial1_done"):
+            sell_qty = max(1, round(initial_qty / 3))
             if _place_market_sell(symbol, sell_qty):
-                sym["partial_done"]       = True
-                sym["partial_qty"]        = sell_qty
-                sym["partial_price"]      = cur_price
-                sym["partial_pnl_pct"]    = round(pnl_pct, 4)
+                sym["partial1_done"] = True
+                sym["partial_done"]  = True   # backward-compat for time stop check
+                sym["partial_qty"]   = sell_qty
+                sym["partial1_price"] = cur_price
                 changed = True
-                _log.info("[monitor] ✓ %s partial exit: sold %d @ $%.2f (+%.1f%%)",
+                _log.info("[monitor] ✓ %s PARTIAL-1 (33%%): sold %d sh @ $%.2f (+%.1f%%)",
                           symbol, sell_qty, cur_price, pnl_pct * 100)
-                # Replace trailing stop for remaining qty — tighter after locking profits
-                remaining = qty - sell_qty
-                if remaining > 0:
-                    tight_trail = cfg.get("trailing_stop_after_partial", 0.05)
+
+        # ── Step B2: Second partial at measured move or +20% — sell 33%, tighten ─
+        elif (sym.get("partial1_done") and
+              pnl_pct >= partial2_trigger and
+              not sym.get("partial2_done")):
+            already_sold = sym.get("partial_qty", 0)
+            sell_qty2 = max(1, round(initial_qty / 3))
+            if _place_market_sell(symbol, sell_qty2):
+                sym["partial2_done"]  = True
+                sym["partial2_qty"]   = sell_qty2
+                sym["partial_qty"]    = already_sold + sell_qty2
+                sym["partial2_price"] = cur_price
+                changed = True
+                _log.info("[monitor] ✓ %s PARTIAL-2 (33%%): sold %d sh @ $%.2f (+%.1f%%)"
+                          " — runner with 5%% trailing",
+                          symbol, sell_qty2, cur_price, pnl_pct * 100)
+                # Tighten trailing stop for the remaining ~34% runner
+                runner_qty = initial_qty - sym["partial_qty"]
+                if runner_qty > 0:
                     _cancel_stop_orders(symbol)
-                    oid2 = _place_trailing_stop(symbol, remaining, tight_trail)
+                    oid2 = _place_trailing_stop(symbol, runner_qty, 0.05)
                     sym["trailing_stop_placed"] = True
                     if oid2:
                         sym["stop_order_id"] = oid2
-                    _log.info("[monitor] %s trailing stop tightened to %.0f%% after partial exit",
-                              symbol, tight_trail * 100)
 
-        # ── Step C: Move stop to breakeven at +breakeven_trigger (default +8%) ───
+        # ── Step C: Move stop to breakeven at +8% (if no partial yet) ───────────
         elif pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
             breakeven = round(avg_cost, 2)
             remaining = qty - sym.get("partial_qty", 0)
@@ -467,6 +547,47 @@ def check_positions() -> None:
                             )
                     except Exception:
                         pass
+
+        # ── Step F: Pyramid — add 25% at +4% confirmation ──────────────────────
+        # Minervini adds to winners: buy more when the breakout is confirmed
+        # Uses same pivot-low stop. Only once, only if heat cap allows.
+        if (pnl_pct >= 0.04
+                and not sym.get("pyramid_done")
+                and not sym.get("partial1_done")):
+            try:
+                from risk_manager import get_state as _prs, check_can_trade
+                from broker import place_market_buy, get_account
+                _pstate = _prs()
+                _pf_val = float(get_account()["portfolio_value"])
+                _add_qty = max(1, round(initial_qty * 0.25))
+                _stop_l  = sym.get("stop_loss", 0.0)
+                if _stop_l > 0 and _stop_l < avg_cost * 0.99:
+                    _add_risk = (_add_qty * (cur_price - _stop_l)) / _pf_val
+                    _heat_ok, _ = check_can_trade(_pf_val, _add_risk)
+                    if _heat_ok and _add_qty >= 1:
+                        _pyo = place_market_buy(symbol, _add_qty)
+                        if _pyo:
+                            sym["pyramid_done"]  = True
+                            sym["pyramid_qty"]   = _add_qty
+                            sym["pyramid_price"] = cur_price
+                            changed = True
+                            _log.info("[monitor] 📐 PYRAMID %s — added %d sh @ $%.2f (+%.1f%% from entry)",
+                                      symbol, _add_qty, cur_price, pnl_pct * 100)
+                            try:
+                                import requests as _rq, os as _os
+                                tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
+                                cid = _os.getenv("TELEGRAM_CHAT_ID", "")
+                                if tok and cid:
+                                    _rq.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                             json={"chat_id": cid, "parse_mode": "Markdown",
+                                                   "text": (f"📐 *Pyramid — {symbol}*\n"
+                                                            f"Added {_add_qty} sh @ ${cur_price:.2f} (+{pnl_pct*100:.1f}%)\n"
+                                                            f"Position confirmed — same pivot stop ${_stop_l:.2f}")},
+                                             timeout=8)
+                            except Exception:
+                                pass
+            except Exception as _e:
+                _log.debug("[monitor] pyramid check %s: %s", symbol, _e)
 
         # ── Step E: Climax run / parabolic exit ────────────────────────────────
         # If stock has moved ≥ 25% in the last 5 trading days AND we see 3 up-days
