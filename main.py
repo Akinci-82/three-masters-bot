@@ -683,6 +683,30 @@ def _minervini_score(vcp) -> float:
     return min(q + conf + tight_b + vol_b + bvol_b + rs_b, 10.0)
 
 
+def _fetch_vix_slope() -> float:
+    """
+    5-day change in VIX (points). Positive = fear rising = risk-off.
+    Returns 0.0 on failure.
+    """
+    try:
+        import yfinance as _yf
+        hist = _yf.Ticker("^VIX").history(period="15d", interval="1d", auto_adjust=False)
+        if len(hist) >= 6:
+            return float(hist["Close"].iloc[-1] - hist["Close"].iloc[-6])
+    except Exception:
+        pass
+    return 0.0
+
+
+def _consecutive_win_factor(wins: int) -> float:
+    """Tudor Jones: press winners — increase size modestly after consecutive wins."""
+    if wins >= 3:
+        return 1.25   # 3+ wins → 125% of base risk
+    if wins >= 2:
+        return 1.10   # 2 wins → 110%
+    return 1.00
+
+
 def _fetch_10y_yield_slope() -> float:
     """
     Return 20-day change in US 10Y Treasury yield in basis points (^TNX).
@@ -783,20 +807,29 @@ def _simons_score(trend) -> float:
     earn_pts  = (0.5 if days_earn is not None and 28 <= days_earn <= 56
                  and eps_g is not None and eps_g >= 0.25 else 0.0)
     # Monthly Stage 2: three-timeframe alignment (monthly+weekly+daily) confirms uptrend
-    monthly_s2 = getattr(trend, "monthly_stage2", True)
+    monthly_s2  = getattr(trend, "monthly_stage2", True)
     monthly_pts = 0.5 if monthly_s2 else 0.0
+    # Earnings estimate revision: forwardEps growing faster than trailing = analyst upgrades
+    eps_rev     = getattr(trend, "eps_revision", None)
+    rev_pts     = (0.5 if eps_rev is not None and eps_rev >= 0.15
+                   else (0.25 if eps_rev is not None and eps_rev >= 0.05 else 0.0))
+    # RS vs own sector: outperforming sector AND SPY = double confirmation of leadership
+    rs_sec      = getattr(trend, "rs_vs_sector", None)
+    sec_rs_pts  = (0.5 if rs_sec is not None and rs_sec >= 0.05
+                   else (0.25 if rs_sec is not None and rs_sec >= 0.02 else 0.0))
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
-               + ad_pts + short_pts + earn_pts + monthly_pts, 10.0)
+               + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts, 10.0)
 
 
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
                   power_trend: bool = False, pcr: float = 0.7,
-                  rate_slope_bps: float = 0.0) -> float:
+                  rate_slope_bps: float = 0.0, vix_slope: float = 0.0) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
     power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
     pcr = CBOE Put/Call ratio: >1.0 fear=+0.5, <0.6 greed=-0.5.
     rate_slope_bps = 20-day change in 10Y yield; >50bps rising = -1.0 pts.
+    vix_slope = 5-day VIX change; >3pts = fear rising (-0.5), <-2pts = complacency (+0.25).
     """
     reg_pts  = {"bull": 3.0, "neutral": 1.5, "bear": 0.0}.get(regime, 3.0)
     losses   = risk_state.get("consecutive_losses", 0)
@@ -811,13 +844,15 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     pcr_pts   = 0.5 if pcr > 1.0 else (-0.5 if pcr < 0.6 else 0.0)
     # Rate sensitivity: rapidly rising yields = headwind for growth stocks
     rate_pts  = -1.0 if rate_slope_bps > 50 else (-0.5 if rate_slope_bps > 25 else 0.0)
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts, 10.0)
+    # VIX direction: rising fear = caution, falling = environment improving
+    vix_pts   = -0.5 if vix_slope > 3.0 else (0.25 if vix_slope < -2.0 else 0.0)
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
                      sector_bonus: float = 0.0, breadth_pct: float = 0.5,
                      power_trend: bool = False, pcr: float = 0.7,
-                     rate_slope_bps: float = 0.0) -> float:
+                     rate_slope_bps: float = 0.0, vix_slope: float = 0.0) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
@@ -828,12 +863,31 @@ def _composite_score(vcp, trend, risk_state: dict, regime: str,
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
 # ── Sector rotation helpers ──────────────────────────────────────────────────
 # Keys are the exact strings yfinance returns for sector info
+_SUPER_SECTOR: dict[str, str] = {
+    "Technology":             "growth",
+    "Communication Services": "growth",
+    "Consumer Cyclical":      "cyclical",
+    "Consumer Discretionary": "cyclical",
+    "Industrials":            "cyclical",
+    "Basic Materials":        "cyclical",
+    "Materials":              "cyclical",
+    "Energy":                 "cyclical",
+    "Consumer Defensive":     "defensive",
+    "Consumer Staples":       "defensive",
+    "Healthcare":             "defensive",
+    "Health Care":            "defensive",
+    "Real Estate":            "defensive",
+    "Utilities":              "defensive",
+    "Financial Services":     "financial",
+    "Financials":             "financial",
+}
+
 _SECTOR_ETF_MAP = {
     "Technology":             "XLK",
     "Financial Services":     "XLF",
@@ -1198,9 +1252,14 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _rs_now = _get_rs()
     loss_streak = _rs_now.get("consecutive_losses", 0)
     loss_factor = _consecutive_loss_factor(loss_streak)
+    win_streak  = _rs_now.get("consecutive_wins", 0)
+    win_factor  = _consecutive_win_factor(win_streak)
     if loss_streak > 0:
         _log.info("[main] Loss streak %d — sizing factor %.0f%%",
                   loss_streak, loss_factor * 100)
+    if win_streak >= 2:
+        _log.info("[main] Win streak %d — pressing winners, size factor %.0f%%",
+                  win_streak, win_factor * 100)
 
     orders_placed = []
 
@@ -1212,6 +1271,39 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _power_trend      = _fetch_power_trend()
     _current_pcr      = _fetch_pcr()
     _rate_slope_bps   = _fetch_10y_yield_slope()
+    _vix_slope        = _fetch_vix_slope()
+    _log.info("[tudor] VIX slope=%.1f pts/5d (%s)",
+              _vix_slope,
+              "fear-rising(-0.5)" if _vix_slope > 3.0 else
+              ("complacency(+0.25)" if _vix_slope < -2.0 else "neutral"))
+    # Enrich trend results with RS vs own sector ETF (pre-fetched sector data)
+    try:
+        import yfinance as _yf_rs
+        import pandas as _pd_rs
+        _etf_closes: dict = {}
+        for _etf in set(_SECTOR_ETF_MAP.values()):
+            try:
+                _h = _yf_rs.Ticker(_etf).history(period="1y", interval="1d", auto_adjust=True)
+                if not _h.empty:
+                    _etf_closes[_etf] = _h["Close"]
+            except Exception:
+                pass
+        for _tr in vcp_passed:
+            _sec = get_sector(_tr.symbol)
+            _etf = _SECTOR_ETF_MAP.get(_sec)
+            if _etf and _etf in _etf_closes and _tr.df is not None:
+                try:
+                    _etf_c  = _etf_closes[_etf]
+                    _stk_c  = _tr.df["Close"]
+                    _n      = min(len(_stk_c), len(_etf_c), 252)
+                    if _n >= 60:
+                        _sp = float(_stk_c.iloc[-1] / _stk_c.iloc[-_n] - 1)
+                        _ep = float(_etf_c.iloc[-1] / _etf_c.iloc[-_n] - 1)
+                        _tr.rs_vs_sector = round(_sp - _ep, 4)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     _log.info("[tudor] 10Y yield slope=%.0fbps (%s)",
               _rate_slope_bps,
               "rising-hard(-1.0)" if _rate_slope_bps > 50 else
@@ -1227,12 +1319,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             scored.append((vcp, trend_r, 0.0))
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps)
-        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f rate=%+.0fbps → composite=%.2f",
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope)
+        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f rate=%+.0fbps vix_sl=%.1f → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps), sec_bonus,
-                  _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, _rate_slope_bps, cs)
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope), sec_bonus,
+                  _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, _rate_slope_bps, _vix_slope, cs)
         scored.append((vcp, trend_r, cs))
 
     # Filter: require composite >= 5.0 (guards against weak Simons/Tudor context)
@@ -1277,13 +1369,25 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             continue
 
         # Correlation check: skip if too similar to any held position
+        # Super-sector concentration guard: limit growth/cyclical/defensive exposure
+        _vcp_super = _SUPER_SECTOR.get(get_sector(vcp.symbol), "other")
+        _max_super  = max(3, round(RISK["max_positions"] * 0.60))
+        _super_cnt  = sum(
+            1 for _s in (held_symbols | orders_to_skip)
+            if _SUPER_SECTOR.get(get_sector(_s), "other") == _vcp_super
+        )
+        if _super_cnt >= _max_super:
+            _log.info("[main] %s skipped — super-sector '%s' at cap (%d/%d)",
+                      vcp.symbol, _vcp_super, _super_cnt, _max_super)
+            continue
+
         if _is_correlated(vcp.symbol, held_symbols):
             _log.info("[main] %s skipped — high correlation with existing position", vcp.symbol)
             continue
 
         # Adaptive risk: composite score → VIX-adjusted → regime/loss multipliers
         base_risk = RISK["risk_per_trade_pct"]
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:

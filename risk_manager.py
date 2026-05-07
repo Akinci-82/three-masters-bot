@@ -202,8 +202,10 @@ def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
 
     if pnl_pct < 0:
         state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+        state["consecutive_wins"]   = 0
     else:
         state["consecutive_losses"] = 0
+        state["consecutive_wins"]   = state.get("consecutive_wins", 0) + 1
 
     _save(state)
     _log.info("[risk] %s closed | pnl=%.1f%% | heat now=%.1f%% | day_pnl=%.1f%%",

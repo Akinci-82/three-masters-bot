@@ -135,6 +135,29 @@ def _place_market_sell(symbol: str, qty: int) -> bool:
         return False
 
 
+def _place_limit_sell(symbol: str, qty: int, limit_price: float) -> bool:
+    """Limit sell for partial exits — captures slightly better fills than market."""
+    try:
+        body = {
+            "symbol": symbol,
+            "qty":    str(qty),
+            "side":   "sell",
+            "type":   "limit",
+            "time_in_force": "day",
+            "limit_price":   str(round(limit_price, 2)),
+        }
+        r = requests.post(
+            f"{_alpaca_base()}/orders",
+            json=body, headers=_alpaca_headers(), timeout=10
+        )
+        r.raise_for_status()
+        _log.info("[monitor] Limit sell %d × %s @ $%.2f submitted", qty, symbol, limit_price)
+        return True
+    except Exception as e:
+        _log.warning("[monitor] limit_sell(%s, %d) error: %s — falling back to market", symbol, qty, e)
+        return _place_market_sell(symbol, qty)
+
+
 def _place_stop(symbol: str, qty: int, stop_price: float) -> str | None:
     """Place hard stop. Returns Alpaca order ID on success, None on failure."""
     try:
@@ -597,7 +620,8 @@ def check_positions() -> None:
 
         if pnl_pct >= partial1_trigger and not sym.get("partial1_done"):
             sell_qty = max(1, round(initial_qty / 3))
-            if _place_market_sell(symbol, sell_qty):
+            _lim1 = round(cur_price * 0.999, 2)  # 0.1% below market — fast fill, better price
+            if _place_limit_sell(symbol, sell_qty, _lim1):
                 sym["partial1_done"] = True
                 sym["partial_done"]  = True   # backward-compat for time stop check
                 sym["partial_qty"]   = sell_qty
@@ -612,7 +636,8 @@ def check_positions() -> None:
               not sym.get("partial2_done")):
             already_sold = sym.get("partial_qty", 0)
             sell_qty2 = max(1, round(initial_qty / 3))
-            if _place_market_sell(symbol, sell_qty2):
+            _lim2 = round(cur_price * 0.999, 2)
+            if _place_limit_sell(symbol, sell_qty2, _lim2):
                 sym["partial2_done"]  = True
                 sym["partial2_qty"]   = sell_qty2
                 sym["partial_qty"]    = already_sold + sell_qty2
@@ -766,6 +791,45 @@ def check_positions() -> None:
                                 pass
             except Exception as _e:
                 _log.debug("[monitor] Climax check %s failed: %s", symbol, _e)
+
+    # ── Telegram proximity alerts (once per day per position) ────────────────
+    for _sym_a, _sym_d in state.items():
+        if _sym_a not in {p["symbol"] for p in positions}:
+            continue
+        _alert_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if _sym_d.get("_alert_date") == _alert_today:
+            continue
+        _sym_d["_alert_date"] = _alert_today
+        _alerts = []
+        _ac    = float(_sym_d.get("avg_cost", 0) or 0)
+        _lp    = float(_sym_d.get("last_price", _ac) or _ac)
+        _pnl   = (_lp - _ac) / _ac if _ac > 0 else 0.0
+        _sl    = float(_sym_d.get("stop_loss", 0) or 0)
+        # Alert 1: position within 2% of stop — danger zone
+        if _sl > 0 and _lp > 0 and _lp < _sl * 1.02:
+            _margin = (_lp / _sl - 1) * 100
+            _alerts.append(f"⚠️ *{_sym_a}* near stop ${_sl:.2f} — {_margin:+.1f}% above")
+        # Alert 2: approaching B1 (+10%) partial trigger
+        if not _sym_d.get("partial1_done") and 0.07 <= _pnl < 0.10:
+            _alerts.append(f"🎯 *{_sym_a}* approaching +10%% target (now {_pnl*100:+.1f}%%)")
+        # Alert 3: earnings within 3–7 days — review protection
+        _de = _sym_d.get("days_to_earnings")
+        if _de is not None and 3 <= _de <= 7:
+            _alerts.append(f"📅 *{_sym_a}* earnings in {_de} days — check protection")
+        if _alerts:
+            try:
+                import requests as _rqa, os as _osa
+                _tok = _osa.getenv("TELEGRAM_BOT_TOKEN", "")
+                _cid = _osa.getenv("TELEGRAM_CHAT_ID", "")
+                if _tok and _cid:
+                    for _alert_msg in _alerts:
+                        _rqa.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
+                                  json={"chat_id": _cid, "parse_mode": "Markdown",
+                                        "text": _alert_msg},
+                                  timeout=5)
+                        changed = True
+            except Exception:
+                pass
 
     # Clean up state for positions that are now closed — call close_trade()
     # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.
