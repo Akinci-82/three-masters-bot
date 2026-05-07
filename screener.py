@@ -166,6 +166,32 @@ def _rs_rating(close: pd.Series, spy_close: pd.Series) -> float:
     return float(np.clip(rs, 1, 99))
 
 
+def _check_monthly_context(symbol: str) -> tuple[bool, str]:
+    """
+    Verify monthly chart is in Stage 2 uptrend: price above MA10m and MA40m.
+    Uses 5-year monthly bars so we have enough history for MA40m.
+    Returns (True, note) on failure — never blocks for missing data.
+    """
+    try:
+        df_m    = yf.Ticker(symbol).history(period="5y", interval="1mo", auto_adjust=True)
+        if len(df_m) < 12:
+            return True, "insufficient_monthly_data"
+        close_m  = df_m["Close"]
+        ma10m    = float(close_m.rolling(10).mean().iloc[-1])
+        price_m  = float(close_m.iloc[-1])
+        if price_m < ma10m:
+            return False, f"monthly_below_MA10m(${ma10m:.0f})"
+        if len(df_m) >= 40:
+            ma40m = float(close_m.rolling(40).mean().iloc[-1])
+            if price_m < ma40m:
+                return False, f"monthly_below_MA40m(${ma40m:.0f})"
+            if ma10m < ma40m:
+                return False, "monthly_MA10m_below_MA40m"
+        return True, "monthly_stage2_ok"
+    except Exception as e:
+        return True, f"monthly_check_skipped:{e}"
+
+
 def _check_weekly_context(symbol: str) -> tuple[bool, str]:
     """
     Verify that the weekly chart confirms the uptrend.
@@ -305,6 +331,7 @@ class TrendResult:
     rs_weekly_confirmed: bool    = False  # weekly RS also at 52w high (daily+weekly = institutional)
     ad_ratio: float              = 1.0    # up-vol / down-vol last 50 bars (>1 = accumulation)
     short_ratio: float | None    = None   # days to cover (high = squeeze potential)
+    monthly_stage2: bool         = True   # monthly chart price > MA10m + MA40m (Stage 2 uptrend)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -340,6 +367,10 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         df     = ticker.history(period="1y", interval="1d", auto_adjust=True)
         if df.empty or len(df) < 150:
             return TrendResult(symbol=symbol, passed=False, fail_reason="insufficient_data")
+        # IPO age filter: <240 bars on 1-year download = stock public <~1 year
+        # New listings lack the base-building and institutional accumulation VCPs require
+        if len(df) < 240:
+            return TrendResult(symbol=symbol, passed=False, fail_reason="ipo_too_recent")
 
         close  = df["Close"]
         volume = df["Volume"]
@@ -438,6 +469,18 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             if not weekly_ok:
                 result.fail_reason = weekly_note
                 return result
+
+        # 5b. Monthly Stage 2: three-timeframe alignment (monthly+weekly+daily)
+        if cfg.get("monthly_context", True):
+            monthly_ok, monthly_note = _check_monthly_context(symbol)
+            result.monthly_stage2 = monthly_ok
+            if not monthly_ok:
+                # Soft reject: only block if weekly also shows weakness
+                # (monthly alone may lag; require both to fail before blocking)
+                if not result.weekly_ok or weekly_note.startswith("weekly_MA"):
+                    result.fail_reason = monthly_note
+                    return result
+                _log.debug("[screen] %s monthly Stage 2 weak (%s) — weekly OK, continuing", symbol, monthly_note)
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through

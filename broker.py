@@ -71,15 +71,18 @@ def place_buy_stop(symbol: str, qty: int, stop_price: float) -> dict | None:
     Placed after close (22:30 CEST) — triggers during the NEXT trading day if price breaks out.
     """
     try:
+        _limit = round(stop_price * 1.005, 2)  # 0.5% above stop — caps slippage at entry
         order = get_api().submit_order(
             symbol=symbol,
             qty=qty,
             side="buy",
-            type="stop",
+            type="stop_limit",
             stop_price=round(stop_price, 2),
+            limit_price=_limit,
             time_in_force="gtc",   # GTC: survives overnight, executes next trading day
         )
-        _log.info("[broker] BUY-STOP %s qty=%d stop=$%.2f id=%s", symbol, qty, stop_price, order.id)
+        _log.info("[broker] BUY-STOP-LIMIT %s qty=%d stop=$%.2f limit=$%.2f id=%s",
+                  symbol, qty, stop_price, _limit, order.id)
         return {"id": order.id, "symbol": symbol, "qty": qty, "stop": stop_price, "type": "buy_stop"}
     except Exception as e:
         _log.error("[broker] BUY-STOP %s failed: %s", symbol, e)
@@ -139,7 +142,8 @@ def get_open_orders() -> list[dict]:
         return [
             {"id": o.id, "symbol": o.symbol, "qty": float(o.qty),
              "type": o.type, "stop_price": float(o.stop_price or 0),
-             "side": o.side, "status": o.status}
+             "side": o.side, "status": o.status,
+             "created_at": str(o.created_at) if hasattr(o, "created_at") else ""}
             for o in get_api().list_orders(status="open")
         ]
     except Exception:

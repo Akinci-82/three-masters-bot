@@ -179,7 +179,7 @@ def _send_morning_briefing() -> None:
         equity    = acct["portfolio_value"]
         positions = get_positions()
         buy_stops = [o for o in get_open_orders()
-                     if o.get("side") == "buy" and o.get("type") == "stop"]
+                     if o.get("side") == "buy" and o.get("type") in ("stop", "stop_limit")]
 
         lines = [f"🌅 *Three Masters — Morning Briefing {date.today()}*",
                  f"Portfolio: ${equity:,.0f}"]
@@ -299,7 +299,7 @@ def _opening_range_check() -> None:
         from risk_manager import _load as _lrs, _save as _srs
 
         buy_stops = [o for o in get_open_orders()
-                     if o.get("side") == "buy" and o.get("type") == "stop"]
+                     if o.get("side") == "buy" and o.get("type") in ("stop", "stop_limit")]
         if not buy_stops:
             return
 
@@ -683,6 +683,23 @@ def _minervini_score(vcp) -> float:
     return min(q + conf + tight_b + vol_b + bvol_b + rs_b, 10.0)
 
 
+def _fetch_10y_yield_slope() -> float:
+    """
+    Return 20-day change in US 10Y Treasury yield in basis points (^TNX).
+    Positive = yields rising = headwind for growth/tech stocks.
+    Returns 0.0 on failure.
+    """
+    try:
+        import yfinance as _yf
+        hist = _yf.Ticker("^TNX").history(period="35d", interval="1d", auto_adjust=False)
+        if len(hist) >= 21:
+            # ^TNX is in %, e.g. 4.50 means 4.50% — convert change to bps
+            return float((hist["Close"].iloc[-1] - hist["Close"].iloc[-21]) * 100)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _dynamic_min_composite() -> float:
     """
     Auto-raise MIN_COMPOSITE to 6.5 if low-score bucket (5.0–6.5) has negative expectancy.
@@ -765,16 +782,21 @@ def _simons_score(trend) -> float:
     days_earn = getattr(trend, "days_to_earnings", None)
     earn_pts  = (0.5 if days_earn is not None and 28 <= days_earn <= 56
                  and eps_g is not None and eps_g >= 0.25 else 0.0)
+    # Monthly Stage 2: three-timeframe alignment (monthly+weekly+daily) confirms uptrend
+    monthly_s2 = getattr(trend, "monthly_stage2", True)
+    monthly_pts = 0.5 if monthly_s2 else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
-               + ad_pts + short_pts + earn_pts, 10.0)
+               + ad_pts + short_pts + earn_pts + monthly_pts, 10.0)
 
 
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
-                  power_trend: bool = False, pcr: float = 0.7) -> float:
+                  power_trend: bool = False, pcr: float = 0.7,
+                  rate_slope_bps: float = 0.0) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
     power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
     pcr = CBOE Put/Call ratio: >1.0 fear=+0.5, <0.6 greed=-0.5.
+    rate_slope_bps = 20-day change in 10Y yield; >50bps rising = -1.0 pts.
     """
     reg_pts  = {"bull": 3.0, "neutral": 1.5, "bear": 0.0}.get(regime, 3.0)
     losses   = risk_state.get("consecutive_losses", 0)
@@ -787,23 +809,26 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     power_pts = 1.0 if power_trend else 0.0
     # Put/Call ratio: >1.0 = fear (contrarian buy), <0.6 = complacency (caution)
     pcr_pts   = 0.5 if pcr > 1.0 else (-0.5 if pcr < 0.6 else 0.0)
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts, 10.0)
+    # Rate sensitivity: rapidly rising yields = headwind for growth stocks
+    rate_pts  = -1.0 if rate_slope_bps > 50 else (-0.5 if rate_slope_bps > 25 else 0.0)
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
                      sector_bonus: float = 0.0, breadth_pct: float = 0.5,
-                     power_trend: bool = False, pcr: float = 0.7) -> float:
+                     power_trend: bool = False, pcr: float = 0.7,
+                     rate_slope_bps: float = 0.0) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
-      Simons     30% — RS strength, RS line at high, RSI quality, 52w proximity
-      Tudor      10% — market regime, loss streak, heat, breadth, power trend, PCR
+      Simons     30% — RS strength, RS line at high, RSI quality, 52w proximity, monthly Stage 2
+      Tudor      10% — regime, loss streak, heat, breadth, power trend, PCR, rate slope
       sector_bonus ±0.5 — sector outperforming/underperforming SPY (Stage 2 required)
     Minimum 5.0 required to place an order.
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
@@ -931,7 +956,7 @@ def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
     from broker import get_open_orders, cancel_all_orders as _cancel_sym
     existing = {
         o["symbol"]: o for o in get_open_orders()
-        if o.get("side") == "buy" and o.get("type") == "stop"
+        if o.get("side") == "buy" and o.get("type") in ("stop", "stop_limit")
     }
     new_map  = {r.symbol: r.breakout_level for r in vcp_passed}
     keep: set[str] = set()
@@ -1184,8 +1209,13 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _current_vix = _fetch_vix()
     _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
     sector_momentum, sector_stage2 = _sector_momentum_scores()
-    _power_trend  = _fetch_power_trend()
-    _current_pcr  = _fetch_pcr()
+    _power_trend      = _fetch_power_trend()
+    _current_pcr      = _fetch_pcr()
+    _rate_slope_bps   = _fetch_10y_yield_slope()
+    _log.info("[tudor] 10Y yield slope=%.0fbps (%s)",
+              _rate_slope_bps,
+              "rising-hard(-1.0)" if _rate_slope_bps > 50 else
+              ("rising(-0.5)" if _rate_slope_bps > 25 else "neutral"))
     if _power_trend:
         _log.info("[tudor] Power Trend active (SPY 21d EMA > 50d EMA \u22658 days) +1.0 T-pts")
     _log.info("[tudor] PCR=%.2f (%s)", _current_pcr,
@@ -1197,12 +1227,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             scored.append((vcp, trend_r, 0.0))
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr)
-        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f → composite=%.2f",
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps)
+        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f rate=%+.0fbps → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr), sec_bonus,
-                  _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, cs)
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps), sec_bonus,
+                  _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, _rate_slope_bps, cs)
         scored.append((vcp, trend_r, cs))
 
     # Filter: require composite >= 5.0 (guards against weak Simons/Tudor context)
@@ -1211,6 +1241,15 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     below = [v.symbol for v, t, cs in scored if cs < _MIN_COMPOSITE]
     if below:
         _log.info("[score] Filtered out (composite < %.1f): %s", _MIN_COMPOSITE, below)
+    # Cancel retained orders for symbols that now score below threshold
+    _scored_syms = {v.symbol for v, t, cs in vcp_scored}
+    _stale_orders = [sym for sym in orders_to_skip if sym not in _scored_syms]
+    if _stale_orders:
+        from broker import cancel_all_orders as _cancel_stale
+        for _sym in _stale_orders:
+            _cancel_stale(_sym)
+            orders_to_skip.discard(_sym)
+            _log.info("[score] Cancelled stale order %s — composite dropped below %.1f", _sym, _MIN_COMPOSITE)
 
     # Sort by composite descending — Minervini dominates but Simons/Tudor contribute
     vcp_scored.sort(key=lambda x: -x[2])

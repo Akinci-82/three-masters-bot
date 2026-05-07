@@ -382,6 +382,33 @@ def check_positions() -> None:
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
         time_stop_days  = 20   if composite >= 8.0 else cfg.get("time_stop_trading_days", 15)
 
+        # ── Step G: Gap-up harvest — sell 50% on overnight gap ≥12% ─────────────
+        # Large gaps often fill; taking half off protects gains from mean-reversion
+        _gap_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (not sym.get("gap_harvest_done")
+                and not sym.get("partial1_done")
+                and sym.get("_gap_check_date") != _gap_today
+                and pnl_pct > 0):
+            sym["_gap_check_date"] = _gap_today
+            try:
+                import yfinance as _yf_g
+                _dfg = _yf_g.Ticker(symbol).history(
+                    period="5d", interval="1d", auto_adjust=True)
+                if len(_dfg) >= 2:
+                    _prev_close = float(_dfg["Close"].iloc[-2])
+                    _gap_pct    = (cur_price - _prev_close) / _prev_close if _prev_close > 0 else 0.0
+                    if _gap_pct >= 0.12:
+                        _gap_qty = max(1, round(qty * 0.50))
+                        _log.warning("[monitor] %s GAP-UP HARVEST +%.1f%% overnight — selling %d sh (50%%)",
+                                     symbol, _gap_pct * 100, _gap_qty)
+                        if _place_market_sell(symbol, _gap_qty):
+                            sym["gap_harvest_done"] = True
+                            sym["partial1_done"]    = True
+                            sym["partial_qty"]      = _gap_qty
+                            changed = True
+            except Exception as _ge:
+                _log.debug("[monitor] gap harvest %s: %s", symbol, _ge)
+
         # ── Earnings protection — tighten or close before earnings report ────────
         _earn_check_date = sym.get("_earnings_checked_date", "")
         _today_str = datetime.now(_ET).strftime("%Y-%m-%d")
@@ -475,6 +502,53 @@ def check_positions() -> None:
                     sym["stop_order_id"] = oid
                     sym["stop_type"] = "trailing"
                     changed = True
+
+        # ── Step A-trail: Pivot-based trailing stop ────────────────────────────────
+        # After 5+ days with open profit, ratchet stop up to latest swing low − 1%.
+        # Minervini uses pivot lows as natural stop levels; more room than fixed %.
+        if (sym.get("trailing_stop_placed")
+                and not sym.get("breakeven_done")
+                and not sym.get("partial1_done")
+                and pnl_pct > 0.01):
+            _ed_pt = sym.get("entry_date", "")
+            if _ed_pt and _trading_days_held(_ed_pt) >= 5:
+                _pt_today = datetime.now(_ET).strftime("%Y-%m-%d")
+                if sym.get("_pivot_trail_date") != _pt_today:
+                    sym["_pivot_trail_date"] = _pt_today
+                    try:
+                        import yfinance as _yf_pt
+                        _dfp = _yf_pt.Ticker(symbol).history(
+                            period="30d", interval="1d", auto_adjust=True)
+                        if len(_dfp) >= 5:
+                            # Find most recent swing low in last 20 bars (skip last 2 incomplete)
+                            _lows  = _dfp["Low"].values
+                            _n_pt  = min(20, len(_lows) - 2)
+                            _swing = None
+                            for _i in range(1, _n_pt):
+                                if _lows[_i] < _lows[_i - 1] and _lows[_i] < _lows[_i + 1]:
+                                    _swing = _lows[_i]  # keep last (most recent) swing low
+                            if _swing is not None:
+                                _pivot_stop = round(float(_swing) * 0.99, 2)  # 1% cushion
+                                _cur_stp    = sym.get("stop_loss", 0.0)
+                                # Ratchet up only — never widen the stop
+                                if _pivot_stop > _cur_stp and _pivot_stop < cur_price * 0.97:
+                                    _rem_pt = qty - sym.get("partial_qty", 0)
+                                    if _rem_pt > 0:
+                                        _cancel_stop_orders(symbol)
+                                        _pt_oid = _place_stop(symbol, _rem_pt, _pivot_stop)
+                                        if _pt_oid:
+                                            sym["stop_loss"]            = _pivot_stop
+                                            sym["stop_order_id"]        = _pt_oid
+                                            sym["stop_type"]            = "pivot_trail"
+                                            sym["trailing_stop_placed"] = True
+                                            changed = True
+                                            _log.info(
+                                                "[monitor] %s PIVOT TRAIL: stop $%.2f→$%.2f "
+                                                "(swing low day %d)",
+                                                symbol, _cur_stp, _pivot_stop,
+                                                _trading_days_held(_ed_pt))
+                    except Exception as _pte:
+                        _log.debug("[monitor] pivot trail %s: %s", symbol, _pte)
 
         # ── Step A+: MA20 dynamic trail — after 10 trading days with profit ────────
         # Switch from fixed pivot stop to MA20*0.98 (ratchet up only).
