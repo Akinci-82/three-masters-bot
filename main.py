@@ -259,6 +259,54 @@ def _send_morning_briefing() -> None:
         regime_emoji = {"bull": "🟢", "neutral": "🟡", "bear": "🔴"}[regime]
         lines.append(f"\nMarket: {regime_emoji} {regime.upper()}  SPY ${spy_price:.0f} ({spy_pct:+.1f}% vs MA200)")
 
+        # ── Breakout volume check for held positions ──────────────────────────
+        if positions:
+            try:
+                import yfinance as _yf_bv
+                _vol_warns = []
+                for _p in positions:
+                    _sym_bv = _p["symbol"]
+                    try:
+                        _dfbv   = _yf_bv.Ticker(_sym_bv).history(period="60d", interval="1d", auto_adjust=True)
+                        if len(_dfbv) >= 25:
+                            _v1     = float(_dfbv["Volume"].iloc[-1])
+                            _avg50  = float(_dfbv["Volume"].tail(50).mean())
+                            _ratio  = _v1 / _avg50 if _avg50 > 0 else 1.0
+                            if _ratio < 0.80:
+                                _vol_warns.append(f"  ⚠️ *{_sym_bv}* weak volume: {_ratio:.1f}× avg — possible distribution")
+                    except Exception:
+                        pass
+                if _vol_warns:
+                    lines.append("\n*Volume alerts:*")
+                    lines.extend(_vol_warns)
+            except Exception:
+                pass
+
+        # ── Sector rotation alert — sectors crossing into leadership ──────────────
+        try:
+            import yfinance as _yf_sr
+            _spy_h  = _yf_sr.Ticker("SPY").history(period="60d", interval="1d", auto_adjust=True)["Close"]
+            _sr_etfs = {"XLK":"Tech","XLV":"Health","XLF":"Finance","XLE":"Energy",
+                        "XLI":"Industrl","XLC":"Comm","XLY":"Cyclical","XLP":"Defensive",
+                        "XLU":"Utilities","XLB":"Materials","XLRE":"Real Estate"}
+            _sr_alerts = []
+            for _etf, _sname in _sr_etfs.items():
+                try:
+                    _h = _yf_sr.Ticker(_etf).history(period="60d", interval="1d", auto_adjust=True)["Close"]
+                    _n = min(len(_h), len(_spy_h), 30)
+                    if _n >= 25:
+                        _rel_now  = float(_h.iloc[-1]/_h.iloc[-22] - _spy_h.iloc[-1]/_spy_h.iloc[-22])
+                        _rel_prev = float(_h.iloc[-6]/_h.iloc[-27] - _spy_h.iloc[-6]/_spy_h.iloc[-27])
+                        if _rel_prev < -0.01 and _rel_now > 0.005:
+                            _sr_alerts.append(f"  🔄 *{_sname}* ({_etf}) entering leadership: {_rel_now*100:+.1f}% vs SPY")
+                except Exception:
+                    pass
+            if _sr_alerts:
+                lines.append("\n*Sector rotation:*")
+                lines.extend(_sr_alerts)
+        except Exception:
+            pass
+
         _tg("\n".join(lines))
         _log.info("[briefing] Morning briefing sent")
     except Exception as e:
@@ -823,6 +871,28 @@ def _simons_score(trend) -> float:
                  else (0.25 if roe_val is not None and roe_val >= 0.10 else 0.0))
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts, 10.0)
+
+
+def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
+    """Reduce position size when 14-day ATR/price > 4%% — avoids oversizing volatile stocks.
+    High ATR means wider natural swings; 1R per trade requires fewer shares.
+    """
+    try:
+        import yfinance as _yf_atr
+        _df = _yf_atr.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
+        if len(_df) < 15:
+            return 1.0
+        _hi, _lo, _cl = _df["High"].values, _df["Low"].values, _df["Close"].values
+        _tr = [max(_hi[i] - _lo[i], abs(_hi[i] - _cl[i-1]), abs(_lo[i] - _cl[i-1]))
+               for i in range(1, len(_cl))]
+        _atr14 = sum(_tr[-14:]) / 14
+        _pct   = _atr14 / entry_price if entry_price > 0 else 0
+        if _pct <= 0.02:  return 1.00   # low volatility — full size
+        if _pct <= 0.04:  return 0.90   # normal
+        if _pct <= 0.06:  return 0.75   # elevated
+        return 0.60                      # high volatility — reduced
+    except Exception:
+        return 1.0
 
 
 def _fetch_distribution_days() -> int:
@@ -1448,7 +1518,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
         # Adaptive risk: composite score → VIX-adjusted → regime/loss multipliers
         base_risk = RISK["risk_per_trade_pct"]
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor
+        _atr_f    = _atr_volatility_factor(vcp.symbol, vcp.breakout_level)
+        if _atr_f < 1.0:
+            _log.info("[main] %s ATR factor %.0f%% — elevated volatility", vcp.symbol, _atr_f * 100)
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:

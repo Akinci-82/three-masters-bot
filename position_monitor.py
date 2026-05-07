@@ -526,6 +526,38 @@ def check_positions() -> None:
                     sym["stop_type"] = "trailing"
                     changed = True
 
+        # ── Step Z: Failed breakout detection — exit if price falls back under pivot ──
+        # Within 5 trading days of entry: price back below buy_stop = failed breakout.
+        # Minervini exits immediately — cut losses before they compound.
+        _buy_stp_z = sym.get("buy_stop", 0.0)
+        _ed_z      = sym.get("entry_date", "")
+        if (_buy_stp_z > 0
+                and not sym.get("partial1_done")
+                and not sym.get("failed_breakout_done")
+                and _ed_z
+                and 1 <= _trading_days_held(_ed_z) <= 5
+                and cur_price < _buy_stp_z):
+            _rem_z = qty - sym.get("partial_qty", 0)
+            _log.warning("[monitor] %s FAILED BREAKOUT — cur $%.2f < pivot $%.2f (day %d)",
+                         symbol, cur_price, _buy_stp_z, _trading_days_held(_ed_z))
+            _cancel_stop_orders(symbol)
+            if _rem_z > 0 and _place_market_sell(symbol, _rem_z):
+                sym["failed_breakout_done"] = True
+                changed = True
+                try:
+                    import requests as _rz, os as _oz
+                    _tok = _oz.getenv("TELEGRAM_BOT_TOKEN", "")
+                    _cid = _oz.getenv("TELEGRAM_CHAT_ID", "")
+                    if _tok and _cid:
+                        _rz.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
+                                 json={"chat_id": _cid, "parse_mode": "Markdown",
+                                       "text": (f"❌ *Failed Breakout — {symbol}*\n"
+                                                f"Price ${cur_price:.2f} fell back under pivot ${_buy_stp_z:.2f}\n"
+                                                f"Day {_trading_days_held(_ed_z)} — cutting loss")},
+                                 timeout=8)
+                except Exception:
+                    pass
+
         # ── Step A-trail: Pivot-based trailing stop ────────────────────────────────
         # After 5+ days with open profit, ratchet stop up to latest swing low − 1%.
         # Minervini uses pivot lows as natural stop levels; more room than fixed %.
@@ -669,6 +701,28 @@ def check_positions() -> None:
                     _log.info("[monitor] %s stop moved to breakeven $%.2f (+%.1f%%)",
                               symbol, breakeven, pnl_pct * 100)
 
+        # ── Profit lock: raise stop to +7% when gain ≥ +15% ─────────────────────
+        # Protects runner profit between B1 (+10%) and B2 (measured move).
+        # Ensures at least 7%% gain is locked even if position reverses before B2.
+        if (sym.get("partial1_done")
+                and not sym.get("partial2_done")
+                and not sym.get("profit_locked")
+                and pnl_pct >= 0.15):
+            _lock_stop = round(avg_cost * 1.07, 2)
+            _cur_stp_l = sym.get("stop_loss", 0.0)
+            if _lock_stop > _cur_stp_l:
+                _runner_l = qty - sym.get("partial_qty", 0)
+                if _runner_l > 0:
+                    _cancel_stop_orders(symbol)
+                    _lock_oid = _place_stop(symbol, _runner_l, _lock_stop)
+                    if _lock_oid:
+                        sym["profit_locked"]  = True
+                        sym["stop_loss"]       = _lock_stop
+                        sym["stop_order_id"]   = _lock_oid
+                        changed = True
+                        _log.info("[monitor] %s PROFIT LOCK +15%%: stop raised to +7%% ($%.2f)",
+                                  symbol, _lock_stop)
+
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
         entry_date_str = sym.get("entry_date", "")
@@ -756,6 +810,65 @@ def check_positions() -> None:
                                 pass
             except Exception as _e:
                 _log.debug("[monitor] pyramid check %s: %s", symbol, _e)
+
+        # ── Step F2: 10-week MA follow-on buy (O'Neil second add-on) ───────────
+        # After partial1 (+10%): if price pulls back to MA10w on drying volume,
+        # add 25% — classic second buy point, improves average cost on winners.
+        if (sym.get("partial1_done")
+                and not sym.get("partial2_done")
+                and not sym.get("f2_done")
+                and pnl_pct >= 0.05):
+            _f2_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_f2_check_date") != _f2_today:
+                sym["_f2_check_date"] = _f2_today
+                try:
+                    import yfinance as _yf_f2
+                    _dfw2 = _yf_f2.Ticker(symbol).history(
+                        period="6mo", interval="1wk", auto_adjust=True)
+                    _dfd2 = _yf_f2.Ticker(symbol).history(
+                        period="30d", interval="1d", auto_adjust=True)
+                    if len(_dfw2) >= 12 and len(_dfd2) >= 10:
+                        _ma10w_f2 = float(_dfw2["Close"].tail(10).mean())
+                        _near_10w = abs(cur_price - _ma10w_f2) / _ma10w_f2 <= 0.03
+                        _vol5_f2  = float(_dfd2["Volume"].tail(5).mean())
+                        _vol20_f2 = float(_dfd2["Volume"].mean())
+                        _dryup_f2 = _vol5_f2 < _vol20_f2 * 0.80  # volume contracting = healthy
+                        if _near_10w and _dryup_f2:
+                            from risk_manager import check_can_trade as _cct_f2
+                            from broker import place_market_buy as _pmb_f2, get_account as _ga_f2
+                            _pf_f2   = float(_ga_f2()["portfolio_value"])
+                            _add_f2  = max(1, round(sym.get("initial_qty", qty) * 0.25))
+                            _sl_f2   = sym.get("stop_loss", 0.0)
+                            if _sl_f2 > 0 and cur_price > _sl_f2:
+                                _arisk_f2 = (_add_f2 * (cur_price - _sl_f2)) / _pf_f2
+                                _ok_f2, _ = _cct_f2(_pf_f2, _arisk_f2)
+                                if _ok_f2:
+                                    _ord_f2 = _pmb_f2(symbol, _add_f2)
+                                    if _ord_f2:
+                                        sym["f2_done"]  = True
+                                        sym["f2_qty"]   = _add_f2
+                                        sym["f2_price"] = cur_price
+                                        changed = True
+                                        _log.info(
+                                            "[monitor] 📈 F2 FOLLOW-ON %s — added %d sh @ $%.2f"
+                                            " (MA10w $%.2f, vol drying up)",
+                                            symbol, _add_f2, cur_price, _ma10w_f2)
+                                        try:
+                                            import requests as _rf2, os as _of2
+                                            _tok = _of2.getenv("TELEGRAM_BOT_TOKEN", "")
+                                            _cid = _of2.getenv("TELEGRAM_CHAT_ID", "")
+                                            if _tok and _cid:
+                                                _rf2.post(
+                                                    f"https://api.telegram.org/bot{_tok}/sendMessage",
+                                                    json={"chat_id": _cid, "parse_mode": "Markdown",
+                                                          "text": (f"📈 *F2 Follow-On — {symbol}*\n"
+                                                                   f"Pulled back to MA10w ${_ma10w_f2:.2f}, vol drying up\n"
+                                                                   f"Added {_add_f2} sh @ ${cur_price:.2f}")},
+                                                    timeout=8)
+                                        except Exception:
+                                            pass
+                except Exception as _ef2:
+                    _log.debug("[monitor] F2 check %s: %s", symbol, _ef2)
 
         # ── Step E: Climax run / parabolic exit ────────────────────────────────
         # If stock has moved ≥ 25% in the last 5 trading days AND we see 3 up-days
@@ -873,6 +986,21 @@ def check_positions() -> None:
         _de = _sym_d.get("days_to_earnings")
         if _de is not None and 3 <= _de <= 7:
             _alerts.append(f"📅 *{_sym_a}* earnings in {_de} days — check protection")
+        # Alert 4: RS line divergence — stock at/near new high but RS declining
+        if _pnl >= 0.05 and not _sym_d.get("_rs_div_alerted"):
+            try:
+                import yfinance as _yf_div
+                _sd = _yf_div.Ticker(_sym_a).history(period="3mo", interval="1d", auto_adjust=True)["Close"]
+                _bd = _yf_div.Ticker("SPY").history(period="3mo", interval="1d", auto_adjust=True)["Close"]
+                if len(_sd) >= 20 and len(_bd) >= 20:
+                    _rs_d = _sd / _bd.reindex(_sd.index, method="ffill")
+                    _price_hi = _lp >= float(_sd.max()) * 0.97   # near 3mo high
+                    _rs_weak  = float(_rs_d.iloc[-1]) < float(_rs_d.tail(20).max()) * 0.95
+                    if _price_hi and _rs_weak:
+                        _sym_d["_rs_div_alerted"] = _alert_today
+                        _alerts.append(f"📉 *{_sym_a}* RS divergence — price at high but RS declining")
+            except Exception:
+                pass
         if _alerts:
             try:
                 import requests as _rqa, os as _osa
