@@ -37,7 +37,7 @@ def _alpaca_headers() -> dict:
 
 def _alpaca_base() -> str:
     from config import ALPACA_BASE_URL
-    return ALPACA_BASE_URL
+    return ALPACA_BASE_URL.rstrip("/") + "/v2"
 
 
 def _market_is_open() -> bool:
