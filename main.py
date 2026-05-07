@@ -442,6 +442,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
         total_trades = wins = losses = 0
         win_r_sum = loss_r_sum = 0.0
         journal_file = LOG_DIR / "trade_journal.jsonl"
+        score_buckets: dict[str, list] = {"5.0-6.0": [], "6.0-7.0": [], "7.0-8.0": [], "8.0+": []}
         if journal_file.exists():
             for line in journal_file.read_text().splitlines():
                 try:
@@ -454,6 +455,10 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     else:
                         losses += 1
                         loss_r_sum += r
+                    cs_val = float(t.get("composite_score", 0.0) or 0.0)
+                    bkt = ("8.0+" if cs_val >= 8.0 else "7.0-8.0" if cs_val >= 7.0
+                           else "6.0-7.0" if cs_val >= 6.0 else "5.0-6.0")
+                    score_buckets[bkt].append(r)
                 except Exception:
                     pass
 
@@ -480,6 +485,30 @@ def _send_weekly_report(portfolio_value: float) -> None:
             lines.append(f"Win rate: {win_rate:.0%}  ({wins}W / {losses}L)")
             lines.append(f"Avg win: {avg_win_r:+.2f}R  |  Avg loss: {avg_loss_r:+.2f}R")
             lines.append(f"Expectancy: {expectancy:+.2f}R per trade")
+        if any(score_buckets.values()):
+            lines.append(f"")
+            lines.append(f"*Score-bucket performance:*")
+            for bkt, rs_list in score_buckets.items():
+                if rs_list:
+                    _avg_r = sum(rs_list) / len(rs_list)
+                    _wr    = sum(1 for rr in rs_list if rr > 0) / len(rs_list)
+                    lines.append(
+                        f"  Score {bkt}: {len(rs_list)} trades  "
+                        f"avg {_avg_r:+.2f}R  WR={_wr:.0%}")
+        try:
+            _fb = {
+                "updated": today.isoformat(),
+                "total_trades": total_trades,
+                "score_buckets": {
+                    k: {"count": len(v),
+                        "avg_r": round(sum(v)/len(v), 3) if v else 0.0,
+                        "win_rate": round(sum(1 for rr in v if rr > 0)/len(v), 3) if v else 0.0}
+                    for k, v in score_buckets.items()
+                },
+            }
+            (LOG_DIR / "feedback_state.json").write_text(json.dumps(_fb, indent=2))
+        except Exception:
+            pass
         lines.append(f"")
         if ret_line:
             lines.append(ret_line)
@@ -555,6 +584,65 @@ def _vix_size_factor(vix: float) -> float:
     return 0.50
 
 
+# ── Macro calendar blackout (FOMC + CPI) ────────────────────────────────────
+_FOMC_2026 = [(1,29),(3,19),(5,7),(6,18),(7,30),(9,17),(10,29),(12,10)]
+_CPI_2026  = [(1,15),(2,12),(3,12),(4,10),(5,13),(6,11),(7,15),(8,12),(9,10),(10,14),(11,12),(12,10)]
+
+
+def _is_macro_blackout() -> tuple[bool, str]:
+    """Return (True, reason) if within 2 calendar days before FOMC or CPI release.
+    Avoids new entries ahead of binary macro events that gap past any stop.
+    """
+    today = date.today()
+    for (m, d) in _FOMC_2026 + _CPI_2026:
+        try:
+            event = date(today.year, m, d)
+        except ValueError:
+            continue
+        delta = (event - today).days
+        if 0 <= delta <= 2:
+            kind = "FOMC" if (m, d) in _FOMC_2026 else "CPI"
+            return True, f"{kind} {event}"
+    return False, ""
+
+
+# ── Power Trend (O'Neil / IBD) ────────────────────────────────────────────
+def _fetch_power_trend() -> bool:
+    """True if SPY 21d EMA > 50d EMA for 8+ consecutive days (O'Neil Power Trend).
+    Signals confirmed bull acceleration — adds +1.0 to Tudor Jones score.
+    """
+    try:
+        import yfinance as _yf
+        _df = _yf.Ticker("SPY").history(period="90d", interval="1d", auto_adjust=True)
+        c = _df["Close"]
+        ema21 = c.ewm(span=21, adjust=False).mean()
+        ema50 = c.ewm(span=50, adjust=False).mean()
+        return all(ema21.iloc[-i] > ema50.iloc[-i] for i in range(1, 9))
+    except Exception:
+        return False
+
+
+# ── Choppy market detection ────────────────────────────────────────────────
+def _is_market_choppy() -> bool:
+    """True if SPY ATR(14)/price < 0.6% for 10 consecutive days.
+    Compressed volatility = institutions waiting; momentum setups fail in chop.
+    When choppy: halve max_positions to preserve capital.
+    """
+    try:
+        import yfinance as _yf
+        _df = _yf.Ticker("SPY").history(period="30d", interval="1d", auto_adjust=True)
+        if len(_df) < 15:
+            return False
+        h = _df["High"].values
+        l = _df["Low"].values
+        c = _df["Close"].values
+        tr = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(c))]
+        spy_px = c[-1]
+        return all(t / spy_px < 0.006 for t in tr[-10:])
+    except Exception:
+        return False
+
+
 def _adaptive_risk_pct(composite: float, base_pct: float, vix: float = 20.0) -> float:
     """Scale position risk 1.5–2% based on composite score, then VIX-adjusted."""
     if composite >= 8.0:
@@ -612,13 +700,17 @@ def _simons_score(trend) -> float:
     eps_g   = getattr(trend, "eps_growth", None)
     eps_pts = (1.0 if eps_g is not None and eps_g >= 0.25
                else (0.5 if eps_g is not None and eps_g >= 0.10 else 0.0))
-    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts, 10.0)
+    # RS momentum: line trending up 4w>8w>12w = institutional accumulation building
+    rs_trend  = getattr(trend, "rs_trending", False)
+    trend_pts = 0.5 if rs_trend and not rs_leading else 0.0
+    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts, 10.0)
 
 
-def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5) -> float:
+def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
+                  power_trend: bool = False) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
-    breadth_pct = fraction of screened universe with price > MA50.
+    power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
     """
     reg_pts  = {"bull": 3.0, "neutral": 1.5, "bear": 0.0}.get(regime, 3.0)
     losses   = risk_state.get("consecutive_losses", 0)
@@ -626,24 +718,26 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5) -> flo
     heat     = risk_state.get("open_risk_pct", 0.0)
     heat_pts = 1.5 if heat < 0.02 else (0.75 if heat < 0.04 else 0.0)
     # Market breadth: % of screened universe trading above MA50
-    # > 65% → healthy internals (+2), 45-65% → neutral (+1), < 45% → weak (+0)
     breadth_pts = 2.0 if breadth_pct > 0.65 else (1.0 if breadth_pct > 0.45 else 0.0)
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts, 10.0)
+    # Power Trend: SPY 21d EMA > 50d EMA ≥8 days (O'Neil confirmation)
+    power_pts = 1.0 if power_trend else 0.0
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
-                     sector_bonus: float = 0.0, breadth_pct: float = 0.5) -> float:
+                     sector_bonus: float = 0.0, breadth_pct: float = 0.5,
+                     power_trend: bool = False) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
       Simons     30% — RS strength, RS line at high, RSI quality, 52w proximity
-      Tudor      10% — market regime, loss streak, heat, market breadth
+      Tudor      10% — market regime, loss streak, heat, breadth, power trend
       sector_bonus ±0.5 — sector outperforming/underperforming SPY
     Minimum 5.0 required to place an order.
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
@@ -954,6 +1048,21 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.info("[main] Neutral regime (SPY %+.1f%% vs MA200) — position sizing at 75%%",
                   spy_pct * 100)
 
+    # ── Macro blackout: skip new orders within 2 days of FOMC/CPI ────────────
+    _blackout, _blackout_reason = _is_macro_blackout()
+    if _blackout:
+        msg = (f"\U0001f4c5 *Macro Blackout \u2014 {_blackout_reason}*\n"
+               f"{len(vcp_passed)} VCP setup(s) found but no orders placed.\n"
+               f"FOMC/CPI within 2 days \u2014 avoiding binary event risk.")
+        _log.warning("[main] MACRO BLACKOUT (%s) \u2014 skipping order placement",
+                     _blackout_reason)
+        _tg(msg)
+        report["summary"] = f"macro_blackout_{_blackout_reason}"
+        report["vcp_found_no_orders"] = [r.symbol for r in vcp_passed]
+        _save_report(report)
+        _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
+        return
+
     # ── Layer 3 + Execution: Tudor Jones — Size + Place Orders ────────────────
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
     from risk_manager import position_size, register_trade, check_can_trade
@@ -965,7 +1074,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # Smart order management: retain unchanged orders, cancel stale/moved ones
     orders_to_skip = _smart_order_management(vcp_passed, held_symbols)
-    max_new_pos    = max(0, RISK["max_positions"] - len(positions) - len(orders_to_skip))
+    # Choppy market: halve max positions when SPY ATR is compressed 10+ days
+    _choppy = _is_market_choppy()
+    _eff_max = max(1, RISK["max_positions"] // 2) if _choppy else RISK["max_positions"]
+    if _choppy:
+        _log.warning("[tudor] CHOPPY MARKET detected — max positions halved to %d", _eff_max)
+    max_new_pos    = max(0, _eff_max - len(positions) - len(orders_to_skip))
 
     # Sector concentration tracking: count existing positions + retained orders
     sector_counts: dict[str, int] = {}
@@ -990,6 +1104,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _current_vix = _fetch_vix()
     _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
     sector_momentum = _sector_momentum_scores()
+    _power_trend = _fetch_power_trend()
+    if _power_trend:
+        _log.info("[tudor] Power Trend active (SPY 21d EMA > 50d EMA \u22658 days) +1.0 T-pts")
     scored  = []
     for vcp in vcp_passed:
         trend_r = trend_map.get(vcp.symbol)
@@ -997,12 +1114,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             scored.append((vcp, trend_r, 0.0))
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct)
-        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% → composite=%.2f",
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend)
+        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct), sec_bonus,
-                  _breadth_pct * 100, cs)
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend), sec_bonus,
+                  _breadth_pct * 100, "✓" if _power_trend else "✗", cs)
         scored.append((vcp, trend_r, cs))
 
     # Filter: require composite >= 5.0 (guards against weak Simons/Tudor context)

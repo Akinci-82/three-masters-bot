@@ -300,6 +300,8 @@ class TrendResult:
     rs_line_leading: bool     = False  # RS line at high while price still in base (strongest signal)
     eps_growth: float | None  = None   # trailing quarterly EPS growth (yfinance)
     revenue_growth: float | None = None  # trailing revenue growth (yfinance)
+    market_cap: float | None     = None   # yfinance marketCap in USD
+    rs_trending: bool            = False  # RS line rising: 4w > 8w > 12w (momentum building)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -311,18 +313,20 @@ class TrendResult:
                 f"MA20={self.ma20:.0f}/{self.ma50:.0f}/{self.ma200:.0f}{earn}")
 
 
-def _get_fundamentals(ticker) -> tuple[float | None, float | None]:
-    """Return (eps_quarterly_growth, revenue_growth) from yfinance. None = unavailable."""
+def _get_fundamentals(ticker) -> tuple[float | None, float | None, float | None]:
+    """Return (eps_quarterly_growth, revenue_growth, market_cap) from yfinance."""
     try:
         info = ticker.info
         eps_g = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
         rev_g = info.get("revenueGrowth")
+        mcap  = info.get("marketCap")
         return (
             float(eps_g) if eps_g is not None else None,
             float(rev_g) if rev_g is not None else None,
+            float(mcap)  if mcap  is not None else None,
         )
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
@@ -424,9 +428,16 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
-        eps_g, rev_g = _get_fundamentals(ticker)
+        eps_g, rev_g, market_cap = _get_fundamentals(ticker)
         result.eps_growth     = eps_g
         result.revenue_growth = rev_g
+        result.market_cap     = market_cap
+        # Minervini sweet spot: $200M–$25B (small/mid cap with growth potential)
+        # Mega-caps rarely make 20-40% VCP breakout moves
+        if market_cap is not None and (
+                market_cap < 200_000_000 or market_cap > 25_000_000_000):
+            result.fail_reason = f"market_cap_out_of_range(${market_cap/1e9:.1f}B)"
+            return result
         if eps_g is not None and eps_g < -0.10:
             result.fail_reason = f"eps_declining({eps_g:.0%})"
             return result
@@ -442,6 +453,14 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         )
         if result.rs_line_leading:
             _log.info("[screen] %s RS LINE LEADING price breakout — elite setup", symbol)
+        # RS trending: RS line slope improving over 4w > 8w > 12w = momentum building
+        if len(close) >= 60 and len(spy_close) >= 60:
+            _rs_now = float(close.iloc[-1])  / float(spy_close.iloc[-1])
+            _rs_4w  = float(close.iloc[-21]) / float(spy_close.iloc[-21])
+            _rs_8w  = float(close.iloc[-42]) / float(spy_close.iloc[-42])
+            result.rs_trending = (_rs_now > _rs_4w > _rs_8w)
+            if result.rs_trending:
+                _log.debug("[screen] %s RS trending up — accumulation building", symbol)
         result.passed = True
         return result
 

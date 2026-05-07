@@ -461,6 +461,45 @@ def check_positions() -> None:
                     sym["stop_type"] = "trailing"
                     changed = True
 
+        # ── Step A+: MA20 dynamic trail — after 10 trading days with profit ────────
+        # Switch from fixed pivot stop to MA20*0.98 (ratchet up only).
+        # Gives natural room in fast moves; tightens during consolidations.
+        _ma20_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (sym.get("_ma20_check_date") != _ma20_today
+                and pnl_pct > 0.02
+                and not sym.get("partial1_done")
+                and not sym.get("breakeven_done")):
+            _ed_ma = sym.get("entry_date", "")
+            if _ed_ma and _trading_days_held(_ed_ma) >= 10:
+                sym["_ma20_check_date"] = _ma20_today
+                try:
+                    import yfinance as _yf_ma
+                    _dfm = _yf_ma.Ticker(symbol).history(
+                        period="35d", interval="1d", auto_adjust=True)
+                    if len(_dfm) >= 20:
+                        _ma20_val  = float(_dfm["Close"].rolling(20).mean().iloc[-1])
+                        _ma20_stop = round(_ma20_val * 0.98, 2)
+                        _cur_stop  = sym.get("stop_loss", 0.0)
+                        # Ratchet up only — never widen the stop
+                        if _ma20_stop > _cur_stop and _ma20_stop < cur_price * 0.99:
+                            _rem_ma = qty - sym.get("partial_qty", 0)
+                            if _rem_ma > 0:
+                                _cancel_stop_orders(symbol)
+                                _ma_oid = _place_stop(symbol, _rem_ma, _ma20_stop)
+                                if _ma_oid:
+                                    sym["stop_loss"]            = _ma20_stop
+                                    sym["stop_order_id"]        = _ma_oid
+                                    sym["stop_type"]            = "ma20_trail"
+                                    sym["trailing_stop_placed"] = True
+                                    changed = True
+                                    _log.info(
+                                        "[monitor] %s MA20 trail: stop $%.2f\u2192$%.2f "
+                                        "(MA20=$%.2f, day %d)",
+                                        symbol, _cur_stop, _ma20_stop,
+                                        _ma20_val, _trading_days_held(_ed_ma))
+                except Exception as _me:
+                    _log.debug("[monitor] ma20 trail %s: %s", symbol, _me)
+
         # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
         initial_qty = sym.get("initial_qty", qty)
         partial1_trigger = 0.10

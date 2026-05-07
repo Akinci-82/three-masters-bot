@@ -94,6 +94,7 @@ class VCPResult:
     rs_line_at_high: bool = False
     vol_at_multiweek_low: bool = False
     measured_move_pct: float = 0.0     # Claude estimate: full base height / entry price
+    pattern_type: str  = "vcp"          # "vcp" | "cwh" | "both"
 
     @property
     def risk_reward(self) -> float:
@@ -395,6 +396,17 @@ Date        High    Low     Close   Volume
 - 2 = Marginal: 2 contractions, uneven volume, handle near 10%
 - 1 = Weak: barely passes quant but lacks visual conviction
 
+**Step 7 — Pattern classification** (VCP vs Cup-with-Handle):
+Also check for Cup-with-Handle (CwH) shape:
+- CwH: U-shaped base lasting 7–65 weeks, cup depth 15–33%,
+  handle forms in upper half of cup, handle depth <15%, duration ≤5 weeks.
+- VCP = progressively tighter contracting swings within a consolidation.
+- These overlap: a VCP within a CwH handle is the strongest possible setup.
+Assign pattern_type:
+  "vcp"  — contracting VCP swings dominate; no clear U-cup shape
+  "cwh"  — distinct U-cup with handle; handle lacks clear VCP contractions
+  "both" — handle shows VCP contractions inside a cup-with-handle base (ideal)
+
 ## Response (JSON ONLY — no prose, no markdown outside JSON)
 {{
   "vcp_confirmed": true/false,
@@ -410,7 +422,8 @@ Date        High    Low     Close   Volume
   "tight_area_pct": <handle range as decimal e.g. 0.047>,
   "pattern_notes": "<describe each contraction with dates and %: C1=date→date 18%, C2=...>",
   "risk_factors": "<one sentence on what could invalidate this setup>",
-  "measured_move_pct": <full base height (from pattern low to pattern high) divided by current price, as decimal e.g. 0.22>
+  "measured_move_pct": <full base height (from pattern low to pattern high) divided by current price, as decimal e.g. 0.22>,
+  "pattern_type": "vcp|cwh|both"
 }}"""
 
 
@@ -657,6 +670,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
         quality_score=quality,
         vol_at_multiweek_low=vol_multiweek,
         measured_move_pct=float(s_data.get("measured_move_pct", 0.0) or 0.0),
+        pattern_type=str(s_data.get("pattern_type", "vcp") or "vcp"),
     )
 
     if passed:
