@@ -302,6 +302,9 @@ class TrendResult:
     revenue_growth: float | None = None  # trailing revenue growth (yfinance)
     market_cap: float | None     = None   # yfinance marketCap in USD
     rs_trending: bool            = False  # RS line rising: 4w > 8w > 12w (momentum building)
+    rs_weekly_confirmed: bool    = False  # weekly RS also at 52w high (daily+weekly = institutional)
+    ad_ratio: float              = 1.0    # up-vol / down-vol last 50 bars (>1 = accumulation)
+    short_ratio: float | None    = None   # days to cover (high = squeeze potential)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -313,20 +316,22 @@ class TrendResult:
                 f"MA20={self.ma20:.0f}/{self.ma50:.0f}/{self.ma200:.0f}{earn}")
 
 
-def _get_fundamentals(ticker) -> tuple[float | None, float | None, float | None]:
-    """Return (eps_quarterly_growth, revenue_growth, market_cap) from yfinance."""
+def _get_fundamentals(ticker) -> tuple[float | None, float | None, float | None, float | None]:
+    """Return (eps_quarterly_growth, revenue_growth, market_cap, short_ratio) from yfinance."""
     try:
         info = ticker.info
         eps_g = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
         rev_g = info.get("revenueGrowth")
         mcap  = info.get("marketCap")
+        srat  = info.get("shortRatio")
         return (
             float(eps_g) if eps_g is not None else None,
             float(rev_g) if rev_g is not None else None,
             float(mcap)  if mcap  is not None else None,
+            float(srat)  if srat  is not None else None,
         )
     except Exception:
-        return None, None, None
+        return None, None, None, None
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
@@ -363,6 +368,13 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         rs  = _rs_rating(close, spy_close)
         rsi = _calc_rsi(close, cfg.get("rsi_period", 14))
 
+        # Accumulation/Distribution ratio: up-vol vs down-vol last 50 bars
+        _n_ad = min(50, len(df))
+        _df50 = df.tail(_n_ad)
+        _up_v = float(_df50.loc[_df50["Close"] >= _df50["Open"], "Volume"].sum())
+        _dn_v = float(_df50.loc[_df50["Close"] <  _df50["Open"], "Volume"].sum())
+        ad_ratio = (_up_v / _dn_v) if _dn_v > 0 else 2.0
+
         # Earnings check (do early — cheap to skip)
         days_earn = _days_to_earnings(symbol)
         earn_min  = cfg.get("earnings_min_days_away", 7)
@@ -378,6 +390,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             pct_from_high=pct_from_high, pct_from_low=pct_from_low,
             rs_rating=rs, rsi=rsi, avg_volume=avg_vol,
             days_to_earnings=days_earn, last_candle=last_candle,
+            ad_ratio=ad_ratio,
             passed=False, df=df,
         )
 
@@ -428,10 +441,11 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
-        eps_g, rev_g, market_cap = _get_fundamentals(ticker)
+        eps_g, rev_g, market_cap, short_ratio = _get_fundamentals(ticker)
         result.eps_growth     = eps_g
         result.revenue_growth = rev_g
         result.market_cap     = market_cap
+        result.short_ratio    = short_ratio
         # Minervini sweet spot: $200M–$25B (small/mid cap with growth potential)
         # Mega-caps rarely make 20-40% VCP breakout moves
         if market_cap is not None and (
@@ -461,6 +475,20 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             result.rs_trending = (_rs_now > _rs_4w > _rs_8w)
             if result.rs_trending:
                 _log.debug("[screen] %s RS trending up — accumulation building", symbol)
+        # Weekly RS confirmation: check if RS line also at 52w high on weekly bars
+        if result.rs_line_at_high:
+            try:
+                _common   = close.index.intersection(spy_close.index)
+                _rs_daily = (close.loc[_common] / spy_close.loc[_common]).dropna()
+                _rs_w     = _rs_daily.resample("W").last().dropna()
+                if len(_rs_w) >= 52:
+                    result.rs_weekly_confirmed = (
+                        float(_rs_w.iloc[-1]) >= float(_rs_w.tail(52).max()) * 0.995
+                    )
+                    if result.rs_weekly_confirmed:
+                        _log.info("[screen] %s RS weekly CONFIRMED — daily+weekly at 52w high", symbol)
+            except Exception:
+                pass
         result.passed = True
         return result
 

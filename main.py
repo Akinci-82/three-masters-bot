@@ -499,6 +499,10 @@ def _send_weekly_report(portfolio_value: float) -> None:
             _fb = {
                 "updated": today.isoformat(),
                 "total_trades": total_trades,
+                "win_rate":   round(win_rate,   3),
+                "avg_win_r":  round(avg_win_r,  3),
+                "avg_loss_r": round(avg_loss_r, 3),
+                "expectancy": round(expectancy, 3),
                 "score_buckets": {
                     k: {"count": len(v),
                         "avg_r": round(sum(v)/len(v), 3) if v else 0.0,
@@ -679,6 +683,43 @@ def _minervini_score(vcp) -> float:
     return min(q + conf + tight_b + vol_b + bvol_b + rs_b, 10.0)
 
 
+def _dynamic_min_composite() -> float:
+    """
+    Auto-raise MIN_COMPOSITE to 6.5 if low-score bucket (5.0–6.5) has negative expectancy.
+    Reads feedback_state.json written weekly. Returns 5.0 (default) or 6.5.
+    """
+    try:
+        import json as _j
+        fb  = _j.loads((LOG_DIR / "feedback_state.json").read_text())
+        bkt = fb.get("score_buckets", {}).get("5.0-6.5", {})
+        if bkt.get("count", 0) >= 5 and bkt.get("avg_r", 0.0) < 0:
+            _log.info("[score] Dynamic MIN raised to 6.5 — low-score bucket avg=%.2fR (%d trades)",
+                      bkt["avg_r"], bkt["count"])
+            return 6.5
+    except Exception:
+        pass
+    return 5.0
+
+
+def _fetch_pcr() -> float:
+    """
+    Fetch CBOE total Put/Call ratio as fear/greed gauge. Returns 0.7 (neutral) on failure.
+    PCR > 1.0 = fear/contrarian buy (+0.5 Tudor pts); PCR < 0.6 = greed (-0.5 pts).
+    """
+    try:
+        import yfinance as _yf
+        for tkr in ("^PCALL", "^CPC"):
+            try:
+                h = _yf.Ticker(tkr).history(period="5d", interval="1d", auto_adjust=False)
+                if not h.empty and not h["Close"].isna().all():
+                    return float(h["Close"].dropna().iloc[-1])
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return 0.7
+
+
 def _simons_score(trend) -> float:
     """
     0–10, weight 30%. Trend quality, RS strength, fundamentals (Simons layer).
@@ -686,10 +727,20 @@ def _simons_score(trend) -> float:
     """
     rs     = getattr(trend, "rs_rating", 70.0)
     rs_pts = min((rs - 70) / 29 * 4.0, 4.0)
-    # RS line signal: leading > at_high_only > neither
-    rs_leading = getattr(trend, "rs_line_leading", False)
-    rs_at_high = getattr(trend, "rs_line_at_high", False)
-    rs_sig  = 2.5 if rs_leading else (1.5 if rs_at_high else 0.0)
+    # RS line signal: weekly confirmation elevates score
+    rs_leading = getattr(trend, "rs_line_leading",  False)
+    rs_at_high = getattr(trend, "rs_line_at_high",  False)
+    rs_weekly  = getattr(trend, "rs_weekly_confirmed", False)
+    if rs_leading and rs_weekly:
+        rs_sig = 3.0   # daily leading + weekly confirmed = institutional breakout
+    elif rs_leading:
+        rs_sig = 2.5   # RS breaks out before price
+    elif rs_at_high and rs_weekly:
+        rs_sig = 2.0   # at high on both timeframes
+    elif rs_at_high:
+        rs_sig = 1.5   # daily high only
+    else:
+        rs_sig = 0.0
     rsi    = getattr(trend, "rsi", 65.0)
     rsi_pts = 2.0 if rsi <= 65 else (1.0 if rsi <= 72 else 0.0)
     pfh    = abs(getattr(trend, "pct_from_high", -0.25))
@@ -703,14 +754,27 @@ def _simons_score(trend) -> float:
     # RS momentum: line trending up 4w>8w>12w = institutional accumulation building
     rs_trend  = getattr(trend, "rs_trending", False)
     trend_pts = 0.5 if rs_trend and not rs_leading else 0.0
-    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts, 10.0)
+    # Accumulation/Distribution: up-vol > down-vol = institutional buying pressure
+    ad       = getattr(trend, "ad_ratio", 1.0)
+    ad_pts   = 0.5 if ad >= 1.5 else (0.25 if ad >= 1.2 else 0.0)
+    # Short interest: high days-to-cover = squeeze fuel at breakout
+    srat     = getattr(trend, "short_ratio", None)
+    short_pts = (0.5 if srat is not None and srat >= 5.0
+                 else (0.25 if srat is not None and srat >= 3.0 else 0.0))
+    # Pre-earnings sweet spot: 4–8 weeks pre-report + strong EPS = upcoming catalyst
+    days_earn = getattr(trend, "days_to_earnings", None)
+    earn_pts  = (0.5 if days_earn is not None and 28 <= days_earn <= 56
+                 and eps_g is not None and eps_g >= 0.25 else 0.0)
+    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
+               + ad_pts + short_pts + earn_pts, 10.0)
 
 
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
-                  power_trend: bool = False) -> float:
+                  power_trend: bool = False, pcr: float = 0.7) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
     power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
+    pcr = CBOE Put/Call ratio: >1.0 fear=+0.5, <0.6 greed=-0.5.
     """
     reg_pts  = {"bull": 3.0, "neutral": 1.5, "bear": 0.0}.get(regime, 3.0)
     losses   = risk_state.get("consecutive_losses", 0)
@@ -721,23 +785,25 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     breadth_pts = 2.0 if breadth_pct > 0.65 else (1.0 if breadth_pct > 0.45 else 0.0)
     # Power Trend: SPY 21d EMA > 50d EMA ≥8 days (O'Neil confirmation)
     power_pts = 1.0 if power_trend else 0.0
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts, 10.0)
+    # Put/Call ratio: >1.0 = fear (contrarian buy), <0.6 = complacency (caution)
+    pcr_pts   = 0.5 if pcr > 1.0 else (-0.5 if pcr < 0.6 else 0.0)
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
                      sector_bonus: float = 0.0, breadth_pct: float = 0.5,
-                     power_trend: bool = False) -> float:
+                     power_trend: bool = False, pcr: float = 0.7) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
       Simons     30% — RS strength, RS line at high, RSI quality, 52w proximity
-      Tudor      10% — market regime, loss streak, heat, breadth, power trend
-      sector_bonus ±0.5 — sector outperforming/underperforming SPY
+      Tudor      10% — market regime, loss streak, heat, breadth, power trend, PCR
+      sector_bonus ±0.5 — sector outperforming/underperforming SPY (Stage 2 required)
     Minimum 5.0 required to place an order.
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct, power_trend)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
@@ -763,41 +829,55 @@ _SECTOR_ETF_MAP = {
 }
 
 
-def _sector_momentum_scores() -> dict[str, float]:
-    """Return {etf: 1mo_return_vs_SPY} for all SPDR sector ETFs. Empty dict on failure."""
+def _sector_momentum_scores() -> tuple[dict[str, float], dict[str, bool]]:
+    """Return ({etf: 21d_return_vs_SPY}, {etf: above_MA200}) for SPDR sector ETFs.
+    Stage 2 flag (above MA200) required for positive sector bonus to apply.
+    """
     try:
         import yfinance as yf
-        etfs = list(_SECTOR_ETF_MAP.values()) + ["SPY"]
-        df = yf.download(etfs, period="1mo", interval="1d",
+        unique_etfs = list(set(_SECTOR_ETF_MAP.values()))
+        df = yf.download(unique_etfs + ["SPY"], period="1y", interval="1d",
                          auto_adjust=True, progress=False)["Close"]
-        ret = df.iloc[-1] / df.iloc[0] - 1
-        spy_ret = float(ret.get("SPY", 0.0))
-        scores = {etf: round(float(ret.get(etf, 0.0)) - spy_ret, 4)
-                  for etf in _SECTOR_ETF_MAP.values()}
-        _log.info("[sector] momentum vs SPY: %s",
-                  {k: f"{v:+.1%}" for k, v in sorted(scores.items(), key=lambda x: -x[1])})
-        return scores
+        spy_ret = (float(df["SPY"].iloc[-1] / df["SPY"].iloc[-21] - 1)
+                   if "SPY" in df.columns and len(df) >= 22 else 0.0)
+        scores, stage2 = {}, {}
+        for etf in unique_etfs:
+            if etf not in df.columns:
+                continue
+            col = df[etf].dropna()
+            if len(col) < 22:
+                continue
+            ret = float(col.iloc[-1] / col.iloc[-21] - 1)
+            scores[etf] = round(ret - spy_ret, 4)
+            ma200 = float(col.tail(200).mean()) if len(col) >= 200 else float(col.mean())
+            stage2[etf] = float(col.iloc[-1]) > ma200
+        _log.info("[sector] momentum vs SPY (21d): %s | Stage2: %s",
+                  {k: f"{v:+.1%}" for k, v in sorted(scores.items(), key=lambda x: -x[1])},
+                  {k: v for k, v in stage2.items()})
+        return scores, stage2
     except Exception as e:
         _log.debug("[sector] momentum fetch failed: %s", e)
-        return {}
+        return {}, {}
 
 
-def _sector_bonus(symbol: str, sector_scores: dict[str, float]) -> float:
+def _sector_bonus(symbol: str, sector_scores: dict[str, float],
+                   stage2: dict[str, bool] | None = None) -> float:
     """
-    Composite bonus (±0.5) based on whether the stock's sector is outperforming SPY.
-    Uses get_sector() from screener; returns 0.0 silently on any failure.
+    Composite bonus (±0.5) based on sector momentum vs SPY.
+    Stage 2 filter: sector ETF must be above its MA200 for full positive bonus.
     """
     if not sector_scores:
         return 0.0
     try:
         from screener import get_sector
-        sector = get_sector(symbol)
-        etf = _SECTOR_ETF_MAP.get(sector)
+        sector   = get_sector(symbol)
+        etf      = _SECTOR_ETF_MAP.get(sector)
         if etf is None:
             return 0.0
-        rel = sector_scores.get(etf, 0.0)
+        rel      = sector_scores.get(etf, 0.0)
+        in_s2    = (stage2 or {}).get(etf, True)  # default True if no stage2 data
         if rel > 0.015:
-            return 0.5
+            return 0.5 if in_s2 else 0.25  # outperforming but below MA200 = muted bonus
         elif rel > 0.005:
             return 0.25
         elif rel < -0.015:
@@ -1103,27 +1183,30 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _rs_now = _get_rs()
     _current_vix = _fetch_vix()
     _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
-    sector_momentum = _sector_momentum_scores()
-    _power_trend = _fetch_power_trend()
+    sector_momentum, sector_stage2 = _sector_momentum_scores()
+    _power_trend  = _fetch_power_trend()
+    _current_pcr  = _fetch_pcr()
     if _power_trend:
         _log.info("[tudor] Power Trend active (SPY 21d EMA > 50d EMA \u22658 days) +1.0 T-pts")
+    _log.info("[tudor] PCR=%.2f (%s)", _current_pcr,
+              "fear+0.5" if _current_pcr > 1.0 else ("greed-0.5" if _current_pcr < 0.6 else "neutral"))
     scored  = []
     for vcp in vcp_passed:
         trend_r = trend_map.get(vcp.symbol)
         if trend_r is None:
             scored.append((vcp, trend_r, 0.0))
             continue
-        sec_bonus = _sector_bonus(vcp.symbol, sector_momentum)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend)
-        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s → composite=%.2f",
+        sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr)
+        _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend), sec_bonus,
-                  _breadth_pct * 100, "✓" if _power_trend else "✗", cs)
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr), sec_bonus,
+                  _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, cs)
         scored.append((vcp, trend_r, cs))
 
     # Filter: require composite >= 5.0 (guards against weak Simons/Tudor context)
-    _MIN_COMPOSITE = 5.0
+    _MIN_COMPOSITE = _dynamic_min_composite()
     vcp_scored = [(v, t, cs) for v, t, cs in scored if cs >= _MIN_COMPOSITE]
     below = [v.symbol for v, t, cs in scored if cs < _MIN_COMPOSITE]
     if below:
