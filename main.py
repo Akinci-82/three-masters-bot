@@ -307,6 +307,31 @@ def _send_morning_briefing() -> None:
         except Exception:
             pass
 
+        # ── Pre-open gap alerts for held positions ─────────────────────────────
+        if positions:
+            try:
+                import yfinance as _yf_pg
+                _pre_alerts = []
+                for _pg_p in positions:
+                    _pg_sym = _pg_p["symbol"]
+                    try:
+                        _fi = _yf_pg.Ticker(_pg_sym).fast_info
+                        _pre_p  = getattr(_fi, "last_price", None) or getattr(_fi, "regularMarketPrice", None)
+                        _prev_c = getattr(_fi, "previous_close", None) or getattr(_fi, "regularMarketPreviousClose", None)
+                        if _pre_p and _prev_c and _prev_c > 0:
+                            _gap = (_pre_p - _prev_c) / _prev_c
+                            if abs(_gap) >= 0.03:
+                                _dir = "▲" if _gap > 0 else "▼"
+                                _pre_alerts.append(
+                                    f"  {_dir} *{_pg_sym}* pre-market ${_pre_p:.2f} ({_gap*100:+.1f}% vs prev close)")
+                    except Exception:
+                        pass
+                if _pre_alerts:
+                    lines.append("\n*Pre-open gaps (≥3%):*")
+                    lines.extend(_pre_alerts)
+            except Exception:
+                pass
+
         _tg("\n".join(lines))
         _log.info("[briefing] Morning briefing sent")
     except Exception as e:
@@ -869,8 +894,20 @@ def _simons_score(trend) -> float:
     roe_val   = getattr(trend, "roe", None)
     roe_pts   = (0.5 if roe_val is not None and roe_val >= 0.15
                  else (0.25 if roe_val is not None and roe_val >= 0.10 else 0.0))
+    # ADX: trend strength — >25 confirms price direction, >35 = strong momentum
+    adx_val  = getattr(trend, "adx", 0.0)
+    adx_pts  = 0.5 if adx_val >= 35 else (0.25 if adx_val >= 25 else 0.0)
+    # Float rotation: 40-day vol / float shares — >1.0 = full float turned (institutional demand)
+    fr_val   = getattr(trend, "float_rotation", None)
+    fr_pts   = (0.5 if fr_val is not None and fr_val >= 1.5
+                else (0.25 if fr_val is not None and fr_val >= 0.8 else 0.0))
+    # Institutional ownership: smart money backing cushions pullbacks and confirms setup
+    inst_val = getattr(trend, "inst_pct", None)
+    inst_pts = (0.5 if inst_val is not None and inst_val >= 0.60
+                else (0.25 if inst_val is not None and inst_val >= 0.40 else 0.0))
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
-               + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts, 10.0)
+               + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
+               + adx_pts + fr_pts + inst_pts, 10.0)
 
 
 def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
@@ -939,7 +976,8 @@ def _fetch_nh_nl_ratio() -> float:
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
                   power_trend: bool = False, pcr: float = 0.7,
                   rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
-                  dist_days: int = 0, nh_nl_ratio: float = 1.0) -> float:
+                  dist_days: int = 0, nh_nl_ratio: float = 1.0,
+                  breadth_trend: int = 0) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
     power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
@@ -968,14 +1006,17 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     dist_pts  = -1.5 if dist_days >= 5 else (-0.5 if dist_days >= 3 else 0.0)
     # NH/NL internals: expanding new highs = healthy tape; collapsing = distribution
     nh_nl_pts = 0.5 if nh_nl_ratio >= 1.5 else (-1.0 if nh_nl_ratio < 0.5 else 0.0)
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts, 10.0)
+    # Breadth trend direction: is market breadth rising or falling vs recent average?
+    breadth_dir_pts = 0.5 if breadth_trend > 0 else (-0.5 if breadth_trend < 0 else 0.0)
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
                      sector_bonus: float = 0.0, breadth_pct: float = 0.5,
                      power_trend: bool = False, pcr: float = 0.7,
                      rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
-                     dist_days: int = 0, nh_nl_ratio: float = 1.0) -> float:
+                     dist_days: int = 0, nh_nl_ratio: float = 1.0,
+                     breadth_trend: int = 0) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
@@ -986,7 +1027,7 @@ def _composite_score(vcp, trend, risk_state: dict, regime: str,
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope, dist_days, nh_nl_ratio)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope, dist_days, nh_nl_ratio, breadth_trend)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
@@ -1253,8 +1294,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
               cash: float, positions: list) -> None:
     """Inner scan — separated so the hard timeout can wrap it cleanly."""
 
-    _breadth_pct = 0.5   # updated after screener run
-    _current_vix = 20.0  # updated in scoring loop (also needs to be in scope here)
+    _breadth_pct   = 0.5   # updated after screener run
+    _breadth_trend = 0     # +1=rising -1=falling 0=flat vs 3-day avg
+    _current_vix   = 20.0  # updated in scoring loop (also needs to be in scope here)
 
     # ── Layer 1: Simons — Trend Template screening ────────────────────────────
     _log.info("\n[LAYER 1 — SIMONS] Trend Template screening...")
@@ -1269,6 +1311,27 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                         / max(len(screen_results), 1))
         _log.info("[tudor] Market breadth: %.0f%% of %d symbols above MA50",
                   _breadth_pct * 100, len(screen_results))
+        # Breadth trend: compare today vs 3-day rolling average from history file
+        try:
+            import json as _json_bt, os as _os_bt
+            _bh_path = str(BASE_DIR / "logs" / "breadth_history.json")
+            _bh: list = []
+            if _os_bt.path.exists(_bh_path):
+                with open(_bh_path) as _f_bt:
+                    _bh = _json_bt.load(_f_bt)
+            if len(_bh) >= 3:
+                _avg_prev = sum(_bh[-3:]) / 3
+                _breadth_trend = (1 if _breadth_pct > _avg_prev + 0.03
+                                  else (-1 if _breadth_pct < _avg_prev - 0.03 else 0))
+                _log.info("[tudor] Breadth trend: %s (today=%.0f%% avg3=%.0f%%)",
+                          {1:"rising",0:"flat",-1:"falling"}[_breadth_trend],
+                          _breadth_pct * 100, _avg_prev * 100)
+            _bh.append(round(_breadth_pct, 4))
+            _bh = _bh[-30:]
+            with open(_bh_path, "w") as _f_bt:
+                _json_bt.dump(_bh, _f_bt)
+        except Exception as _bte:
+            _log.debug("[tudor] Breadth history error: %s", _bte)
         report["trend_passed"] = [r.symbol for r in trend_passed]
         _log.info("[simons] %d/%d passed Trend Template",
                   len(trend_passed), len(screen_results))
@@ -1450,11 +1513,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             scored.append((vcp, trend_r, 0.0))
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio)
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend)
         _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f rate=%+.0fbps vix_sl=%.1f → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio), sec_bonus,
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend), sec_bonus,
                   _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, _rate_slope_bps, _vix_slope, cs)
         scored.append((vcp, trend_r, cs))
 

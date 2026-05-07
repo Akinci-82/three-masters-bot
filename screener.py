@@ -335,6 +335,9 @@ class TrendResult:
     eps_revision: float | None   = None   # forwardEps/trailingEps-1 (analyst revision proxy)
     rs_vs_sector: float | None   = None   # RS outperformance vs own sector ETF (>0 = leader)
     roe: float | None            = None   # returnOnEquity (>=0.15 = efficient capital use)
+    adx: float               = 0.0    # Average Directional Index — trend strength (>25 = trending)
+    float_rotation: float | None = None  # base vol / float shares (>1.0 = full float turned over)
+    inst_pct: float | None   = None   # % held by institutions (sponsorship quality)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -346,30 +349,59 @@ class TrendResult:
                 f"MA20={self.ma20:.0f}/{self.ma50:.0f}/{self.ma200:.0f}{earn}")
 
 
-def _get_fundamentals(ticker) -> tuple[float | None, float | None, float | None, float | None, float | None, float | None]:
-    """Return (eps_quarterly_growth, revenue_growth, market_cap, short_ratio, eps_revision, roe) from yfinance."""
+def _get_fundamentals(ticker) -> tuple:
+    """Return (eps_g, rev_g, market_cap, short_ratio, eps_revision, roe, float_shares, inst_pct) from yfinance."""
     try:
-        info  = ticker.info
-        eps_g = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
-        rev_g = info.get("revenueGrowth")
-        mcap  = info.get("marketCap")
-        srat  = info.get("shortRatio")
-        fwd   = info.get("forwardEps")
-        trail = info.get("trailingEps")
+        info    = ticker.info
+        eps_g   = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
+        rev_g   = info.get("revenueGrowth")
+        mcap    = info.get("marketCap")
+        srat    = info.get("shortRatio")
+        fwd     = info.get("forwardEps")
+        trail   = info.get("trailingEps")
         eps_rev = (float(fwd) / float(trail) - 1
                    if fwd and trail and float(trail) > 0 else None)
-        roe_raw = info.get("returnOnEquity")
-        roe     = float(roe_raw) if roe_raw is not None else None
+        roe_raw  = info.get("returnOnEquity")
+        roe      = float(roe_raw) if roe_raw is not None else None
+        float_sh = info.get("floatShares")
+        inst_raw = info.get("heldPercentInstitutions")
         return (
-            float(eps_g)  if eps_g  is not None else None,
-            float(rev_g)  if rev_g  is not None else None,
-            float(mcap)   if mcap   is not None else None,
-            float(srat)   if srat   is not None else None,
+            float(eps_g)   if eps_g   is not None else None,
+            float(rev_g)   if rev_g   is not None else None,
+            float(mcap)    if mcap    is not None else None,
+            float(srat)    if srat    is not None else None,
             eps_rev,
             roe,
+            float(float_sh) if float_sh is not None else None,
+            float(inst_raw) if inst_raw is not None else None,
         )
     except Exception:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
+
+
+def _compute_adx(df: pd.DataFrame, period: int = 14) -> float:
+    """ADX via Wilder EWM smoothing. Returns 0.0 on error or insufficient data."""
+    try:
+        if len(df) < period * 2 + 1:
+            return 0.0
+        hi, lo, cl = df["High"], df["Low"], df["Close"]
+        tr   = pd.concat([(hi - lo), (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+        up   = hi.diff()
+        dn   = -lo.diff()
+        pdm  = up.where((up > dn) & (up > 0), 0.0)
+        ndm  = dn.where((dn > up) & (dn > 0), 0.0)
+        a    = 1 / period
+        atr_s  = tr.ewm(alpha=a, adjust=False).mean()
+        pdi_s  = pdm.ewm(alpha=a, adjust=False).mean()
+        ndi_s  = ndm.ewm(alpha=a, adjust=False).mean()
+        p_pct  = (pdi_s / atr_s * 100).fillna(0)
+        n_pct  = (ndi_s / atr_s * 100).fillna(0)
+        denom  = (p_pct + n_pct).replace(0, float("nan"))
+        dx     = ((p_pct - n_pct).abs() / denom * 100).fillna(0)
+        adx    = dx.ewm(alpha=a, adjust=False).mean()
+        return round(float(adx.iloc[-1]), 1)
+    except Exception:
+        return 0.0
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
@@ -416,6 +448,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         _up_v = float(_df50.loc[_df50["Close"] >= _df50["Open"], "Volume"].sum())
         _dn_v = float(_df50.loc[_df50["Close"] <  _df50["Open"], "Volume"].sum())
         ad_ratio = (_up_v / _dn_v) if _dn_v > 0 else 2.0
+        adx_val  = _compute_adx(df)
 
         # Earnings check (do early — cheap to skip)
         days_earn = _days_to_earnings(symbol)
@@ -495,13 +528,17 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
-        eps_g, rev_g, market_cap, short_ratio, eps_rev, roe = _get_fundamentals(ticker)
+        eps_g, rev_g, market_cap, short_ratio, eps_rev, roe, float_sh, inst_pct = _get_fundamentals(ticker)
         result.eps_growth     = eps_g
         result.revenue_growth = rev_g
         result.market_cap     = market_cap
         result.short_ratio    = short_ratio
         result.eps_revision   = eps_rev
         result.roe            = roe
+        result.adx            = adx_val
+        result.inst_pct       = inst_pct
+        if float_sh and float_sh > 0:
+            result.float_rotation = round(float(df.tail(40)["Volume"].sum()) / float_sh, 3)
         # Liquidity floor: $500M+ to avoid thin-volume micro-caps
         # No upper cap — VCP logic is size-agnostic (NVDA, AAPL, MSFT all form VCPs)
         if market_cap is not None and market_cap < 500_000_000:

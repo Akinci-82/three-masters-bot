@@ -646,7 +646,9 @@ def check_positions() -> None:
 
         # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
         initial_qty = sym.get("initial_qty", qty)
-        partial1_trigger = 0.10
+        # Superperformance skip: composite ≥8 setups (elite VCPs) need more room before first partial
+        _cs_val = float(sym.get("composite_score", 0.0) or 0.0)
+        partial1_trigger = 0.15 if _cs_val >= 8.0 else 0.10
         mm_pct = sym.get("measured_move_pct", 0.0) or 0.0
         partial2_trigger = max(mm_pct, 0.20) if mm_pct > 0.05 else 0.20
 
@@ -722,6 +724,23 @@ def check_positions() -> None:
                         changed = True
                         _log.info("[monitor] %s PROFIT LOCK +15%%: stop raised to +7%% ($%.2f)",
                                   symbol, _lock_stop)
+
+        # ── Step G2: Runner upgrade — widen trail to 8% when past 2× measured move ─
+        # Position has proven itself past double the expected target; give the runner room.
+        if (sym.get("partial2_done")
+                and not sym.get("runner_upgraded")
+                and mm_pct > 0.05
+                and pnl_pct >= mm_pct * 2):
+            _runner_2x = qty - sym.get("partial_qty", 0)
+            if _runner_2x > 0:
+                _cancel_stop_orders(symbol)
+                _r2x_oid = _place_trailing_stop(symbol, _runner_2x, 0.08)
+                if _r2x_oid:
+                    sym["runner_upgraded"] = True
+                    sym["stop_order_id"]   = _r2x_oid
+                    changed = True
+                    _log.info("[monitor] %s RUNNER UPGRADE: trail 5%%→8%% at 2×mm (pnl=+%.1f%%)",
+                              symbol, pnl_pct * 100)
 
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
