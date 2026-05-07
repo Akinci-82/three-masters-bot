@@ -68,21 +68,44 @@ def _save_state(state: dict) -> None:
 
 # ── Alpaca REST calls ─────────────────────────────────────────────────────────
 
+class AlpacaConnectionError(RuntimeError):
+    """Raised when Alpaca REST API is persistently unreachable after retries."""
+
+
+def _pm_retry(fn, *args, retries: int = 3, backoff: float = 2.0, **kwargs):
+    """Call fn(*args, **kwargs) up to `retries` times with exponential backoff."""
+    import time as _t
+    delay = 1.0
+    for _attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as _exc:
+            if _attempt == retries - 1:
+                raise
+            _log.warning("[monitor] %s attempt %d/%d failed: %s - retry in %.0fs",
+                         getattr(fn, "__name__", "call"), _attempt + 1, retries, _exc, delay)
+            _t.sleep(delay)
+            delay *= backoff
+
+
 def _get_positions() -> list[dict]:
-    try:
+    """Fetch current positions. Raises AlpacaConnectionError on persistent failure."""
+    def _fetch():
         r = requests.get(
             f"{_alpaca_base()}/positions",
             headers=_alpaca_headers(), timeout=10
         )
         r.raise_for_status()
         return r.json()
+    try:
+        return _pm_retry(_fetch)
     except Exception as e:
-        _log.warning("[monitor] get_positions error: %s", e)
-        return []
+        _log.error("[monitor] get_positions FAILED after retries: %s", e)
+        raise AlpacaConnectionError(f"get_positions failed: {e}") from e
 
 
 def _get_open_orders(symbol: str) -> list[dict]:
-    try:
+    def _fetch():
         r = requests.get(
             f"{_alpaca_base()}/orders",
             params={"status": "open", "symbols": symbol, "limit": 20},
@@ -90,8 +113,10 @@ def _get_open_orders(symbol: str) -> list[dict]:
         )
         r.raise_for_status()
         return r.json()
+    try:
+        return _pm_retry(_fetch)
     except Exception as e:
-        _log.warning("[monitor] get_orders(%s) error: %s", symbol, e)
+        _log.error("[monitor] get_orders(%s) FAILED after retries: %s", symbol, e)
         return []
 
 
@@ -131,7 +156,7 @@ def _place_market_sell(symbol: str, qty: int) -> bool:
         _log.info("[monitor] Market sell %d × %s submitted", qty, symbol)
         return True
     except Exception as e:
-        _log.warning("[monitor] market_sell(%s, %d) error: %s", symbol, qty, e)
+        _log.error("[monitor] market_sell(%s, %d) FAILED (exit NOT submitted): %s", symbol, qty, e)
         return False
 
 
@@ -179,7 +204,7 @@ def _place_stop(symbol: str, qty: int, stop_price: float) -> str | None:
                   stop_price, symbol, qty, order_id)
         return order_id
     except Exception as e:
-        _log.warning("[monitor] place_stop(%s) error: %s", symbol, e)
+        _log.error("[monitor] place_stop(%s) FAILED (stop NOT placed - will retry next cycle): %s", symbol, e)
         return None
 
 
@@ -205,7 +230,7 @@ def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> str | None:
                   trail_val, symbol, qty, order_id)
         return order_id
     except Exception as e:
-        _log.warning("[monitor] trailing_stop(%s) error: %s", symbol, e)
+        _log.error("[monitor] trailing_stop(%s) FAILED (stop NOT placed - will retry next cycle): %s", symbol, e)
         return None
 
 
@@ -400,7 +425,25 @@ def check_positions() -> None:
             pass
         return   # skip entire monitoring cycle — do NOT touch orders
 
-    positions = _get_positions()
+    try:
+        positions = _get_positions()
+    except AlpacaConnectionError as e:
+        _log.error("[monitor] POSITIONS UNAVAILABLE - skipping entire cycle: %s", e)
+        try:
+            import os as _os_cp
+            _tok_cp = _os_cp.getenv("TELEGRAM_BOT_TOKEN", "")
+            _cid_cp = _os_cp.getenv("TELEGRAM_CHAT_ID", "")
+            if _tok_cp and _cid_cp:
+                requests.post(
+                    f"https://api.telegram.org/bot{_tok_cp}/sendMessage",
+                    json={"chat_id": _cid_cp, "parse_mode": "Markdown",
+                          "text": ("🚨 *Three Masters — Monitor: can't fetch positions*\n"
+                                   f"`{e}`\nCycle skipped — positions NOT managed this tick.")},
+                    timeout=8,
+                )
+        except Exception:
+            pass
+        return
     if not positions:
         return
 

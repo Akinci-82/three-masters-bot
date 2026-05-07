@@ -1838,6 +1838,40 @@ def _start_position_monitor() -> threading.Thread | None:
     return t
 
 
+def _alpaca_connectivity_watchdog(stop_event: threading.Event) -> None:
+    """
+    Background thread: pings Alpaca /account every 5 min.
+    Sends one Telegram alert on outage, another on recovery.
+    Complements the startup health check with runtime connectivity monitoring.
+    """
+    import time as _tw
+    _INTERVAL  = 300   # 5 minutes
+    _ALERT_MIN = 900   # re-alert at most every 15 min during sustained outage
+    _was_down  = False
+    _last_alert: float = 0.0
+
+    while not stop_event.is_set():
+        try:
+            import broker as _bk_wd
+            _bk_wd.get_account()   # lightweight ping - uses _retry internally
+            if _was_down:
+                _log.info("[watchdog] Alpaca connectivity RESTORED")
+                _tg("✅ *Three Masters — Alpaca connectivity restored*\nBot is back online.")
+                _was_down = False
+        except Exception as _e_wd:
+            _now_wd = _tw.time()
+            if not _was_down or (_now_wd - _last_alert) > _ALERT_MIN:
+                _log.error("[watchdog] Alpaca UNREACHABLE: %s", _e_wd)
+                _tg(f"🚨 *Three Masters — Alpaca UNREACHABLE*\n"
+                    f"`{_e_wd}`\nChecking every 5 min until resolved.")
+                _last_alert = _now_wd
+                _was_down   = True
+
+        stop_event.wait(_INTERVAL)
+
+    _log.info("[watchdog] Alpaca connectivity watchdog stopped")
+
+
 def _start_background_services() -> None:
     """Start Telegram commands, fill stream, and dashboard alongside main loop."""
     try:
@@ -1857,6 +1891,18 @@ def _start_background_services() -> None:
         dashboard.start(_monitor_stop)
     except Exception as e:
         _log.warning("[main] Dashboard failed to start: %s", e)
+
+    try:
+        _t_wd = threading.Thread(
+            target=_alpaca_connectivity_watchdog,
+            args=(_monitor_stop,),
+            daemon=True,
+            name="alpaca-watchdog",
+        )
+        _t_wd.start()
+        _log.info("[main] Alpaca connectivity watchdog started (ping every 5 min)")
+    except Exception as e:
+        _log.warning("[main] Alpaca watchdog failed to start: %s", e)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
