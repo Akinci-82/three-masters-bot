@@ -47,6 +47,33 @@ def _save(data: dict):
         json.dump(data, f, indent=2, default=str)
 
 
+def _kelly_factor() -> float:
+    """
+    Half-Kelly fraction from trade journal win rate and average R.
+    Full Kelly = W - (1-W)/R where W=win_rate, R=avg_win/avg_loss.
+    Half-Kelly applied for safety; clamped [0.5, 1.0]. Returns 1.0 if <10 trades.
+    """
+    import json as _j
+    from pathlib import Path as _P
+    jpath = _P(__file__).parent / "logs" / "trade_journal.jsonl"
+    try:
+        if not jpath.exists():
+            return 1.0
+        trades = [_j.loads(ln) for ln in jpath.read_text().splitlines() if ln.strip()]
+        if len(trades) < 10:
+            return 1.0
+        wins   = [t["r_multiple"] for t in trades if t.get("r_multiple", 0) > 0]
+        losses = [abs(t["r_multiple"]) for t in trades if t.get("r_multiple", 0) < 0]
+        if not wins or not losses:
+            return 1.0
+        w     = len(wins) / len(trades)
+        r     = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+        kelly = w - (1 - w) / r
+        return float(max(0.5, min(1.0, kelly / 2.0)))
+    except Exception:
+        return 1.0
+
+
 def position_size(portfolio_value: float, entry_price: float,
                   stop_loss: float, risk_pct: float | None = None,
                   measured_move_pct: float = 0.0) -> dict:
@@ -64,7 +91,8 @@ def position_size(portfolio_value: float, entry_price: float,
 
     risk_pct = min(risk_pct, RISK["max_risk_per_trade_pct"])
 
-    risk_amount = portfolio_value * risk_pct
+    kelly = _kelly_factor()
+    risk_amount = portfolio_value * risk_pct * kelly
     risk_per_share = entry_price - stop_loss
 
     if risk_per_share <= 0:

@@ -278,10 +278,11 @@ def _lookup_position_metadata(symbol: str) -> dict:
                         "quality_score":     int(order.get("quality_score", 0) or 0),
                         "composite_score":   float(order.get("composite_score", 0) or 0),
                         "measured_move_pct": float(order.get("measured_move_pct", 0) or 0),
+                        "buy_stop":          float(order.get("buy_stop", 0) or 0),
                     }
         except Exception:
             pass
-    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0, "measured_move_pct": 0.0}
+    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0, "measured_move_pct": 0.0, "buy_stop": 0.0}
 
 
 def check_positions() -> None:
@@ -353,10 +354,24 @@ def check_positions() -> None:
             sym["quality_score"]      = meta["quality_score"]
             sym["composite_score"]    = meta["composite_score"]
             sym["measured_move_pct"]  = meta["measured_move_pct"]
+            sym["buy_stop"]           = meta["buy_stop"]
             if meta["stop_loss"] > 0:
                 _log.info("[monitor] %s meta: SL=$%.2f Q%d composite=%.1f",
                           symbol, meta["stop_loss"], meta["quality_score"],
                           meta["composite_score"])
+            # Fill-slippage guard: verify actual fill vs planned buy-stop
+            _planned = meta.get("buy_stop", 0.0)
+            if _planned > 0 and avg_cost > _planned:
+                _slip = (avg_cost - _planned) / _planned
+                if _slip > 0.02:
+                    _log.warning("[monitor] %s SLIPPAGE GUARD >2%% (%.1f%%) — closing "
+                                 "(fill=$%.2f planned=$%.2f)",
+                                 symbol, _slip * 100, avg_cost, _planned)
+                    _place_market_sell(symbol, qty)
+                elif _slip > 0.01:
+                    _log.warning("[monitor] %s slippage >1%% (%.1f%%) — "
+                                 "fill=$%.2f planned=$%.2f",
+                                 symbol, _slip * 100, avg_cost, _planned)
             changed = True
 
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
