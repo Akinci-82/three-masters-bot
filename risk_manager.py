@@ -171,6 +171,11 @@ def check_can_trade(portfolio_value: float, new_risk_pct: float) -> tuple[bool, 
         _save(state)
         ath = portfolio_value
     drawdown = (ath - portfolio_value) / ath if ath > 0 else 0
+    # Soft pause: slow down entries before hitting the hard halt (8% drawdown)
+    soft_dd_pct = RISK.get("soft_drawdown_pause_pct", 0.08)
+    if soft_dd_pct <= drawdown < RISK["max_drawdown_pct"]:
+        return False, (f"Soft drawdown pause: {drawdown:.1%} >= {soft_dd_pct:.0%} — "
+                       "no new entries until portfolio recovers")
     if drawdown >= RISK["max_drawdown_pct"]:
         msg = f"Drawdown {drawdown:.1%} >= {RISK['max_drawdown_pct']:.0%}"
         _halt(msg)
@@ -224,6 +229,36 @@ def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
     _save(state)
     _log.info("[risk] %s closed | pnl=%.1f%% | heat now=%.1f%% | day_pnl=%.1f%%",
               symbol, pnl_pct * 100, state["open_risk_pct"] * 100, daily_pnl * 100)
+
+
+def record_stop_out(symbol: str):
+    """Record a stop-out so the symbol is in re-entry cooldown for 5 trading days."""
+    state = _load()
+    state.setdefault("stop_out_cooldown", {})[symbol] = str(date.today())
+    _save(state)
+    _log.info("[risk] %s stop-out recorded — 5-day re-entry cooldown", symbol)
+
+
+def check_reentry_cooldown(symbol: str) -> bool:
+    """True if symbol is still in re-entry cooldown (5 trading days since stop-out)."""
+    state = _load()
+    stop_date_str = state.get("stop_out_cooldown", {}).get(symbol)
+    if not stop_date_str:
+        return False
+    try:
+        from pandas.tseries.offsets import BDay
+        import pandas as _pd
+        stop_dt = _pd.Timestamp(stop_date_str)
+        cooldown_end = stop_dt + BDay(5)
+        in_cooldown = _pd.Timestamp.today() < cooldown_end
+        if not in_cooldown:
+            cooldowns = state.get("stop_out_cooldown", {})
+            cooldowns.pop(symbol, None)
+            _save(state)
+        return in_cooldown
+    except Exception:
+        return False
+
 
 
 def get_state() -> dict:

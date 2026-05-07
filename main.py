@@ -1479,6 +1479,20 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
         return
 
+    # ── Breadth gate: pause entries when broad market is deteriorating ────────
+    if _breadth_pct < 0.45 and regime != "bull":
+        msg = (f"Market breadth {_breadth_pct*100:.0f}% above MA50 (threshold 45%) "
+               f"in {regime.upper()} regime — pausing new orders. "
+               f"{len(vcp_passed)} VCP setup(s) found.")
+        _log.warning("[main] BREADTH GATE — %.0f%% above MA50 in %s regime",
+                     _breadth_pct * 100, regime)
+        _tg(f"\U0001f4c9 *Three Masters — Breadth Gate*\n{msg}")
+        report["summary"] = f"breadth_gate_{regime}_no_orders"
+        report["vcp_found_no_orders"] = [r.symbol for r in vcp_passed]
+        _save_report(report)
+        _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
+        return
+
     regime_size_factor = 0.75 if regime == "neutral" else 1.0
     if regime == "neutral":
         _log.info("[main] Neutral regime (SPY %+.1f%% vs MA200) — position sizing at 75%%",
@@ -1507,6 +1521,14 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     from config import RISK
 
     held_symbols = {p["symbol"] for p in positions}
+
+    # Re-entry cooldown: skip symbols stopped out within the last 5 trading days
+    from risk_manager import check_reentry_cooldown
+    _before_cd = len(vcp_passed)
+    vcp_passed  = [r for r in vcp_passed if not check_reentry_cooldown(r.symbol)]
+    _skipped_cd = _before_cd - len(vcp_passed)
+    if _skipped_cd:
+        _log.info("[main] %d candidate(s) in re-entry cooldown — skipped", _skipped_cd)
 
     # Smart order management: retain unchanged orders, cancel stale/moved ones
     orders_to_skip = _smart_order_management(vcp_passed, held_symbols)

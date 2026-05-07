@@ -1293,11 +1293,14 @@ def check_positions() -> None:
             last_price = sym_data.get("last_price", avg_cost)
             pnl_pct   = ((last_price - avg_cost) / avg_cost) if avg_cost > 0 else 0.0
             try:
-                from risk_manager import close_trade
+                from risk_manager import close_trade, record_stop_out
                 from broker import get_account
                 portfolio_value = get_account()["portfolio_value"]
                 close_trade(sym, pnl_pct, portfolio_value)   # start_value read from risk_state
                 _journal_trade(sym, sym_data, pnl_pct, portfolio_value)
+                # Re-entry cooldown: block stop-outs from re-entering for 5 trading days
+                if pnl_pct < 0:
+                    record_stop_out(sym)
             except Exception as e:
                 _log.warning("[monitor] close_trade %s failed: %s", sym, e)
 

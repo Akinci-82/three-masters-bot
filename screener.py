@@ -29,11 +29,18 @@ _BAD_SYMBOLS = {"BRK.B", "BF.B", "BRK-B", "BF-B"}
 
 # Nasdaq 100 extras not typically in S&P 500 — high VCP potential
 _NDQ_EXTRAS = [
+    # Original Nasdaq extras
     "MELI","BKNG","LULU","REGN","VRTX","IDXX","ANSS","CDNS","SNPS",
-    "DXCM","SGEN","ALGN","ILMN","ZBRA","NXPI","MCHP","KLAC","MPWR",
+    "DXCM","ALGN","ILMN","ZBRA","NXPI","MCHP","KLAC","MPWR",
     "ENPH","FSLR","CELH","APP","DUOL","AXON","DECK","CROX","LNTH",
     "ELF","SMCI","AEHR","FTNT","DDOG","MDB","NET","ZS","PANW","CRWD",
     "SNOW","NOW","HUBS","BILL","GTLB","IOT","TMDX","AAON","DOCS",
+    # Russell 1000 mid-cap growth additions
+    "PAYC","PODD","MEDP","CRNX","RXRX","RVMD","TGTX","ARDX","PRCT",
+    "ICUI","INSP","IRTC","TNDM","NVST","RGEN","ITGR","KRYS","BBIO",
+    "ACLS","ALGM","FORM","GTLS","HQY","LFST","OMCL","PDFS","PLUS",
+    "POWL","PRVA","SKYW","SPSC","TBBK","TFIN","TRMK","UFPI","WDFC",
+    "WTS","XPEL","YETI","ZWS","GFAI","MGEE","NRC","NTST",
 ]
 
 _UNIVERSE_CACHE = LOG_DIR / "universe_cache.json"

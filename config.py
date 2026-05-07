@@ -60,9 +60,9 @@ VCP = {
     "min_contraction_ratio":    0.50,
     "max_depth_from_high":      0.35,
     "volume_decline_required":  True,
-    "final_tight_pct":          0.08,
+    "final_tight_pct":          0.10,
     "lookback_days":            60,
-    "min_confidence":           0.65,
+    "min_confidence":           0.60,
     "min_quality_score":        3,
     "breakout_volume_min":      1.5,   # today's volume ≥ 1.5x avg = breakout confirmed
     # Candlestick confirmation on entry candle
@@ -80,6 +80,7 @@ RISK = {
     "max_daily_loss_pct":      0.04,
     "max_drawdown_pct":        0.12,
     "max_portfolio_heat_pct":  0.08,
+    "soft_drawdown_pause_pct": 0.08,   # pause new entries (no halt) when dd >8%
     "position_scale_in":       False,
 }
 
@@ -97,7 +98,7 @@ MONITOR = {
     # Hard stop upgrade: move stop to breakeven after +8%
     "breakeven_trigger":      0.08,
     # Time stop: close stagnant positions (Minervini 3-4 week rule)
-    "time_stop_trading_days": 15,     # max holding days with no breakout
+    "time_stop_trading_days": 20,     # max holding days with no breakout
     "time_stop_min_gain_pct":  0.02,  # only close if gain < 2% (not a winner)
     # Pre-market gap check: cancel buy-stop if stock gaps above stop
     "premarket_gap_pct":       0.02,  # cancel if stock >2% above stop price

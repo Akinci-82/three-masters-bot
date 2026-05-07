@@ -137,6 +137,7 @@ def _cmd_help() -> str:
         "/orders — pending buy-stop orders\n"
         "/positions — open positions with P&L\n"
         "/cancel SYMBOL — cancel buy-stop for a symbol\n"
+        "/scan — run today's VCP scan now\n"
         "/help — this message"
     )
 
@@ -168,6 +169,16 @@ def _handle_update(update: dict) -> None:
             _send("Usage: /cancel SYMBOL  (e.g. /cancel BG)")
         else:
             _send(_cmd_cancel(arg))
+    elif cmd == "/scan":
+        _send("\U0001f50d Running manual scan\u2026 (2\u20135 min)")
+        import threading as _thr
+        def _bg_scan(_send_fn=_send):
+            try:
+                import main as _main
+                _main.run_daily()
+            except Exception as _e:
+                _send_fn(f"\u274c Scan error: {_e}")
+        _thr.Thread(target=_bg_scan, daemon=True, name="tg-manual-scan").start()
     elif cmd == "/help":
         _send(_cmd_help())
     else:

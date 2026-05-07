@@ -307,8 +307,7 @@ def _call_haiku(symbol: str, prompt: str) -> dict:
 
 # ── Tier 2: Sonnet full analysis ──────────────────────────────────────────────
 
-def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict,
-                          last_candle: str) -> str:
+def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle: str, fundamentals: dict | None = None) -> str:
     """
     100-day OHLCV prompt with explicit step-by-step Minervini VCP analysis.
     Forces Claude to identify each contraction, measure precisely, and pinpoint
@@ -355,6 +354,9 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict,
     elif last_candle == "bearish":
         candle_ctx = "\n- ENTRY CANDLE: Bearish close — caution"
 
+    news_headlines = _get_recent_news(symbol, n=4)
+    news_ctx = f"\n\n## Recent News (catalyst check)\n{news_headlines}"
+
     return f"""You are executing Mark Minervini's VCP analysis protocol on {symbol}.
 
 ## Price Data (last {len(recent)} trading days, vol avg={vol_avg:,})
@@ -367,7 +369,7 @@ Date        High    Low     Close   Volume
 - MA50=${ma50:.2f} | MA200=${ma200:.2f} | Current=${float(close.iloc[-1]):.2f}
 - Quant segment ranges (oldest→newest): {seg_str}
 - Depth from pattern high: {quant.get('pattern_depth_pct',0):.1%}
-- Handle range (last 10 bars): {quant.get('tight_rng_pct',0):.1%}{vol_ctx}{candle_ctx}
+- Handle range (last 10 bars): {quant.get('tight_rng_pct',0):.1%}{vol_ctx}{candle_ctx}{news_ctx}
 
 ## Analysis Protocol — follow each step:
 
@@ -431,7 +433,7 @@ def _call_sonnet(symbol: str, prompt: str) -> dict:
     try:
         resp = _get_client().messages.create(
             model=_SONNET_MODEL,
-            max_tokens=600,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
@@ -474,7 +476,7 @@ def _build_opus_prompt(symbol: str, df: pd.DataFrame, sonnet: dict,
 
     prev_analysis = json.dumps(sonnet, indent=2)
 
-    return f"""You are Mark Minervini's most demanding technical analyst. A junior analyst (Sonnet) flagged {symbol} as a potential high-quality VCP setup. Your job: validate or veto.
+    return f"""You are an experienced VCP analyst trained by Mark Minervini. A junior analyst (Sonnet) flagged {symbol} as a potential high-quality VCP setup. Your job: weigh the evidence and give a balanced verdict — trade, watch, or skip. When the risk/reward is favourable and the pattern is mostly sound, lean toward trade or watch rather than skip.
 
 ## Price Data (last {len(recent)} trading days, vol avg={vol_avg:,})
 ```
@@ -493,8 +495,8 @@ MA50=${ma50:.2f} | MA200=${ma200:.2f} | Entry candle: {last_candle}
 2. Is the handle truly low-volume compared to the prior contractions?
 3. Is the proposed breakout level (${ sonnet.get('breakout_level', '?')}) the correct pivot high — or is there a better level?
 4. Is the stop loss (${ sonnet.get('stop_loss', '?')}) logical — just below the handle low, not too wide?
-5. Would Minervini actually trade this? What would make him walk away?
-6. Risk/reward: entry ${sonnet.get('breakout_level','?')} → projected +20–25% move. Does the pattern support this?
+5. Weigh risk/reward: entry ${sonnet.get('breakout_level','?')} → projected +20-25% move. If the setup is 70%+ sound, prefer "trade" or "watch" over "skip".
+6. Use "skip" only when a clear disqualifying flaw exists (broken pattern, wrong volume structure, stop too wide).
 
 ## Response (JSON ONLY)
 {{
@@ -533,7 +535,23 @@ def _call_opus(symbol: str, prompt: str) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPResult:
+def _get_recent_news(symbol: str, n: int = 5) -> str:
+    """Return up to n recent news headlines via yfinance for catalyst check."""
+    try:
+        import yfinance as _yf
+        t = _yf.Ticker(symbol)
+        news = t.news or []
+        headlines = []
+        for item in news[:n]:
+            title = item.get("content", {}).get("title") or item.get("title", "")
+            if title:
+                headlines.append(f"• {title}")
+        return "\n".join(headlines) if headlines else "No recent news available."
+    except Exception:
+        return "News unavailable."
+
+
+def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundamentals: dict | None = None) -> VCPResult:
     """
     Three-tier VCP analysis:
       Tier 0: quantitative filter (free)
@@ -652,6 +670,11 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral") -> VCPR
             quality    = int(o_data.get("quality_score", quality))
             tier_label = "opus"
             s_data = o_data   # use Opus notes for logging
+            # "watch" = borderline setup — allow through but cap confidence at 0.70
+            # so position sizing stays conservative
+            if verdict == "watch":
+                confidence = min(confidence, 0.70)
+                _log.info("[vcp] %s Opus verdict=watch — capping confidence at 70%%", symbol)
 
     stop_loss = _atr_adjusted_stop(df, breakout, stop_loss)
     vol_multiweek = quant.get("vol_at_multiweek_low", False)
