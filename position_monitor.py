@@ -704,9 +704,24 @@ def check_positions() -> None:
         # ── Step F: Pyramid — add 25% at +4% confirmation ──────────────────────
         # Minervini adds to winners: buy more when the breakout is confirmed
         # Uses same pivot-low stop. Only once, only if heat cap allows.
+        # RS gate: only pyramid when stock is still leading the market (RS at/near high)
+        _rs_pyr_date = datetime.now(_ET).strftime("%Y-%m-%d")
+        if sym.get("_rs_pyr_date") != _rs_pyr_date:
+            sym["_rs_pyr_date"] = _rs_pyr_date
+            try:
+                import yfinance as _yf_pyr
+                _s_pyr  = _yf_pyr.Ticker(symbol).history(period="1y", interval="1d", auto_adjust=True)["Close"]
+                _sp_pyr = _yf_pyr.Ticker("SPY").history(period="1y", interval="1d", auto_adjust=True)["Close"]
+                if len(_s_pyr) >= 20 and len(_sp_pyr) >= 20:
+                    _rs_l = _s_pyr / _sp_pyr.reindex(_s_pyr.index, method="ffill")
+                    sym["_rs_at_high"] = float(_rs_l.iloc[-1]) >= float(_rs_l.max()) * 0.98
+            except Exception:
+                sym["_rs_at_high"] = True
+        _rs_ok = sym.get("_rs_at_high", True)
         if (pnl_pct >= 0.04
                 and not sym.get("pyramid_done")
-                and not sym.get("partial1_done")):
+                and not sym.get("partial1_done")
+                and _rs_ok):
             try:
                 from risk_manager import get_state as _prs, check_can_trade
                 from broker import place_market_buy, get_account
@@ -792,6 +807,48 @@ def check_positions() -> None:
             except Exception as _e:
                 _log.debug("[monitor] Climax check %s failed: %s", symbol, _e)
 
+        # ── Step W: Weekly close rule — exit if weekly bar closes below MA10w ──────
+        # O'Neil: a close below the 10-week MA is institutional selling — loss of trend
+        # Use last completed weekly bar (iloc[-2]) to avoid reacting to intraweek noise.
+        if (not sym.get("weekly_close_exited")
+                and not sym.get("climax_exited")
+                and pnl_pct > 0):
+            _wc_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_wc_check_date") != _wc_today:
+                sym["_wc_check_date"] = _wc_today
+                try:
+                    import yfinance as _yf_wc
+                    _dfw = _yf_wc.Ticker(symbol).history(
+                        period="6mo", interval="1wk", auto_adjust=True)
+                    if len(_dfw) >= 12:
+                        _w_close = float(_dfw["Close"].iloc[-2])   # last completed week
+                        _ma10w   = float(_dfw["Close"].iloc[-12:-2].mean())  # MA10w of prior 10
+                        if _w_close < _ma10w:
+                            _rem_wc = qty - sym.get("partial_qty", 0)
+                            _log.warning(
+                                "[monitor] %s WEEKLY CLOSE BELOW MA10w ($%.2f < MA10w $%.2f) — exiting",
+                                symbol, _w_close, _ma10w)
+                            _cancel_stop_orders(symbol)
+                            if _rem_wc > 0 and _place_market_sell(symbol, _rem_wc):
+                                sym["weekly_close_exited"] = True
+                                changed = True
+                                try:
+                                    import requests as _rwc, os as _owc
+                                    _tok = _owc.getenv("TELEGRAM_BOT_TOKEN", "")
+                                    _cid = _owc.getenv("TELEGRAM_CHAT_ID", "")
+                                    if _tok and _cid:
+                                        _rwc.post(
+                                            f"https://api.telegram.org/bot{_tok}/sendMessage",
+                                            json={"chat_id": _cid, "parse_mode": "Markdown",
+                                                  "text": (f"📉 *Weekly Close Exit — {symbol}*\n"
+                                                           f"Weekly close ${_w_close:.2f} below MA10w ${_ma10w:.2f}\n"
+                                                           f"O'Neil institutional selling signal")},
+                                            timeout=8)
+                                except Exception:
+                                    pass
+                except Exception as _we:
+                    _log.debug("[monitor] weekly close %s: %s", symbol, _we)
+
     # ── Telegram proximity alerts (once per day per position) ────────────────
     for _sym_a, _sym_d in state.items():
         if _sym_a not in {p["symbol"] for p in positions}:
@@ -830,6 +887,40 @@ def check_positions() -> None:
                         changed = True
             except Exception:
                 pass
+
+    # ── Stale position review (>30 trading days, no major exit milestone) ─────────
+    for _sym_st, _sym_std in state.items():
+        if _sym_st not in {p["symbol"] for p in positions}:
+            continue
+        _stale_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if _sym_std.get("_stale_alert_date") == _stale_today:
+            continue
+        _ed_st = _sym_std.get("entry_date", "")
+        if not _ed_st:
+            continue
+        if _trading_days_held(_ed_st) < 30:
+            continue
+        if (_sym_std.get("partial2_done") or _sym_std.get("climax_exited")
+                or _sym_std.get("time_stopped") or _sym_std.get("weekly_close_exited")):
+            continue
+        _sym_std["_stale_alert_date"] = _stale_today
+        try:
+            import requests as _rqst, os as _ost
+            _tok = _ost.getenv("TELEGRAM_BOT_TOKEN", "")
+            _cid = _ost.getenv("TELEGRAM_CHAT_ID", "")
+            if _tok and _cid:
+                _cur_p  = next((p for p in positions if p["symbol"] == _sym_st), None)
+                _pnl_st = float(_cur_p.get("unrealized_plpc", 0)) * 100 if _cur_p else 0.0
+                _days_st = _trading_days_held(_ed_st)
+                _rqst.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
+                           json={"chat_id": _cid, "parse_mode": "Markdown",
+                                 "text": (f"⏳ *Stale Position — {_sym_st}*\n"
+                                          f"Held {_days_st} trading days • P&L {_pnl_st:+.1f}%%\n"
+                                          f"Review: is the VCP thesis still valid?")},
+                           timeout=5)
+                changed = True
+        except Exception:
+            pass
 
     # Clean up state for positions that are now closed — call close_trade()
     # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.

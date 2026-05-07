@@ -74,6 +74,19 @@ def _kelly_factor() -> float:
         return 1.0
 
 
+def _stop_distance_factor(entry_price: float, stop_price: float) -> float:
+    """Scale position size down for wide stops — tight VCP handle = bigger position.
+    A 5% stop means the setup is ideal; 10%+ stop = lower conviction, smaller size.
+    """
+    if entry_price <= 0 or stop_price >= entry_price:
+        return 1.0
+    stop_pct = (entry_price - stop_price) / entry_price
+    if stop_pct <= 0.05:  return 1.00   # ideal tight handle
+    if stop_pct <= 0.07:  return 0.85   # slightly wide
+    if stop_pct <= 0.10:  return 0.70   # moderately wide
+    return 0.55                          # very wide — reduced conviction
+
+
 def position_size(portfolio_value: float, entry_price: float,
                   stop_loss: float, risk_pct: float | None = None,
                   measured_move_pct: float = 0.0) -> dict:
@@ -91,8 +104,9 @@ def position_size(portfolio_value: float, entry_price: float,
 
     risk_pct = min(risk_pct, RISK["max_risk_per_trade_pct"])
 
-    kelly = _kelly_factor()
-    risk_amount = portfolio_value * risk_pct * kelly
+    kelly  = _kelly_factor()
+    sdf    = _stop_distance_factor(entry_price, stop_loss)
+    risk_amount = portfolio_value * risk_pct * kelly * sdf
     risk_per_share = entry_price - stop_loss
 
     if risk_per_share <= 0:

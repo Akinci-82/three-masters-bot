@@ -817,19 +817,67 @@ def _simons_score(trend) -> float:
     rs_sec      = getattr(trend, "rs_vs_sector", None)
     sec_rs_pts  = (0.5 if rs_sec is not None and rs_sec >= 0.05
                    else (0.25 if rs_sec is not None and rs_sec >= 0.02 else 0.0))
+    # Return on equity: ≥15% = capital-efficient compounding machine (Simons quality)
+    roe_val   = getattr(trend, "roe", None)
+    roe_pts   = (0.5 if roe_val is not None and roe_val >= 0.15
+                 else (0.25 if roe_val is not None and roe_val >= 0.10 else 0.0))
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
-               + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts, 10.0)
+               + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts, 10.0)
+
+
+def _fetch_distribution_days() -> int:
+    """Count SPY distribution days in last 25 sessions.
+    Distribution day = SPY closes down >0.2%% on higher volume than prior day.
+    4-5 distribution days signal institutional selling (O'Neil market health).
+    """
+    try:
+        import yfinance as _yf_dd
+        _df = _yf_dd.Ticker("SPY").history(period="40d", interval="1d", auto_adjust=True)
+        if len(_df) < 5:
+            return 0
+        _df = _df.tail(26)
+        _count = 0
+        for _i in range(1, len(_df)):
+            _chg = (_df["Close"].iloc[_i] - _df["Close"].iloc[_i - 1]) / _df["Close"].iloc[_i - 1]
+            if _chg < -0.002 and _df["Volume"].iloc[_i] > _df["Volume"].iloc[_i - 1]:
+                _count += 1
+        return _count
+    except Exception:
+        return 0
+
+
+def _fetch_nh_nl_ratio() -> float:
+    """NYSE new highs vs new lows ratio via ^NYHL (net = NH - NL).
+    >1.5 = market breadth expanding; <0.5 = deteriorating internals.
+    Falls back to neutral (1.0) if data unavailable.
+    """
+    try:
+        import yfinance as _yf_nl
+        _hl = _yf_nl.Ticker("^NYHL").history(period="5d", interval="1d", auto_adjust=True)
+        if len(_hl) >= 1:
+            _net = float(_hl["Close"].iloc[-1])
+            if _net > 150:   return 2.0   # strong expansion
+            if _net > 50:    return 1.5   # mild expansion
+            if _net < -150:  return 0.25  # deteriorating
+            if _net < -50:   return 0.5   # weakening
+            return 1.0
+    except Exception:
+        pass
+    return 1.0   # neutral fallback when data unavailable
 
 
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
                   power_trend: bool = False, pcr: float = 0.7,
-                  rate_slope_bps: float = 0.0, vix_slope: float = 0.0) -> float:
+                  rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
+                  dist_days: int = 0, nh_nl_ratio: float = 1.0) -> float:
     """
     0–10, weight 10%. Market regime, portfolio health, breadth (Tudor Jones layer).
     power_trend = O'Neil SPY 21d EMA > 50d EMA for ≥8 days (+1.0 pts).
     pcr = CBOE Put/Call ratio: >1.0 fear=+0.5, <0.6 greed=-0.5.
     rate_slope_bps = 20-day change in 10Y yield; >50bps rising = -1.0 pts.
     vix_slope = 5-day VIX change; >3pts = fear rising (-0.5), <-2pts = complacency (+0.25).
+    dist_days = distribution days in last 25 sessions; >=5 = -1.5 pts (O'Neil sell signal).
+    nh_nl_ratio = NYSE new highs/lows ratio; <0.5 = -1.0 pts (internal deterioration).
     """
     reg_pts  = {"bull": 3.0, "neutral": 1.5, "bear": 0.0}.get(regime, 3.0)
     losses   = risk_state.get("consecutive_losses", 0)
@@ -846,13 +894,18 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     rate_pts  = -1.0 if rate_slope_bps > 50 else (-0.5 if rate_slope_bps > 25 else 0.0)
     # VIX direction: rising fear = caution, falling = environment improving
     vix_pts   = -0.5 if vix_slope > 3.0 else (0.25 if vix_slope < -2.0 else 0.0)
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts, 10.0)
+    # Distribution days: institutional selling on heavy volume (O'Neil market health)
+    dist_pts  = -1.5 if dist_days >= 5 else (-0.5 if dist_days >= 3 else 0.0)
+    # NH/NL internals: expanding new highs = healthy tape; collapsing = distribution
+    nh_nl_pts = 0.5 if nh_nl_ratio >= 1.5 else (-1.0 if nh_nl_ratio < 0.5 else 0.0)
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
                      sector_bonus: float = 0.0, breadth_pct: float = 0.5,
                      power_trend: bool = False, pcr: float = 0.7,
-                     rate_slope_bps: float = 0.0, vix_slope: float = 0.0) -> float:
+                     rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
+                     dist_days: int = 0, nh_nl_ratio: float = 1.0) -> float:
     """
     Three Masters weighted composite score (0–10).
       Minervini 60% — VCP quality, confidence, handle tightness, volume
@@ -863,7 +916,7 @@ def _composite_score(vcp, trend, risk_state: dict, regime: str,
     """
     m = _minervini_score(vcp)
     s = _simons_score(trend)
-    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope)
+    t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope, dist_days, nh_nl_ratio)
     return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
 
 
@@ -1310,6 +1363,14 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
               ("rising(-0.5)" if _rate_slope_bps > 25 else "neutral"))
     if _power_trend:
         _log.info("[tudor] Power Trend active (SPY 21d EMA > 50d EMA \u22658 days) +1.0 T-pts")
+    _dist_days    = _fetch_distribution_days()
+    _nh_nl_ratio  = _fetch_nh_nl_ratio()
+    _log.info("[tudor] Distribution days=%d (%s)", _dist_days,
+              "institutional-selling(-1.5)" if _dist_days >= 5 else
+              ("caution(-0.5)" if _dist_days >= 3 else "healthy"))
+    _log.info("[tudor] NH/NL ratio=%.2f (%s)", _nh_nl_ratio,
+              "expanding(+0.5)" if _nh_nl_ratio >= 1.5 else
+              ("deteriorating(-1.0)" if _nh_nl_ratio < 0.5 else "neutral"))
     _log.info("[tudor] PCR=%.2f (%s)", _current_pcr,
               "fear+0.5" if _current_pcr > 1.0 else ("greed-0.5" if _current_pcr < 0.6 else "neutral"))
     scored  = []
@@ -1319,11 +1380,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             scored.append((vcp, trend_r, 0.0))
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
-        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope)
+        cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio)
         _log.info("[score] %s  M=%.1f S=%.1f T=%.1f sec=%+.2f breadth=%.0f%% pt=%s pcr=%.2f rate=%+.0fbps vix_sl=%.1f → composite=%.2f",
                   vcp.symbol,
                   _minervini_score(vcp), _simons_score(trend_r),
-                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope), sec_bonus,
+                  _tudor_score(_rs_now, regime, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio), sec_bonus,
                   _breadth_pct * 100, "✓" if _power_trend else "✗", _current_pcr, _rate_slope_bps, _vix_slope, cs)
         scored.append((vcp, trend_r, cs))
 

@@ -334,6 +334,7 @@ class TrendResult:
     monthly_stage2: bool         = True   # monthly chart price > MA10m + MA40m (Stage 2 uptrend)
     eps_revision: float | None   = None   # forwardEps/trailingEps-1 (analyst revision proxy)
     rs_vs_sector: float | None   = None   # RS outperformance vs own sector ETF (>0 = leader)
+    roe: float | None            = None   # returnOnEquity (>=0.15 = efficient capital use)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -345,28 +346,30 @@ class TrendResult:
                 f"MA20={self.ma20:.0f}/{self.ma50:.0f}/{self.ma200:.0f}{earn}")
 
 
-def _get_fundamentals(ticker) -> tuple[float | None, float | None, float | None, float | None, float | None]:
-    """Return (eps_quarterly_growth, revenue_growth, market_cap, short_ratio, eps_revision) from yfinance."""
+def _get_fundamentals(ticker) -> tuple[float | None, float | None, float | None, float | None, float | None, float | None]:
+    """Return (eps_quarterly_growth, revenue_growth, market_cap, short_ratio, eps_revision, roe) from yfinance."""
     try:
         info  = ticker.info
         eps_g = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
         rev_g = info.get("revenueGrowth")
         mcap  = info.get("marketCap")
         srat  = info.get("shortRatio")
-        # Analyst revision proxy: forwardEps vs trailingEps growth expectation
         fwd   = info.get("forwardEps")
         trail = info.get("trailingEps")
         eps_rev = (float(fwd) / float(trail) - 1
                    if fwd and trail and float(trail) > 0 else None)
+        roe_raw = info.get("returnOnEquity")
+        roe     = float(roe_raw) if roe_raw is not None else None
         return (
             float(eps_g)  if eps_g  is not None else None,
             float(rev_g)  if rev_g  is not None else None,
             float(mcap)   if mcap   is not None else None,
             float(srat)   if srat   is not None else None,
             eps_rev,
+            roe,
         )
     except Exception:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
@@ -492,12 +495,13 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
-        eps_g, rev_g, market_cap, short_ratio, eps_rev = _get_fundamentals(ticker)
+        eps_g, rev_g, market_cap, short_ratio, eps_rev, roe = _get_fundamentals(ticker)
         result.eps_growth     = eps_g
         result.revenue_growth = rev_g
         result.market_cap     = market_cap
         result.short_ratio    = short_ratio
         result.eps_revision   = eps_rev
+        result.roe            = roe
         # Liquidity floor: $500M+ to avoid thin-volume micro-caps
         # No upper cap — VCP logic is size-agnostic (NVDA, AAPL, MSFT all form VCPs)
         if market_cap is not None and market_cap < 500_000_000:
