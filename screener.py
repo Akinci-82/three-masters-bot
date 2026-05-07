@@ -446,11 +446,10 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         result.revenue_growth = rev_g
         result.market_cap     = market_cap
         result.short_ratio    = short_ratio
-        # Minervini sweet spot: $200M–$25B (small/mid cap with growth potential)
-        # Mega-caps rarely make 20-40% VCP breakout moves
-        if market_cap is not None and (
-                market_cap < 200_000_000 or market_cap > 25_000_000_000):
-            result.fail_reason = f"market_cap_out_of_range(${market_cap/1e9:.1f}B)"
+        # Liquidity floor: $500M+ to avoid thin-volume micro-caps
+        # No upper cap — VCP logic is size-agnostic (NVDA, AAPL, MSFT all form VCPs)
+        if market_cap is not None and market_cap < 500_000_000:
+            result.fail_reason = f"market_cap_too_small(${market_cap/1e9:.1f}B)"
             return result
         if eps_g is not None and eps_g < -0.10:
             result.fail_reason = f"eps_declining({eps_g:.0%})"
