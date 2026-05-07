@@ -339,6 +339,8 @@ class TrendResult:
     float_rotation: float | None = None  # base vol / float shares (>1.0 = full float turned over)
     inst_pct: float | None   = None   # % held by institutions (sponsorship quality)
     eps_beat_count: int       = 0      # consecutive EPS beats in last 3 quarters
+    at_52w_high: bool         = False  # price within 2% of 52w high (no overhead supply)
+    accum_ratio: float        = 0.0   # accum days on above-avg vol / total up-days (base quality)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -476,6 +478,12 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         _dn_v = float(_df50.loc[_df50["Close"] <  _df50["Open"], "Volume"].sum())
         ad_ratio = (_up_v / _dn_v) if _dn_v > 0 else 2.0
         adx_val  = _compute_adx(df)
+        # At 52-week high: within 2% = no overhead supply from prior holders
+        at_52w_high_val = abs(pct_from_high) <= 0.02
+        # Accumulation days: up-close bars on above-avg volume in the base
+        _up_days_df     = _df50[_df50["Close"] >= _df50["Open"]]
+        _accum_d        = _up_days_df[_up_days_df["Volume"] >= avg_vol]
+        accum_ratio_val = round(_accum_d.shape[0] / max(_up_days_df.shape[0], 1), 3)
 
         # Earnings check (do early — cheap to skip)
         days_earn = _days_to_earnings(symbol)
@@ -563,6 +571,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         result.eps_revision   = eps_rev
         result.roe            = roe
         result.adx            = adx_val
+        result.at_52w_high    = at_52w_high_val
+        result.accum_ratio    = accum_ratio_val
         result.inst_pct       = inst_pct
         result.eps_beat_count = _count_eps_beats(ticker)
         if float_sh and float_sh > 0:

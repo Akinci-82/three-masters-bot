@@ -255,6 +255,8 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
         "pnl_dollar":      round(pnl_dollar, 2),
         "r_multiple":      round(r_multiple, 2),
         "composite_score": round(float(sym_data.get("composite_score", 0.0) or 0.0), 2),
+        "mae_pct":         round(float(sym_data.get("mae_pct", 0.0) or 0.0) * 100, 2),
+        "mfe_pct":         round(float(sym_data.get("mfe_pct", 0.0) or 0.0) * 100, 2),
         "portfolio_after": round(portfolio_value, 2),
     }
     journal = os.path.join(os.path.dirname(__file__), "logs", "trade_journal.jsonl")
@@ -277,6 +279,68 @@ def _trading_days_held(entry_date_str: str) -> int:
         return int(np.busday_count(entry.isoformat(), today.isoformat()))
     except Exception:
         return 0
+
+
+# ── Sector ETF map (minimal copy for position monitor) ─────────────────────
+_SECTOR_ETF_PM: dict[str, str] = {
+    "Technology": "XLK", "Financial Services": "XLF", "Financials": "XLF",
+    "Healthcare": "XLV", "Health Care": "XLV", "Energy": "XLE",
+    "Consumer Cyclical": "XLY", "Consumer Discretionary": "XLY",
+    "Industrials": "XLI", "Basic Materials": "XLB", "Materials": "XLB",
+    "Real Estate": "XLRE", "Utilities": "XLU",
+    "Consumer Defensive": "XLP", "Consumer Staples": "XLP",
+    "Communication Services": "XLC",
+}
+_sector_etf_cache: dict[str, tuple[bool, float]] = {}
+
+
+def _sector_etf_below_ma50(symbol: str) -> bool:
+    """True if the symbol's sector ETF is below its 50-day MA (sector headwind).
+    Cached per ETF with 1-hour TTL to avoid excessive yfinance calls.
+    """
+    import time as _time_s
+    try:
+        from screener import get_sector as _gs
+        etf = _SECTOR_ETF_PM.get(_gs(symbol))
+        if not etf:
+            return False
+        _now = _time_s.time()
+        if etf in _sector_etf_cache and _now - _sector_etf_cache[etf][1] < 3600:
+            return _sector_etf_cache[etf][0]
+        import yfinance as _yf_etf
+        _col = _yf_etf.Ticker(etf).history(
+            period="60d", interval="1d", auto_adjust=True)["Close"]
+        _result = len(_col) >= 51 and float(_col.iloc[-1]) < float(_col.tail(50).mean())
+        _sector_etf_cache[etf] = (_result, _now)
+        return _result
+    except Exception:
+        return False
+
+
+# ── Regime cache (1-hour TTL) — for adaptive time stop ───────────────────────
+_cached_regime_pm: str   = "neutral"
+_regime_ts_pm:    float  = 0.0
+
+
+def _get_cached_regime() -> str:
+    """Return SPY regime (bull/neutral/bear) with a 1-hour cache to avoid per-position fetches."""
+    import time as _time_r
+    global _cached_regime_pm, _regime_ts_pm
+    if _time_r.time() - _regime_ts_pm < 3600:
+        return _cached_regime_pm
+    try:
+        import yfinance as _yf_rg
+        _spy = _yf_rg.Ticker("SPY").history(
+            period="200d", interval="1d", auto_adjust=True)["Close"]
+        if len(_spy) >= 50:
+            _ma200 = float(_spy.tail(200).mean())
+            _pct   = (float(_spy.iloc[-1]) - _ma200) / _ma200
+            _cached_regime_pm = ("bull" if _pct > 0.02
+                                  else ("bear" if _pct < -0.02 else "neutral"))
+    except Exception:
+        pass
+    _regime_ts_pm = _time_r.time()
+    return _cached_regime_pm
 
 
 def _lookup_position_metadata(symbol: str) -> dict:
@@ -401,10 +465,16 @@ def check_positions() -> None:
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
                    symbol, qty, avg_cost, cur_price, pnl_pct * 100)
 
+        # MAE/MFE: track worst (most adverse) and best (most favorable) excursion per position
+        sym["mae_pct"] = min(sym.get("mae_pct", pnl_pct), pnl_pct)
+        sym["mfe_pct"] = max(sym.get("mfe_pct", pnl_pct), pnl_pct)
+
         # Quality-adjusted exits: elite setups get more room to run
         composite      = sym.get("composite_score", 0.0)
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
-        time_stop_days  = 20   if composite >= 8.0 else cfg.get("time_stop_trading_days", 15)
+        _regime_ts      = _get_cached_regime()
+        _base_ts        = 25 if _regime_ts == "bull" else (10 if _regime_ts == "neutral" else 15)
+        time_stop_days  = max(_base_ts, 20) if composite >= 8.0 else _base_ts
 
         # ── Step G: Gap-up harvest — sell 50% on overnight gap ≥12% ─────────────
         # Large gaps often fill; taking half off protects gains from mean-reversion
@@ -703,6 +773,28 @@ def check_positions() -> None:
                     changed = True
                     _log.info("[monitor] %s stop moved to breakeven $%.2f (+%.1f%%)",
                               symbol, breakeven, pnl_pct * 100)
+
+        # ── Step C2: Sector ETF < MA50 — force breakeven on sector weakness ─────
+        # If the broader sector is losing leadership, tighten before the position turns.
+        # Runs once per day per position (ETF data cached 1h).
+        if (not sym.get("breakeven_done")
+                and pnl_pct > 0.01):
+            _c2_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_sector_be_date") != _c2_today:
+                sym["_sector_be_date"] = _c2_today
+                if _sector_etf_below_ma50(symbol):
+                    _c2_remaining = qty - sym.get("partial_qty", 0)
+                    if _c2_remaining > 0:
+                        _cancel_stop_orders(symbol)
+                        _c2_oid = _place_stop(symbol, _c2_remaining, round(avg_cost, 2))
+                        if _c2_oid:
+                            sym["breakeven_done"] = True
+                            sym["stop_order_id"]  = _c2_oid
+                            changed = True
+                            _log.warning(
+                                "[monitor] %s SECTOR ETF < MA50 — "
+                                "forced breakeven $%.2f (pnl=+%.1f%%)",
+                                symbol, avg_cost, pnl_pct * 100)
 
         # ── Profit lock: raise stop to +7% when gain ≥ +15% ─────────────────────
         # Protects runner profit between B1 (+10%) and B2 (measured move).

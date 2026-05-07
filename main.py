@@ -596,6 +596,12 @@ def _send_weekly_report(portfolio_value: float) -> None:
             _wk_wins = sum(1 for t in _wk_trades if t.get("r_multiple", 0) > 0)
             _wk_avg  = sum(t.get("r_multiple", 0) for t in _wk_trades) / len(_wk_trades)
             lines.append(f"  Week: {_wk_wins}W/{len(_wk_trades)-_wk_wins}L  avg {_wk_avg:+.2f}R")
+            _maes = [t.get("mae_pct") for t in _wk_trades if t.get("mae_pct") is not None]
+            _mfes = [t.get("mfe_pct") for t in _wk_trades if t.get("mfe_pct") is not None]
+            if _maes and _mfes:
+                lines.append(
+                    f"  avg MAE {sum(_maes)/len(_maes):+.1f}%  |  "
+                    f"avg MFE {sum(_mfes)/len(_mfes):+.1f}%")
 
         try:
             _fb = {
@@ -935,11 +941,19 @@ def _simons_score(trend) -> float:
     inst_pts = (0.5 if inst_val is not None and inst_val >= 0.60
                 else (0.25 if inst_val is not None and inst_val >= 0.40 else 0.0))
     # EPS beat history: consistent positive earnings surprises = management execution quality
-    beat_cnt  = getattr(trend, "eps_beat_count", 0)
-    beat_pts  = 0.25 if beat_cnt >= 2 else 0.0
+    beat_cnt     = getattr(trend, "eps_beat_count", 0)
+    beat_pts     = 0.25 if beat_cnt >= 2 else 0.0
+    # Revenue beat proxy: EPS beats + strong revenue growth = double confirmation
+    _rev_g_v     = getattr(trend, "revenue_growth", None)
+    rev_beat_pts = 0.25 if (beat_cnt >= 2 and _rev_g_v is not None and _rev_g_v >= 0.10) else 0.0
+    # 52-week high breakout: no overhead supply — cleanest possible Minervini setup
+    at_52w_pts   = 0.5 if getattr(trend, "at_52w_high", False) else 0.0
+    # Accumulation days in base: institutional buyers active on up-days (quality base)
+    accum_r      = getattr(trend, "accum_ratio", 0.0)
+    accum_pts    = 0.25 if accum_r >= 0.60 else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
-               + adx_pts + fr_pts + inst_pts + beat_pts, 10.0)
+               + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts, 10.0)
 
 
 def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
@@ -1618,6 +1632,15 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     vcp_scored.sort(key=lambda x: -x[2])
     _log.info("[score] Order of priority: %s",
               [(v.symbol, cs) for v, t, cs in vcp_scored])
+
+    # Daily P&L guard: Tudor Jones principle — never add risk on a bad day
+    _daily_pnl_chk = _rs_now.get("daily_pnl_pct", 0.0)
+    if _daily_pnl_chk < -0.02:
+        _log.warning("[tudor] DAILY P&L GUARD: portfolio down %.1f%% today — new orders blocked",
+                     _daily_pnl_chk * 100)
+        _tg(f"🛡️ *Daily P&L Guard*\nPortfolio down {_daily_pnl_chk*100:.1f}% today — "
+            f"no new orders (Tudor Jones: never add risk on a bad day)")
+        max_new_pos = 0
 
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
