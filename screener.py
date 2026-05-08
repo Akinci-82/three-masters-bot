@@ -362,6 +362,8 @@ class TrendResult:
     pocket_pivot: bool        = False  # today up-vol > max prior down-day vol in last 10 days
     eps_accelerating: bool    = False  # EPS growth rate accelerating Q-over-Q (Minervini SEPA core)
     accum_weeks_strong: bool  = False  # ≥8/13 up-volume weeks = sustained institutional accumulation
+    insider_buying: bool      = False  # C-suite/director purchase in last 90 days (not option exercise)
+    industry_leader: bool     = False  # stock's sector ETF in top-4 by 6-month momentum
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -845,6 +847,61 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.accum_weeks_strong = _accum_strong
+
+        # Insider buying: recent C-suite/director purchase = strongest alignment signal
+        # Filters out option exercises; only counts open-market purchases
+        _insider_buy = False
+        try:
+            _it = ticker.insider_transactions
+            if _it is not None and not _it.empty:
+                _cutoff_it = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
+                for _, _row in _it.iterrows():
+                    _tx_type = str(_row.get("Transaction", "")).lower()
+                    _tx_date = pd.to_datetime(_row.get("Start Date", None), utc=True, errors="coerce")
+                    _tx_sh   = float(_row.get("Shares", 0) or 0)
+                    if (not pd.isnull(_tx_date)
+                            and _tx_date >= _cutoff_it
+                            and _tx_sh > 0
+                            and "purchase" in _tx_type
+                            and "sale" not in _tx_type):
+                        _insider_buy = True
+                        break
+        except Exception:
+            pass
+        result.insider_buying = _insider_buy
+
+        # Industry group momentum rank: stock's sector ETF in top-4 by 6-month return
+        # O'Neil: 37% of a stock's move comes from its industry group trend
+        _ind_leader = False
+        try:
+            _sec_sym = get_sector(symbol)
+            _etf_map_il = {
+                "Technology": "XLK", "Financial Services": "XLF", "Financials": "XLF",
+                "Healthcare": "XLV", "Health Care": "XLV", "Energy": "XLE",
+                "Consumer Cyclical": "XLY", "Consumer Discretionary": "XLY",
+                "Industrials": "XLI", "Basic Materials": "XLB", "Materials": "XLB",
+                "Real Estate": "XLRE", "Utilities": "XLU",
+                "Consumer Defensive": "XLP", "Consumer Staples": "XLP",
+                "Communication Services": "XLC",
+            }
+            _etf_sym = _etf_map_il.get(_sec_sym)
+            if _etf_sym:
+                import yfinance as _yf_ind
+                _all_etfs = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLI", "XLB", "XLRE", "XLU", "XLP", "XLC"]
+                _idf = _yf_ind.download(_all_etfs, period="6mo", interval="1d",
+                                        auto_adjust=True, progress=False)["Close"]
+                _rets = {}
+                for _e in _all_etfs:
+                    if _e in _idf.columns:
+                        _col = _idf[_e].dropna()
+                        if len(_col) >= 100:
+                            _rets[_e] = float(_col.iloc[-1] / _col.iloc[0] - 1)
+                if _etf_sym in _rets and _rets:
+                    _ranked_il = sorted(_rets, key=lambda x: -_rets[x])
+                    _ind_leader = _etf_sym in _ranked_il[:4]
+        except Exception:
+            pass
+        result.industry_leader = _ind_leader
 
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)

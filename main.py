@@ -988,11 +988,16 @@ def _simons_score(trend) -> float:
     accel_pts = 0.5 if getattr(trend, "eps_accelerating", False) else 0.0
     # 13-week accumulation: ≥8/13 up-volume weeks = sustained institutional demand (O'Neil breadth)
     aw_pts = 0.25 if getattr(trend, "accum_weeks_strong", False) else 0.0
+    # Insider buying: open-market C-suite purchase = highest conviction alignment signal
+    insider_pts = 0.5 if getattr(trend, "insider_buying", False) else 0.0
+    # Industry leadership: sector ETF in top-4 by 6-month momentum = tide lifting all boats
+    indleader_pts = 0.25 if getattr(trend, "industry_leader", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
-               + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts, 10.0)
+               + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
+               + insider_pts + indleader_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -1799,6 +1804,15 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # Filter: require composite >= 5.0 (guards against weak Simons/Tudor context)
     _MIN_COMPOSITE = _dynamic_min_composite()
+    # Losing streak quality gate: ≥4 consecutive losses = filter tightens to elite-only setups
+    # Separate from consecutive_loss_factor (which reduces SIZE); this reduces QUANTITY of entries.
+    if loss_streak >= 4 and _MIN_COMPOSITE < 7.0:
+        _log.warning("[score] LOSS STREAK GATE: %d losses — MIN_COMPOSITE %.1f→7.0",
+                     loss_streak, _MIN_COMPOSITE)
+        _tg("\U0001f4ca *Loss Streak Gate — quality filter raised*\n"
+            + f"{loss_streak} consecutive losses\n"
+            + "MIN_COMPOSITE raised to 7.0 until next winning trade")
+        _MIN_COMPOSITE = 7.0
     vcp_scored = [(v, t, cs) for v, t, cs in scored if cs >= _MIN_COMPOSITE]
     below = [v.symbol for v, t, cs in scored if cs < _MIN_COMPOSITE]
     if below:
@@ -1863,6 +1877,13 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _now_et_iw = datetime.now(_pytz_iw.timezone("America/New_York")).time()
     if _dtime(11, 0) <= _now_et_iw < _dtime(14, 30) and max_new_pos > 1:
         _log.info("[tudor] Midday window (11:00-14:30 ET) — max_new_pos %d→%d (weaker follow-through)",
+                  max_new_pos, max(1, max_new_pos // 2))
+        max_new_pos = max(1, max_new_pos // 2)
+
+    # Friday weekend risk gate: weekend gaps cannot be managed with GTC stops
+    # Tudor Jones: reduce risk before unmanageable uncertainty, restore after confirmation.
+    if datetime.now().weekday() == 4 and max_new_pos > 1:
+        _log.info("[tudor] Friday — max_new_pos %d→%d (weekend gap risk reduction)",
                   max_new_pos, max(1, max_new_pos // 2))
         max_new_pos = max(1, max_new_pos // 2)
 

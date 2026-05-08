@@ -667,6 +667,57 @@ def check_positions() -> None:
             except Exception as _e:
                 _log.debug("[monitor] earnings check %s: %s", symbol, _e)
 
+        # ── PM9: IV Crush Protection — exit runner if ATM implied vol > 50% near earnings ──
+        # Options market pricing a large move means IV collapses after the report
+        # regardless of whether EPS beats — this erodes the runner's value even on good news.
+        _dte_iv = sym.get("days_to_earnings", 99)
+        if (not sym.get("iv_crush_exited")
+                and 2 <= _dte_iv <= 7
+                and pnl_pct >= 0.15):
+            _iv_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_iv_check_date") != _iv_today:
+                sym["_iv_check_date"] = _iv_today
+                try:
+                    import yfinance as _yf_iv
+                    _tk_iv = _yf_iv.Ticker(symbol)
+                    _exps  = _tk_iv.options
+                    if _exps:
+                        _chain = _tk_iv.option_chain(_exps[0])
+                        _calls = _chain.calls
+                        if not _calls.empty and "impliedVolatility" in _calls.columns:
+                            _atm_i  = (_calls["strike"] - cur_price).abs().idxmin()
+                            _iv_val = float(_calls.loc[_atm_i, "impliedVolatility"])
+                            if _iv_val > 0.50:
+                                _iv_rem = qty - sym.get("partial_qty", 0)
+                                _log.warning(
+                                    "[monitor] %s IV CRUSH EXIT: ATM IV=%.0f%%, "
+                                    "%d days to earnings, pnl=+%.1f%% — closing runner",
+                                    symbol, _iv_val * 100, _dte_iv, pnl_pct * 100)
+                                _cancel_stop_orders(symbol)
+                                if _iv_rem > 0 and _place_market_sell(symbol, _iv_rem):
+                                    sym["iv_crush_exited"] = True
+                                    changed = True
+                                    try:
+                                        import requests as _rqiv, os as _osiv
+                                        _tiv = _osiv.getenv("TELEGRAM_BOT_TOKEN", "")
+                                        _civ = _osiv.getenv("TELEGRAM_CHAT_ID", "")
+                                        if _tiv and _civ:
+                                            _rqiv.post(
+                                                f"https://api.telegram.org/bot{_tiv}/sendMessage",
+                                                json={"chat_id": _civ, "parse_mode": "Markdown",
+                                                      "text": (
+                                                          f"\U0001f9e8 *IV Crush Exit — {symbol}*\n"
+                                                          f"ATM implied vol {_iv_val*100:.0f}% > 50%\n"
+                                                          f"{_dte_iv} days to earnings | "
+                                                          f"gain +{pnl_pct*100:.1f}%\n"
+                                                          f"Exiting runner before IV collapse"
+                                                      )},
+                                                timeout=8)
+                                    except Exception:
+                                        pass
+                except Exception as _ive:
+                    _log.debug("[monitor] iv_crush %s: %s", symbol, _ive)
+
         # ── Step A: Initial stop (placed once when position first seen) ──────────
         # Use HARD STOP at VCP pivot low if we have the planned stop from the order.
         # This protects against false breakouts at exactly the level Minervini intends.
