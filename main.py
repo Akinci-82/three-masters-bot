@@ -994,12 +994,19 @@ def _simons_score(trend) -> float:
     indleader_pts = 0.25 if getattr(trend, "industry_leader", False) else 0.0
     # Revenue acceleration: quarterly revenue growth accelerating Q-over-Q (double SEPA confirmation)
     rev_accel_pts = 0.5 if getattr(trend, "rev_accelerating", False) else 0.0
+    # 3-weeks tight: consecutive weekly closes within 1.5% = institutional hold, no distribution
+    twt2_pts = 0.25 if getattr(trend, "three_weeks_tight", False) else 0.0
+    # Short interest monthly change: covering = squeeze fuel (+0.25), building = warning (-0.25)
+    si_mo_pts = float(getattr(trend, "short_mo_pts", 0.0))
+    # Analyst PT gap: consensus >25% above price = substantial institutional expected upside
+    apt_pts = 0.25 if getattr(trend, "analyst_pt_upside", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
                + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
-               + insider_pts + indleader_pts + rev_accel_pts, 10.0)
+               + insider_pts + indleader_pts + rev_accel_pts
+               + twt2_pts + si_mo_pts + apt_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -1982,6 +1989,30 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.info("[tudor] Friday — max_new_pos %d→%d (weekend gap risk reduction)",
                   max_new_pos, max(1, max_new_pos // 2))
         max_new_pos = max(1, max_new_pos // 2)
+
+    # Seasonal momentum factor: May-Oct historically weak for momentum strategies
+    # "Sell in May" effect is strongest for high-beta momentum names (academic consensus)
+    _month_now = datetime.now().month
+    if _month_now in (5, 6, 7, 8, 9, 10) and max_new_pos > 1:
+        _log.info("[tudor] Seasonal weak window (May-Oct) — max_new_pos %d→%d",
+                  max_new_pos, max_new_pos - 1)
+        max_new_pos = max(1, max_new_pos - 1)
+
+    # SPY choppiness gate: 14-day ATR/price > 1.5% = directionless market
+    # VIX catches fear spikes; this catches sideways grind where breakouts consistently fail
+    try:
+        import yfinance as _yf_chop
+        _spy_chop = _yf_chop.Ticker("SPY").history(period="30d", interval="1d", auto_adjust=True)
+        if len(_spy_chop) >= 15:
+            _tr_chop = (_spy_chop["High"] - _spy_chop["Low"]).tail(14).mean()
+            _pr_chop = float(_spy_chop["Close"].iloc[-1])
+            _atr_pct = float(_tr_chop) / _pr_chop if _pr_chop > 0 else 0.0
+            if _atr_pct > 0.015 and max_new_pos > 1:
+                _log.info("[tudor] SPY CHOPPY: 14d ATR/price=%.1f%% > 1.5%% — max_new_pos %d→%d",
+                          _atr_pct * 100, max_new_pos, max(1, max_new_pos // 2))
+                max_new_pos = max(1, max_new_pos // 2)
+    except Exception:
+        pass
 
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:

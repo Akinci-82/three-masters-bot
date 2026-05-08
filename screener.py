@@ -365,6 +365,9 @@ class TrendResult:
     insider_buying: bool      = False  # C-suite/director purchase in last 90 days (not option exercise)
     industry_leader: bool     = False  # stock's sector ETF in top-4 by 6-month momentum
     rev_accelerating: bool    = False  # quarterly revenue growth rate accelerating Q-over-Q
+    three_weeks_tight: bool   = False  # last 3 weekly closes within 1.5% (O'Neil institutional hold)
+    short_mo_pts: float       = 0.0   # short interest monthly change: +0.25 covering, -0.25 building
+    analyst_pt_upside: bool   = False  # analyst consensus PT > current price × 1.25
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -926,6 +929,50 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.rev_accelerating = _rev_accel
+
+        # 3-Weeks Tight: three consecutive weekly closes within 1.5% — O'Neil consolidation signal
+        # Distinct from weekly tight base (H-L range): this specifically checks CLOSE prices
+        # showing institutions are holding, not distributing, during the consolidation
+        _twt = False
+        try:
+            _wk_twt = ticker.history(period="6wk", interval="1wk", auto_adjust=True)
+            if len(_wk_twt) >= 4:
+                _wc = _wk_twt["Close"].iloc[-4:].values
+                _wc_max = max(_wc[-3:])
+                _wc_min = min(_wc[-3:])
+                if _wc_min > 0:
+                    _twt = (_wc_max - _wc_min) / _wc_min <= 0.015
+        except Exception:
+            pass
+        result.three_weeks_tight = _twt
+
+        # Short interest monthly change: rapid build = bearish, rapid cover = squeeze fuel
+        _si_pts = 0.0
+        try:
+            _info_si = ticker.info
+            _si_cur  = float(_info_si.get("sharesShort", 0) or 0)
+            _si_prev = float(_info_si.get("sharesShortPriorMonth", 0) or 0)
+            if _si_prev > 0:
+                _si_chg = (_si_cur - _si_prev) / _si_prev
+                if _si_chg <= -0.20:
+                    _si_pts = 0.25   # shorts covering aggressively = squeeze fuel
+                elif _si_chg >= 0.25:
+                    _si_pts = -0.25  # shorts building = someone knows something
+        except Exception:
+            pass
+        result.short_mo_pts = _si_pts
+
+        # Analyst consensus price target: >25% above current price = institutional expected upside
+        _apt = False
+        try:
+            _info_apt = ticker.info
+            _pt_mean  = float(_info_apt.get("targetMeanPrice", 0) or 0)
+            _pt_cur   = float(_info_apt.get("currentPrice", price) or price)
+            if _pt_mean > 0 and _pt_cur > 0:
+                _apt = _pt_mean / _pt_cur >= 1.25
+        except Exception:
+            pass
+        result.analyst_pt_upside = _apt
 
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)
