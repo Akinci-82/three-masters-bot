@@ -23,6 +23,7 @@ MAIN_PY       = BASE / "main.py"
 SERVICE_NAME  = "three-masters-bot.service"
 
 STALE_MINUTES    = 20   # heartbeat updates every 60s; 20 min covers slow startup
+DEADLOCK_MINUTES = 45   # stale THIS long with process running = real hang → alert
 COOLDOWN_MINUTES = 120  # don't send Telegram more than once per 2 hours
 
 
@@ -153,21 +154,38 @@ def run() -> None:
         return
 
     print(f" — STALE (>{STALE_MINUTES} min)")
+
+    if _process_running():
+        if age <= DEADLOCK_MINUTES:
+            # Process alive, scan probably in progress — normal during Claude analysis
+            print(f"[watchdog] Process running, scan likely in progress ({age:.0f} min) — OK")
+            return
+        else:
+            # Process alive but heartbeat >45 min stale — genuine hang/deadlock
+            print(f"[watchdog] DEADLOCK SUSPECTED — process running but {age:.0f} min no heartbeat")
+            status = "process running but no heartbeat for {:.0f} min — possible deadlock".format(age)
+            _log_restart(age, status)
+            if not _alert_on_cooldown():
+                _send_telegram(
+                    f"⚠️ *Three Masters Watchdog — Possible Deadlock*\n"
+                    f"Process is running but no heartbeat for *{age:.0f} min*\n"
+                    f"Bot may be frozen — check logs"
+                )
+                _record_alert()
+            return
+
+    # Process is NOT running — genuine outage, restart and alert
     status = _restart()
     print(f"[watchdog] {status}")
     _log_restart(age, status)
 
     if not _alert_on_cooldown():
-        if "already running" in status:
-            # Process is live — heartbeat lag, not a real outage. Log but don't alert.
-            print(f"[watchdog] Suppressing alert — {status}")
-        else:
-            _send_telegram(
-                f"🔄 *Three Masters Watchdog* — Bot restarted\n"
-                f"Last heartbeat: *{age:.0f} min ago*\n"
-                f"`{status}`"
-            )
-            _record_alert()
+        _send_telegram(
+            f"🔄 *Three Masters Watchdog* — Bot restarted\n"
+            f"Last heartbeat: *{age:.0f} min ago*\n"
+            f"`{status}`"
+        )
+        _record_alert()
 
 
 if __name__ == "__main__":

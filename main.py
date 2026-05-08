@@ -1537,6 +1537,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _save_report(report)
         return
 
+    _heartbeat()   # Layer 1 done — screener can take 10-20 min
+
     # ── Layer 2: Minervini — VCP Analysis ────────────────────────────────────
     _log.info("\n[LAYER 2 — MINERVINI] VCP pattern analysis...")
     try:
@@ -1621,6 +1623,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     from config import RISK
 
     held_symbols = {p["symbol"] for p in positions}
+
+    _heartbeat()   # Layer 2 done — Claude VCP analysis can take 10-30 min
 
     # Re-entry cooldown: skip symbols stopped out within the last 5 trading days
     from risk_manager import check_reentry_cooldown, check_pivot_failure_cooldown
