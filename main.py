@@ -1954,7 +1954,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # Re-entry cooldown: skip symbols stopped out within the last 5 trading days
     from risk_manager import check_reentry_cooldown, check_pivot_failure_cooldown
     _before_cd = len(vcp_passed)
-    vcp_passed  = [r for r in vcp_passed if not check_reentry_cooldown(r.symbol)]
+    vcp_passed  = [r for r in vcp_passed if not check_reentry_cooldown(r.symbol, r.current_price)]
     vcp_passed  = [r for r in vcp_passed if not check_pivot_failure_cooldown(r.symbol)]
     _skipped_cd = _before_cd - len(vcp_passed)
     if _skipped_cd:
@@ -2283,7 +2283,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
         try:
             sizing = position_size(portfolio_value, vcp.breakout_level, vcp.stop_loss,
-                                   risk_pct, vcp.measured_move_pct)
+                                   risk_pct, vcp.measured_move_pct, vcp.symbol)
         except ValueError as e:
             _log.warning("[main] %s sizing error: %s", vcp.symbol, e)
             continue

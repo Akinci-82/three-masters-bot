@@ -110,7 +110,7 @@ def _stop_distance_factor(entry_price: float, stop_price: float) -> float:
 
 def position_size(portfolio_value: float, entry_price: float,
                   stop_loss: float, risk_pct: float | None = None,
-                  measured_move_pct: float = 0.0) -> dict:
+                  measured_move_pct: float = 0.0, symbol: str = "") -> dict:
     """
     Calculate Tudor Jones position size.
 
@@ -148,6 +148,26 @@ def position_size(portfolio_value: float, entry_price: float,
         measured_move = max(entry_price * measured_move_pct, risk_per_share * 2)
     else:
         measured_move = risk_per_share * 3  # default 3R when no Claude estimate
+
+    # ATR sanity check: cap measured move at 3x the stock's recent ATR.
+    # Prevents unrealistic targets on low-volatility stocks from inflating R:R.
+    try:
+        if not symbol:
+            raise ValueError("no symbol")
+        import yfinance as _yf_atr
+        _h_atr = _yf_atr.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
+        if len(_h_atr) >= 14:
+            _tr = (_h_atr["High"] - _h_atr["Low"]).tail(14).mean()
+            _atr_pct = float(_tr) / entry_price if entry_price > 0 else 0.0
+            if _atr_pct > 0:
+                _atr_cap = entry_price * (_atr_pct * 3.0)
+                if measured_move > _atr_cap:
+                    _log.info("[risk] measured_move $%.2f capped at 3×ATR $%.2f (ATR=%.1f%%)",
+                              measured_move, _atr_cap, _atr_pct * 100)
+                    measured_move = _atr_cap
+    except Exception:
+        pass
+
     rr_ratio = measured_move / risk_per_share
 
     return {
@@ -252,31 +272,55 @@ def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
               symbol, pnl_pct * 100, state["open_risk_pct"] * 100, daily_pnl * 100)
 
 
-def record_stop_out(symbol: str):
-    """Record a stop-out so the symbol is in re-entry cooldown for 5 trading days."""
+def record_stop_out(symbol: str, breakout_level: float = 0.0):
+    """Record a stop-out so the symbol is in re-entry cooldown for 5 trading days.
+    Stores breakout_level so check_reentry_cooldown can require price recovery.
+    """
     state = _load()
-    state.setdefault("stop_out_cooldown", {})[symbol] = str(date.today())
+    state.setdefault("stop_out_cooldown", {})[symbol] = {
+        "date":           str(date.today()),
+        "breakout_level": round(breakout_level, 2),
+    }
     _save(state)
-    _log.info("[risk] %s stop-out recorded — 5-day re-entry cooldown", symbol)
+    _log.info("[risk] %s stop-out recorded — 5-day cooldown (pivot=$%.2f)", symbol, breakout_level)
 
 
-def check_reentry_cooldown(symbol: str) -> bool:
-    """True if symbol is still in re-entry cooldown (5 trading days since stop-out)."""
+def check_reentry_cooldown(symbol: str, current_price: float = 0.0) -> bool:
+    """True if symbol is still in re-entry cooldown (5 trading days since stop-out).
+    Also blocks re-entry if price has not recovered above the prior breakout level.
+    """
     state = _load()
-    stop_date_str = state.get("stop_out_cooldown", {}).get(symbol)
+    entry = state.get("stop_out_cooldown", {}).get(symbol)
+    if not entry:
+        return False
+    # Support both old format (plain date string) and new format (dict)
+    if isinstance(entry, str):
+        stop_date_str   = entry
+        prior_breakout  = 0.0
+    else:
+        stop_date_str   = entry.get("date", "")
+        prior_breakout  = float(entry.get("breakout_level", 0.0))
     if not stop_date_str:
         return False
     try:
         from pandas.tseries.offsets import BDay
         import pandas as _pd
-        stop_dt = _pd.Timestamp(stop_date_str)
+        stop_dt      = _pd.Timestamp(stop_date_str)
         cooldown_end = stop_dt + BDay(5)
-        in_cooldown = _pd.Timestamp.today() < cooldown_end
+        in_cooldown  = _pd.Timestamp.today() < cooldown_end
         if not in_cooldown:
+            # Time cooldown expired — also check pivot recovery
+            if prior_breakout > 0 and current_price > 0:
+                if current_price < prior_breakout * 1.00:
+                    # Price still below or at prior failed pivot — not recovered
+                    _log.debug("[risk] %s re-entry blocked: price $%.2f below failed pivot $%.2f",
+                               symbol, current_price, prior_breakout)
+                    return True
             cooldowns = state.get("stop_out_cooldown", {})
             cooldowns.pop(symbol, None)
             _save(state)
-        return in_cooldown
+            return False
+        return True
     except Exception:
         return False
 
