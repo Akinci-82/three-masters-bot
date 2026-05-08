@@ -530,6 +530,48 @@ def check_positions() -> None:
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
                    symbol, qty, avg_cost, cur_price, pnl_pct * 100)
 
+        # ── PM11: Stop order re-validation ───────────────────────────────────────
+        # GTC stops can be silently cancelled (corporate actions, margin events, API failures).
+        # Once per day: verify expected stop is still active; re-place if missing.
+        _sv_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (sym.get("trailing_stop_placed")
+                and sym.get("stop_order_id")
+                and sym.get("_sv_date") != _sv_today
+                and not sym.get("time_stopped")
+                and not sym.get("max_loss_exited")):
+            sym["_sv_date"] = _sv_today
+            try:
+                _open_ords = _get_open_orders(symbol)
+                _stop_ids  = {o.get("id") for o in _open_ords
+                              if o.get("type") in ("stop", "trailing_stop", "stop_limit")}
+                if sym["stop_order_id"] not in _stop_ids and not _stop_ids:
+                    _sv_price = sym.get("stop_loss", round(avg_cost * 0.93, 2))
+                    _sv_rem   = qty - sym.get("partial_qty", 0)
+                    _log.warning("[monitor] %s STOP MISSING (was %s) — re-placing at $%.2f",
+                                 symbol, sym["stop_order_id"], _sv_price)
+                    _sv_oid = _place_stop(symbol, _sv_rem, _sv_price) if _sv_rem > 0 else None
+                    if _sv_oid:
+                        sym["stop_order_id"] = _sv_oid
+                        changed = True
+                    try:
+                        import requests as _rqsv, os as _ossv
+                        _tsv = _ossv.getenv("TELEGRAM_BOT_TOKEN", "")
+                        _csv2 = _ossv.getenv("TELEGRAM_CHAT_ID", "")
+                        if _tsv and _csv2:
+                            _rqsv.post(
+                                f"https://api.telegram.org/bot{_tsv}/sendMessage",
+                                json={"chat_id": _csv2, "parse_mode": "Markdown",
+                                      "text": (
+                                          f"\u26a0\ufe0f *Stop Missing — {symbol}*\n"
+                                          f"GTC stop not found on Alpaca\n"
+                                          f"Re-placed at ${_sv_price:.2f}"
+                                      )},
+                                timeout=8)
+                    except Exception:
+                        pass
+            except Exception as _sve:
+                _log.debug("[monitor] stop_revalidation %s: %s", symbol, _sve)
+
         # MAE/MFE: track worst (most adverse) and best (most favorable) excursion per position
         sym["mae_pct"] = min(sym.get("mae_pct", pnl_pct), pnl_pct)
         sym["mfe_pct"] = max(sym.get("mfe_pct", pnl_pct), pnl_pct)
@@ -1128,12 +1170,66 @@ def check_positions() -> None:
             except Exception as _lle:
                 _log.debug("[monitor] LH/LL %s: %s", symbol, _lle)
 
+        # ── PM10: PEAD — Post-Earnings Announcement Drift (60-day time-stop hold) ────
+        # Academic finding: stocks that beat EPS estimates by ≥5% drift up ~60 trading days.
+        # Suspending the time stop during this window avoids selling the best winners early.
+        if not sym.get("pead_hold") and not sym.get("pead_checked") and pnl_pct > 0:
+            _pead_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_pead_check_date") != _pead_today:
+                sym["_pead_check_date"] = _pead_today
+                try:
+                    import yfinance as _yf_pd
+                    _ed_df = _yf_pd.Ticker(symbol).earnings_dates
+                    if _ed_df is not None and not _ed_df.empty:
+                        _ed_r = _ed_df.reset_index()
+                        _now_ts = pd.Timestamp.now(tz="UTC")
+                        _past = _ed_r[
+                            pd.to_datetime(_ed_r.iloc[:, 0], utc=True, errors="coerce")
+                            < _now_ts
+                        ]
+                        if not _past.empty:
+                            _le   = _past.iloc[0]
+                            _est  = float(_le.get("EPS Estimate", 0) or 0)
+                            _rep  = float(_le.get("Reported EPS", 0) or 0)
+                            sym["pead_checked"] = True
+                            if _est > 0 and _rep >= _est * 1.05:
+                                sym["pead_hold"]  = True
+                                sym["pead_date"]  = datetime.now(_ET).strftime("%Y-%m-%d")
+                                _log.info(
+                                    "[monitor] %s PEAD: EPS $%.2f vs est $%.2f (+%.0f%%) "
+                                    "— 60-day time-stop hold activated",
+                                    symbol, _rep, _est, (_rep - _est) / _est * 100)
+                                try:
+                                    import requests as _rqpd, os as _ospd
+                                    _tpd = _ospd.getenv("TELEGRAM_BOT_TOKEN", "")
+                                    _cpd = _ospd.getenv("TELEGRAM_CHAT_ID", "")
+                                    if _tpd and _cpd:
+                                        _rqpd.post(
+                                            f"https://api.telegram.org/bot{_tpd}/sendMessage",
+                                            json={"chat_id": _cpd, "parse_mode": "Markdown",
+                                                  "text": (
+                                                      f"\U0001f4c8 *PEAD Hold — {symbol}*\n"
+                                                      f"EPS ${_rep:.2f} beat est ${_est:.2f}"
+                                                      f" (+{(_rep-_est)/_est*100:.0f}%)\n"
+                                                      f"60-day time-stop suspended"
+                                                  )},
+                                            timeout=8)
+                                except Exception:
+                                    pass
+                except Exception as _pde:
+                    _log.debug("[monitor] pead_check %s: %s", symbol, _pde)
+
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
         entry_date_str = sym.get("entry_date", "")
+        _pead_active = (
+            sym.get("pead_hold")
+            and _trading_days_held(sym.get("pead_date", "")) < 60
+        )
         if (entry_date_str
                 and not sym.get("partial_done")
-                and pnl_pct < time_stop_gain):
+                and pnl_pct < time_stop_gain
+                and not _pead_active):
             days_held = _trading_days_held(entry_date_str)
             if days_held >= time_stop_days:
                 remaining = qty - sym.get("partial_qty", 0)

@@ -364,6 +364,7 @@ class TrendResult:
     accum_weeks_strong: bool  = False  # ≥8/13 up-volume weeks = sustained institutional accumulation
     insider_buying: bool      = False  # C-suite/director purchase in last 90 days (not option exercise)
     industry_leader: bool     = False  # stock's sector ETF in top-4 by 6-month momentum
+    rev_accelerating: bool    = False  # quarterly revenue growth rate accelerating Q-over-Q
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -902,6 +903,29 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.industry_leader = _ind_leader
+
+        # Revenue acceleration: quarterly revenue growth rate increasing Q-over-Q
+        # When BOTH EPS and revenue are accelerating = strongest Minervini SEPA signal
+        _rev_accel = False
+        try:
+            _qfin = ticker.quarterly_financials
+            if _qfin is not None and not _qfin.empty and "Total Revenue" in _qfin.index:
+                _rev_s = _qfin.loc["Total Revenue"].sort_index()
+                if len(_rev_s) >= 4:
+                    _rev_gs = []
+                    for _ri in range(1, len(_rev_s)):
+                        _pr = float(_rev_s.iloc[_ri - 1])
+                        _cr = float(_rev_s.iloc[_ri])
+                        if _pr > 0:
+                            _rev_gs.append((_cr - _pr) / _pr)
+                    if len(_rev_gs) >= 3:
+                        _rev_accel = (
+                            _rev_gs[-1] > _rev_gs[-2] > _rev_gs[-3]
+                            and _rev_gs[-1] > 0 and _rev_gs[-2] > 0
+                        )
+        except Exception:
+            pass
+        result.rev_accelerating = _rev_accel
 
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)

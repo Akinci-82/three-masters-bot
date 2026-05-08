@@ -992,12 +992,14 @@ def _simons_score(trend) -> float:
     insider_pts = 0.5 if getattr(trend, "insider_buying", False) else 0.0
     # Industry leadership: sector ETF in top-4 by 6-month momentum = tide lifting all boats
     indleader_pts = 0.25 if getattr(trend, "industry_leader", False) else 0.0
+    # Revenue acceleration: quarterly revenue growth accelerating Q-over-Q (double SEPA confirmation)
+    rev_accel_pts = 0.5 if getattr(trend, "rev_accelerating", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
                + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
-               + insider_pts + indleader_pts, 10.0)
+               + insider_pts + indleader_pts + rev_accel_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -1094,6 +1096,48 @@ def _extended_market_factor() -> float:
     return 1.0
 
 
+def _portfolio_beta_factor(positions: list) -> float:
+    """Weighted portfolio beta vs SPY over 60 days.
+    If beta > 1.5 (over-concentrated in high-beta names) → size new entries at 80%%.
+    """
+    try:
+        if not positions:
+            return 1.0
+        import yfinance as _yf_beta, pandas as _pd_beta
+        _syms = [p["symbol"] for p in positions]
+        _total_val = sum(float(p.get("qty", 0)) * float(p.get("current_price", 0))
+                         for p in positions)
+        if _total_val <= 0:
+            return 1.0
+        _df_b = _yf_beta.download(_syms + ["SPY"], period="60d", interval="1d",
+                                   auto_adjust=True, progress=False)["Close"]
+        _spy_r = _df_b["SPY"].pct_change().dropna() if "SPY" in _df_b.columns else None
+        if _spy_r is None or len(_spy_r) < 20:
+            return 1.0
+        _spy_var = float(_spy_r.var())
+        if _spy_var <= 0:
+            return 1.0
+        _port_beta = 0.0
+        for _p in positions:
+            _s = _p["symbol"]
+            if _s not in _df_b.columns:
+                continue
+            _w = float(_p.get("qty", 0)) * float(_p.get("current_price", 0)) / _total_val
+            _sr = _df_b[_s].pct_change().dropna()
+            _al = _pd_beta.concat([_sr, _spy_r], axis=1, join="inner").dropna()
+            if len(_al) < 20:
+                continue
+            _b_i = float(_al.iloc[:, 0].cov(_al.iloc[:, 1])) / _spy_var
+            _port_beta += _w * _b_i
+        if _port_beta > 1.5:
+            _log.info("[main] Portfolio beta=%.2f > 1.5 — new entry size reduced 20%%",
+                      _port_beta)
+            return 0.80
+        return 1.0
+    except Exception:
+        return 1.0
+
+
 def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
     """Reduce position size when 14-day ATR/price > 4%% — avoids oversizing volatile stocks.
     High ATR means wider natural swings; 1R per trade requires fewer shares.
@@ -1184,6 +1228,53 @@ def _compute_ad_divergence(breadth_pct: float) -> bool:
         return False
 
 
+_YC_CACHE:  tuple[bool, float] = (False, 0.0)
+_CSW_CACHE: tuple[bool, float] = (False, 0.0)
+
+def _yield_curve_inverted() -> bool:
+    """3-month T-bill yield > 10-year yield = inverted curve = late cycle signal.
+    Cached 4 hours to avoid flooding Yahoo Finance. Returns False on error.
+    """
+    global _YC_CACHE
+    _val, _ts = _YC_CACHE
+    import time as _time_yc
+    if _time_yc.time() - _ts < 14400:
+        return _val
+    try:
+        import yfinance as _yf_yc
+        _yc_df = _yf_yc.download(["^IRX", "^TNX"], period="5d", interval="1d",
+                                  progress=False, auto_adjust=False)["Close"]
+        _3m  = float(_yc_df["^IRX"].dropna().iloc[-1])
+        _10y = float(_yc_df["^TNX"].dropna().iloc[-1])
+        _inv = _3m > _10y
+        _YC_CACHE = (_inv, _time_yc.time())
+        return _inv
+    except Exception:
+        return False
+
+
+def _credit_spreads_wide() -> bool:
+    """HYG (high-yield ETF) 20-day return < -2% AND underperforms TLT by ≥2pp
+    = risk-off, credit markets deteriorating. Cached 4 hours.
+    """
+    global _CSW_CACHE
+    _val2, _ts2 = _CSW_CACHE
+    import time as _time_cs
+    if _time_cs.time() - _ts2 < 14400:
+        return _val2
+    try:
+        import yfinance as _yf_cs
+        _csdf = _yf_cs.download(["HYG", "TLT"], period="30d", interval="1d",
+                                  progress=False, auto_adjust=True)["Close"]
+        _hyg_r = float(_csdf["HYG"].iloc[-1] / _csdf["HYG"].iloc[-21] - 1)
+        _tlt_r = float(_csdf["TLT"].iloc[-1] / _csdf["TLT"].iloc[-21] - 1)
+        _wide  = _hyg_r < -0.02 and (_hyg_r - _tlt_r) < -0.02
+        _CSW_CACHE = (_wide, _time_cs.time())
+        return _wide
+    except Exception:
+        return False
+
+
 def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
                   power_trend: bool = False, pcr: float = 0.7,
                   rate_slope_bps: float = 0.0, vix_slope: float = 0.0,
@@ -1221,7 +1312,11 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     breadth_dir_pts = 0.5 if breadth_trend > 0 else (-0.5 if breadth_trend < 0 else 0.0)
     # A/D divergence: SPY rising while breadth declining = distribution under the surface
     ad_div_pts = -0.5 if ad_divergence else 0.0
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts + ad_div_pts, 10.0)
+    # Yield curve: 3-month yield > 10-year = inverted = late economic cycle risk
+    yc_pts  = -0.5 if _yield_curve_inverted() else 0.0
+    # Credit spreads: HYG falling relative to TLT = institutional risk-off signal
+    csw_pts = -0.5 if _credit_spreads_wide() else 0.0
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts + ad_div_pts + yc_pts + csw_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
@@ -1647,6 +1742,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _extended_factor = _extended_market_factor()
     _qqq_factor      = _qqq_size_factor()
     _cs_factor       = _fetch_credit_spread_factor()
+    _beta_f          = _portfolio_beta_factor(positions)
 
     # ── Macro blackout: skip new orders within 2 days of FOMC/CPI ────────────
     _blackout, _blackout_reason = _is_macro_blackout()
@@ -1963,7 +2059,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                               vcp.symbol, _gap_open, _gap_prev_h)
         except Exception:
             pass
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor * _gap_up_f
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor * _gap_up_f * _beta_f
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
