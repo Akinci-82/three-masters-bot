@@ -2218,6 +2218,10 @@ def main():
     _log.info("  Watchdog interval: 15 min (reads logs/heartbeat.json)")
     _log.info("=" * 70)
 
+    # Write heartbeat IMMEDIATELY so watchdog knows process is alive during startup
+    # (health check can take minutes; without this, watchdog fires false alerts)
+    _heartbeat()
+
     if "--run-now" in sys.argv:
         _log.info("[main] --run-now flag — executing immediately")
         run_daily()

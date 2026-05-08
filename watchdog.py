@@ -22,7 +22,7 @@ VENV_PYTHON   = BASE / "venv" / "bin" / "python"
 MAIN_PY       = BASE / "main.py"
 SERVICE_NAME  = "three-masters-bot.service"
 
-STALE_MINUTES    = 10   # heartbeat updates every 60s; 10 min = generous slack
+STALE_MINUTES    = 20   # heartbeat updates every 60s; 20 min covers slow startup
 COOLDOWN_MINUTES = 120  # don't send Telegram more than once per 2 hours
 
 
@@ -158,12 +158,16 @@ def run() -> None:
     _log_restart(age, status)
 
     if not _alert_on_cooldown():
-        _send_telegram(
-            f"🔄 *Three Masters Watchdog* — Bot restarted\n"
-            f"Last heartbeat: *{age:.0f} min ago*\n"
-            f"`{status}`"
-        )
-        _record_alert()
+        if "already running" in status:
+            # Process is live — heartbeat lag, not a real outage. Log but don't alert.
+            print(f"[watchdog] Suppressing alert — {status}")
+        else:
+            _send_telegram(
+                f"🔄 *Three Masters Watchdog* — Bot restarted\n"
+                f"Last heartbeat: *{age:.0f} min ago*\n"
+                f"`{status}`"
+            )
+            _record_alert()
 
 
 if __name__ == "__main__":
