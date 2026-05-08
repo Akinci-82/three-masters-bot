@@ -357,6 +357,7 @@ class TrendResult:
     rvol_5d: float            = 0.0   # 5d avg vol / 60d avg vol (>1.5 = stock is in play)
     weekly_breakout_aligned: bool = False  # daily breakout aligns with weekly 5-week high
     analyst_upgrades: bool    = False  # net analyst upgrades > downgrades in last 60 days
+    inst_ownership_increasing: bool = False  # ≥3 institutional holders filed 13F within 90 days
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -761,6 +762,18 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.analyst_upgrades = _analyst_up
+
+        # Institutional accumulation: ≥3 holders with recent (≤90 day) 13F filings
+        _inst_inc = False
+        try:
+            _ih = ticker.institutional_holders
+            if _ih is not None and not _ih.empty and "Date Reported" in _ih.columns:
+                _cutoff_ih = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
+                _ih_dt = pd.to_datetime(_ih["Date Reported"], utc=True, errors="coerce")
+                _inst_inc = int((_ih_dt >= _cutoff_ih).sum()) >= 3
+        except Exception:
+            pass
+        result.inst_ownership_increasing = _inst_inc
 
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)

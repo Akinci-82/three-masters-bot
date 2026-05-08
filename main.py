@@ -978,10 +978,45 @@ def _simons_score(trend) -> float:
     wba_pts = 0.5 if getattr(trend, "weekly_breakout_aligned", False) else 0.0
     # Analyst upgrades: net positive analyst activity = institutional attention building
     aug_pts = 0.25 if getattr(trend, "analyst_upgrades", False) else 0.0
+    # Institutional accumulation trend: recent 13F filings = smart money building position
+    inst_trend_pts = 0.25 if getattr(trend, "inst_ownership_increasing", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
-               + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts, 10.0)
+               + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
+               + inst_trend_pts, 10.0)
+
+
+def _market_follow_through_confirmed() -> bool:
+    """
+    O'Neil follow-through day: only block new entries when SPY is in a confirmed
+    correction (>5% below MA50) AND no follow-through day (≥1.7% gain on above-avg
+    volume, day 4+ from the rally low) has occurred in the last 25 sessions.
+    Returns True (allow entries) in all other cases including errors.
+    """
+    try:
+        import yfinance as _yf_ftd
+        _spy_ftd = _yf_ftd.Ticker("SPY").history(period="80d", interval="1d", auto_adjust=True)
+        if len(_spy_ftd) < 25:
+            return True
+        _cl_ftd  = _spy_ftd["Close"]
+        _ma50    = float(_cl_ftd.tail(50).mean())
+        _cur     = float(_cl_ftd.iloc[-1])
+        if (_cur - _ma50) / _ma50 >= -0.05:
+            return True   # within 5% of MA50 — no restriction
+        # In correction: scan last 25 sessions for a follow-through day
+        _vl_ftd  = _spy_ftd["Volume"]
+        _avg_vol = float(_vl_ftd.tail(25).mean())
+        _recent  = _spy_ftd.tail(25).reset_index(drop=True)
+        # Find rally low first, then count from there
+        _low_idx = int(_recent["Close"].argmin())
+        for _i in range(_low_idx + 4, len(_recent)):
+            _chg = (float(_recent["Close"].iloc[_i]) - float(_recent["Close"].iloc[_i - 1])) / float(_recent["Close"].iloc[_i - 1])
+            if _chg >= 0.017 and float(_recent["Volume"].iloc[_i]) > _avg_vol:
+                return True   # follow-through day confirmed
+        return False
+    except Exception:
+        return True   # on error, allow entries
 
 
 def _qqq_size_factor() -> float:
@@ -1729,6 +1764,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     if _power_trend:
         _log.info("[tudor] Power Trend active (SPY 21d EMA > 50d EMA \u22658 days) +1.0 T-pts")
     _dist_days    = _fetch_distribution_days()
+    _ftd_ok       = _market_follow_through_confirmed()
     _nh_nl_ratio  = _fetch_nh_nl_ratio()
     _log.info("[tudor] Distribution days=%d (%s)", _dist_days,
               "institutional-selling(-1.5)" if _dist_days >= 5 else
@@ -1804,6 +1840,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     if _vix_spike_today and max_new_pos > 0:
         _log.warning("[tudor] VIX SPIKE >15%% — all new orders blocked for today")
         _tg("🚨 *VIX Spike — orders paused*\nVIX jumped >15% today — no new breakout entries (sudden market distress)")
+        max_new_pos = 0
+
+    # Follow-through day gate: SPY >5%% below MA50 without confirmed FTD = block entries
+    if not _ftd_ok and max_new_pos > 0:
+        _log.warning("[tudor] FTD gate: SPY in correction, no follow-through confirmed — entries blocked")
+        _tg("🛑 *Follow-Through Gate — entries paused*\nSPY >5%% below MA50, no FTD confirmed\nWaiting for O'Neil uptrend confirmation")
         max_new_pos = 0
 
     for vcp, trend_r, composite in vcp_scored:
