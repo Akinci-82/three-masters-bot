@@ -52,25 +52,49 @@ def _handle_trade_update(data) -> None:
         avg_fill  = float(order.get("filled_avg_price", 0) or 0)
         qty_total = float(order.get("qty", 0) or 0)
 
-        if side != "buy":
+        order_type = order.get("order_type", "") or order.get("type", "")
+
+        # ── BUY fills ────────────────────────────────────────────────────────
+        if side == "buy":
+            if event == "fill":
+                _log.info("[stream] FILL %s %dsh @ $%.2f", symbol, qty_fill, avg_fill)
+                _tg(
+                    f"✅ *ORDER FILLED* — *{symbol}*\n"
+                    f"Filled: {qty_fill:.0f}sh @ ${avg_fill:.2f}\n"
+                    f"Trailing stop will be placed at next monitor cycle (≤15 min)."
+                )
+            elif event == "partial_fill":
+                _log.info("[stream] PARTIAL FILL %s %.0f/%.0f sh @ $%.2f",
+                          symbol, qty_fill, qty_total, avg_fill)
+                _tg(
+                    f"⚡ *PARTIAL FILL* — *{symbol}*\n"
+                    f"Filled: {qty_fill:.0f}/{qty_total:.0f}sh @ ${avg_fill:.2f}"
+                )
+            elif event == "canceled":
+                _log.info("[stream] CANCELED %s", symbol)
             return
 
-        if event == "fill":
-            _log.info("[stream] FILL %s %dsh @ $%.2f", symbol, qty_fill, avg_fill)
-            _tg(
-                f"✅ *ORDER FILLED* — *{symbol}*\n"
-                f"Filled: {qty_fill:.0f}sh @ ${avg_fill:.2f}\n"
-                f"Trailing stop will be placed at next monitor cycle (≤15 min)."
-            )
-        elif event == "partial_fill":
-            _log.info("[stream] PARTIAL FILL %s %.0f/%.0f sh @ $%.2f",
-                      symbol, qty_fill, qty_total, avg_fill)
-            _tg(
-                f"⚡ *PARTIAL FILL* — *{symbol}*\n"
-                f"Filled: {qty_fill:.0f}/{qty_total:.0f}sh @ ${avg_fill:.2f}"
-            )
-        elif event == "canceled":
-            _log.info("[stream] CANCELED %s", symbol)
+        # ── SELL fills — stop / trailing-stop / limit ─────────────────────────
+        # These fire when a GTC stop hits overnight or intraday; the monitor only
+        # runs every 15 min, so the user would otherwise have no real-time alert.
+        _stop_types = ("stop", "trailing_stop", "stop_limit")
+        if side == "sell" and event == "fill":
+            _pnl_tag = ""
+            try:
+                _avg_cost = float(order.get("filled_avg_price", avg_fill))
+                # avg_entry_price is not in the stream event; we use a best-effort note
+            except Exception:
+                pass
+            if order_type in _stop_types:
+                _log.warning("[stream] STOP FILL %s %.0fsh @ $%.2f", symbol, qty_fill, avg_fill)
+                _tg(
+                    f"🛑 *STOP HIT* — *{symbol}*\n"
+                    f"Filled: {qty_fill:.0f}sh @ ${avg_fill:.2f}\n"
+                    f"Position closed by stop order. P&L updated next monitor cycle."
+                )
+            else:
+                _log.info("[stream] SELL FILL %s %.0fsh @ $%.2f [%s]",
+                          symbol, qty_fill, avg_fill, order_type)
     except Exception as e:
         _log.debug("[stream] handle_trade_update error: %s", e)
 

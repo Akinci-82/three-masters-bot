@@ -114,6 +114,13 @@ Reads `logs/trade_journal.jsonl` (all-time) and reports:
 
 
 
+
+## Patch 12 upgrades (added 2026-05-08)
+- **Stop fill notification** (`order_stream.py`): previously `side != "buy"` caused all SELL fills to be silently ignored. GTC stops that fire overnight or intraday now send an immediate Telegram alert with symbol, fill price and reason. Buy-side logic unchanged.
+- **Earnings cluster guard** (`main.py`): if ≥2 held positions have earnings within 7 days, no new buy-stop orders are placed for the nightly scan. Prevents concentrated simultaneous binary risk. Sends Telegram alert explaining the block.
+- **Bootstrap state files** (`logs/`): `feedback_state.json` and `signal_accuracy.json` initialized to zero. Previously, `_dynamic_min_composite()` and signal attribution code had dead code paths because both files were missing. Now accumulate from first real trade.
+- **RS line divergence** (`position_monitor.py`): daily check per position. If price makes a new 20-day high but the RS line (stock/SPY) is >2% below its 20-day peak, distribution is suspected. Stop moved to breakeven + Telegram alert. Implements Minervini's core "act abnormally, exit" rule.
+- **Signal attribution in weekly report** (`main.py`): weekly Telegram now includes a ranked table of screener signals by total R across closed trades (signals with ≥3 appearances). Shows win rate and cumulative R contribution, allowing empirical calibration of point weights over time.
 ## Patch 11 upgrades (added 2026-05-08)
 - **RVOL upper cap** (`main.py`): RVOL filter now requires `0.8 <= rvol_5d <= 2.0`. Upper bound removes candidates with sustained elevated volume during the base — signals distribution, not the dry-up VCPs need. Dollar-ADV filter already existed at $5M (confirmed, not changed).
 - **Base age penalty** (`screener.py` + `main.py`): New `base_age_days` field = trading days since 52w high peak (base start). Added to `_simons_score`: 61-120 days = -0.25 pts, >120 days = -0.5 pts. Stale consolidations lose momentum and produce lower-quality breakouts.
@@ -124,6 +131,7 @@ Reads `logs/trade_journal.jsonl` (all-time) and reports:
 - **Why**: Scanner runs 22:30 CEST (20:30 UTC). Without this fix, evening scan on FOMC day blocked orders that would execute *next morning* -- after Fed reaction is fully priced in. CPI blackout logic unchanged (no single known announcement time).
 - **WebSocket stream monitoring loop** (`order_stream.py`): replaced bare `stream_thread.join()` with a 10 s polling loop. The old bare join hung forever if the WS stalled without firing a disconnect event -- reconnect never triggered. New loop also pings Alpaca REST every 90 s; if ping fails (auth error), stream is force-stopped and reconnects immediately via the existing exponential backoff.
 ## Commits (latest first)
+- `PENDING` -- Patch 12: stop fill notify, earnings cluster, RS divergence, signal attribution (2026-05-08)
 - `PENDING` -- Patch 11: RVOL cap, base age, Claude cache, backtest refactor (2026-05-08)
 - `PENDING` -- fix: WS stream polling loop + REST auth ping every 90s (order_stream.py) (2026-05-08)
 - `cf0a1b2` -- fix: lift FOMC blackout post-announcement (>=20:00 UTC same day) (2026-05-08)

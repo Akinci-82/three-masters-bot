@@ -1219,6 +1219,70 @@ def check_positions() -> None:
                 except Exception as _pde:
                     _log.debug("[monitor] pead_check %s: %s", symbol, _pde)
 
+        # ── RS-line divergence alert (daily, once per position) ────────────────
+        # If price makes new 20-day high but RS line (stock/SPY) does not,
+        # distribution is likely. Minervini: tighten stop when RS diverges from price.
+        _rsd_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (not sym.get("partial2_done")
+                and pnl_pct > 0.03
+                and sym.get("_rsd_date") != _rsd_today):
+            sym["_rsd_date"] = _rsd_today
+            try:
+                import yfinance as _yf_rsd
+                _df_rsd = _yf_rsd.Ticker(symbol).history(
+                    period="60d", interval="1d", auto_adjust=True)
+                _spy_rsd = _yf_rsd.Ticker("SPY").history(
+                    period="60d", interval="1d", auto_adjust=True)["Close"]
+                if len(_df_rsd) >= 22 and len(_spy_rsd) >= 22:
+                    _c_rsd   = _df_rsd["Close"]
+                    _h_rsd   = _df_rsd["High"]
+                    _rs_line = (_c_rsd / _spy_rsd.reindex(_c_rsd.index, method="nearest")
+                                ).dropna()
+                    if len(_rs_line) >= 22:
+                        _price_20h = float(_h_rsd.iloc[-21:-1].max())
+                        _rs_20h    = float(_rs_line.iloc[-21:-1].max())
+                        _price_now = float(_h_rsd.iloc[-1])
+                        _rs_now_v  = float(_rs_line.iloc[-1])
+                        # Price makes new 20-day high but RS line does not confirm
+                        _price_nh  = _price_now >= _price_20h * 0.999
+                        _rs_lagging = _rs_now_v < _rs_20h * 0.98
+                        if _price_nh and _rs_lagging:
+                            _log.warning(
+                                "[monitor] %s RS DIVERGENCE: price new 20d high $%.2f "
+                                "but RS line %.2f%% below 20d peak — tightening stop",
+                                symbol, _price_now, (1 - _rs_now_v / _rs_20h) * 100)
+                            # Tighten: if stop not at breakeven, move to breakeven
+                            if not sym.get("breakeven_done"):
+                                _rem_rsd = qty - sym.get("partial_qty", 0)
+                                if _rem_rsd > 0:
+                                    _cancel_stop_orders(symbol)
+                                    _rsd_oid = _place_stop(symbol, _rem_rsd, round(avg_cost, 2))
+                                    if _rsd_oid:
+                                        sym["breakeven_done"] = True
+                                        sym["stop_order_id"]  = _rsd_oid
+                                        sym["stop_loss"]      = avg_cost
+                                        changed = True
+                            try:
+                                import requests as _rqrsd, os as _osrsd
+                                _tr = _osrsd.getenv("TELEGRAM_BOT_TOKEN", "")
+                                _cr = _osrsd.getenv("TELEGRAM_CHAT_ID", "")
+                                if _tr and _cr:
+                                    _rqrsd.post(
+                                        f"https://api.telegram.org/bot{_tr}/sendMessage",
+                                        json={"chat_id": _cr, "parse_mode": "Markdown",
+                                              "text": (
+                                                  f"⚠️ *RS Divergence — {symbol}*\n"
+                                                  f"Price new 20d high ${_price_now:.2f} "
+                                                  f"but RS line {(1-_rs_now_v/_rs_20h)*100:.1f}%% "
+                                                  f"below its peak\n"
+                                                  f"Distribution signal — stop moved to breakeven"
+                                              )},
+                                        timeout=8)
+                            except Exception:
+                                pass
+            except Exception as _rsd_e:
+                _log.debug("[monitor] rs_divergence %s: %s", symbol, _rsd_e)
+
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
         entry_date_str = sym.get("entry_date", "")

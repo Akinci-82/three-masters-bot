@@ -653,6 +653,29 @@ def _send_weekly_report(portfolio_value: float) -> None:
             (LOG_DIR / "feedback_state.json").write_text(json.dumps(_fb, indent=2))
         except Exception:
             pass
+        # ── Signal attribution: which screener flags correlate with winners ─────
+        try:
+            _sa_path = LOG_DIR / "signal_accuracy.json"
+            if _sa_path.exists():
+                _sa = json.loads(_sa_path.read_text())
+                _sig_lines = []
+                for _sname, _sdata in sorted(
+                    _sa.items(),
+                    key=lambda kv: -(kv[1].get("total_r", 0)),
+                ):
+                    _sw = _sdata.get("wins", 0)
+                    _sl = _sdata.get("losses", 0)
+                    _sr = _sdata.get("total_r", 0.0)
+                    if _sw + _sl >= 3:
+                        _swr = _sw / (_sw + _sl)
+                        _sig_lines.append(
+                            f"  {_sname}: {_sw}W/{_sl}L  WR={_swr:.0%}  R={_sr:+.1f}")
+                if _sig_lines:
+                    lines.append(f"\n*Signal accuracy (≥3 trades):*")
+                    lines.extend(_sig_lines[:8])   # top 8 by total R
+        except Exception:
+            pass
+
         lines.append(f"")
         if ret_line:
             lines.append(ret_line)
@@ -1865,6 +1888,32 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _save_report(report)
         _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
         return
+
+    # ── Earnings cluster guard: ≥2 held positions reporting same week ────────
+    # Concentrated binary risk: multiple simultaneous earnings = correlated gap risk.
+    # Block new orders for the week; existing positions already have earnings protection.
+    try:
+        from screener import _days_to_earnings as _dte_fn
+        _earn_this_week = [
+            p["symbol"] for p in positions
+            if (_dte_fn(p["symbol"]) or 99) <= 7
+        ]
+        if len(_earn_this_week) >= 2:
+            _msg_ec = (
+                f"📅 *Earnings Cluster — {len(_earn_this_week)} positions reporting this week*\n"
+                f"{', '.join(_earn_this_week)}\n"
+                f"No new orders placed — reducing binary risk concentration."
+            )
+            _log.warning("[tudor] EARNINGS CLUSTER: %d positions report this week (%s) — blocking new orders",
+                         len(_earn_this_week), _earn_this_week)
+            _tg(_msg_ec)
+            report["summary"] = f"earnings_cluster_{len(_earn_this_week)}_positions"
+            report["vcp_found_no_orders"] = [r.symbol for r in vcp_passed]
+            _save_report(report)
+            _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
+            return
+    except Exception as _ec_err:
+        _log.debug("[tudor] earnings cluster check failed: %s", _ec_err)
 
     # ── Layer 3 + Execution: Tudor Jones — Size + Place Orders ────────────────
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
