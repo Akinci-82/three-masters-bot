@@ -46,13 +46,12 @@ def _heartbeat_age_minutes() -> float | None:
 def _process_running() -> bool:
     try:
         r = subprocess.run(
-            ["pgrep", "-f", "three-masters-bot/main.py"],
-            capture_output=True, timeout=5,
+            ["systemctl", "--user", "is-active", SERVICE_NAME],
+            capture_output=True, text=True, timeout=5,
         )
-        return r.returncode == 0
+        return r.stdout.strip() == "active"
     except Exception:
         return False
-
 
 def _restart() -> str:
     # systemctl --user — no sudo required
