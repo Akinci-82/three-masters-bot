@@ -951,9 +951,41 @@ def _simons_score(trend) -> float:
     # Accumulation days in base: institutional buyers active on up-days (quality base)
     accum_r      = getattr(trend, "accum_ratio", 0.0)
     accum_pts    = 0.25 if accum_r >= 0.60 else 0.0
+    # 3-weeks tight: Minervini's strongest base compression signal
+    twt_pts = 1.0 if getattr(trend, "three_weeks_tight", False) else 0.0
+    # OBV at 52w high: institutional accumulation confirmed in base
+    obv_pts = 0.5 if getattr(trend, "obv_new_high", False) else 0.0
+    # Base count: later bases have materially higher failure rates (Minervini SEPA)
+    _bcnt_s  = getattr(trend, "base_count", 1)
+    base_pts = 0.0 if _bcnt_s <= 2 else (-0.5 if _bcnt_s == 3 else -1.0)
+    # Volume contraction quality: consistent volume decline = controlled institutional base
+    _vq_s   = getattr(trend, "vol_contraction_quality", 0.0)
+    vq_pts  = 0.5 if _vq_s >= 1.0 else (0.25 if _vq_s >= 0.5 else 0.0)
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
-               + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts, 10.0)
+               + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
+               + twt_pts + obv_pts + base_pts + vq_pts, 10.0)
+
+
+def _extended_market_factor() -> float:
+    """
+    Returns 0.7 when SPY is >7% above its 50-day MA — historically elevated stop-out risk.
+    Markets this extended mean mean-reversion risk is high; we cap new-position sizing.
+    """
+    try:
+        import yfinance as _yf_em
+        _spy_em = _yf_em.Ticker("SPY").history(
+            period="80d", interval="1d", auto_adjust=True)["Close"]
+        if len(_spy_em) >= 51:
+            _ma50_em = float(_spy_em.tail(50).mean())
+            _ext_pct = (float(_spy_em.iloc[-1]) - _ma50_em) / _ma50_em
+            if _ext_pct > 0.07:
+                _log.info("[tudor] Extended market: SPY %.1f%% above MA50 — sizing capped 70%%",
+                          _ext_pct * 100)
+                return 0.7
+    except Exception:
+        pass
+    return 1.0
 
 
 def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
@@ -1498,6 +1530,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.info("[main] Neutral regime (SPY %+.1f%% vs MA200) — position sizing at 75%%",
                   spy_pct * 100)
 
+    _extended_factor = _extended_market_factor()
+
     # ── Macro blackout: skip new orders within 2 days of FOMC/CPI ────────────
     _blackout, _blackout_reason = _is_macro_blackout()
     if _blackout:
@@ -1652,6 +1686,23 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # Sort by composite descending — Minervini dominates but Simons/Tudor contribute
     vcp_scored.sort(key=lambda x: -x[2])
+
+    # Peer sector confirmation: when >=2 VCPs fire in the same sector, sector has a tailwind
+    _sec_vcp_cnt: dict[str, int] = {}
+    for _pv, _pt, _pcs in vcp_scored:
+        _ps = get_sector(_pv.symbol)
+        _sec_vcp_cnt[_ps] = _sec_vcp_cnt.get(_ps, 0) + 1
+    _hot_sectors = {_s for _s, _n in _sec_vcp_cnt.items() if _n >= 2}
+    if _hot_sectors:
+        vcp_scored = [
+            (_pv, _pt, min(_pcs + (0.3 if get_sector(_pv.symbol) in _hot_sectors else 0.0), 10.0))
+            for _pv, _pt, _pcs in vcp_scored
+        ]
+        _peer_syms = [_pv.symbol for _pv, _pt, _pcs in vcp_scored
+                      if get_sector(_pv.symbol) in _hot_sectors]
+        _log.info("[score] Peer sector boost +0.3: %s (sectors: %s)", _peer_syms, _hot_sectors)
+        vcp_scored.sort(key=lambda x: -x[2])
+
     _log.info("[score] Order of priority: %s",
               [(v.symbol, cs) for v, t, cs in vcp_scored])
 
@@ -1706,7 +1757,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _atr_f    = _atr_volatility_factor(vcp.symbol, vcp.breakout_level)
         if _atr_f < 1.0:
             _log.info("[main] %s ATR factor %.0f%% — elevated volatility", vcp.symbol, _atr_f * 100)
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
@@ -1722,6 +1773,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
         if sizing["shares"] < 1:
             _log.info("[main] %s too expensive for risk budget — skip", vcp.symbol)
+            continue
+
+        if sizing["rr_ratio"] < 2.5:
+            _log.info("[main] %s skipped — R:R %.1f:1 below minimum 2.5:1 "
+                      "(stop too wide or measured move too small)",
+                      vcp.symbol, sizing["rr_ratio"])
             continue
 
         if sizing["notional"] > cash * 0.95:

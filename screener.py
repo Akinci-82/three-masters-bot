@@ -348,6 +348,10 @@ class TrendResult:
     eps_beat_count: int       = 0      # consecutive EPS beats in last 3 quarters
     at_52w_high: bool         = False  # price within 2% of 52w high (no overhead supply)
     accum_ratio: float        = 0.0   # accum days on above-avg vol / total up-days (base quality)
+    three_weeks_tight: bool   = False  # price in <=1.5% range for 3+ consecutive weeks (Minervini)
+    obv_new_high: bool        = False  # OBV at 52w high = institutional accumulation in base
+    base_count: int           = 1      # prior VCP bases last 18mo (1-2=fresh, 3+=late stage)
+    vol_contraction_quality: float = 0.0  # 0=none 0.5=partial 1.0=perfect vol decline in base
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -626,6 +630,76 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                         _log.info("[screen] %s RS weekly CONFIRMED — daily+weekly at 52w high", symbol)
             except Exception:
                 pass
+        # 3-weeks tight: price H-L range <=1.5% across 3 consecutive weeks
+        # Minervini's strongest compression signal — coiled spring before explosive move
+        _three_wt = False
+        try:
+            _wk = ticker.history(period="4mo", interval="1wk", auto_adjust=True)
+            if len(_wk) >= 4:
+                for _wi in range(len(_wk) - 1, max(len(_wk) - 7, 1), -1):
+                    _w3 = _wk.iloc[max(_wi - 2, 0):_wi + 1]
+                    if len(_w3) == 3:
+                        _rng = (_w3["High"].max() - _w3["Low"].min()) / float(_w3["Low"].min())
+                        if _rng <= 0.015:
+                            _three_wt = True
+                            break
+        except Exception:
+            pass
+        result.three_weeks_tight = _three_wt
+        if _three_wt:
+            _log.info("[screen] %s 3-WEEKS TIGHT — elite Minervini compression", symbol)
+
+        # OBV: On-Balance Volume at/near 52-week high = institutional buying in base
+        _obv_nh = False
+        try:
+            _dir = df["Close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+            _obv = (df["Volume"] * _dir).cumsum()
+            if len(_obv) >= 50:
+                _obv_nh = float(_obv.iloc[-1]) >= float(_obv.tail(252).max()) * 0.99
+        except Exception:
+            pass
+        result.obv_new_high = _obv_nh
+
+        # Base count: number of prior consolidation bases in last 18 months
+        # Base 1-2 = fresh breakout (best R:R); base 3+ = late stage (higher failure)
+        _bcnt = 1
+        try:
+            _cl18 = df["Close"].tail(378)
+            if len(_cl18) >= 80:
+                _pk_b  = float(_cl18.iloc[0])
+                _in_b  = False
+                for _p_b in _cl18.iloc[1:]:
+                    _pf = float(_p_b)
+                    if _pf > _pk_b * 1.02:
+                        if _in_b:
+                            _bcnt += 1
+                            _in_b = False
+                        _pk_b = _pf
+                    elif _pf < _pk_b * 0.85:
+                        _in_b = True
+        except Exception:
+            pass
+        result.base_count = min(_bcnt, 5)
+        if _bcnt >= 3:
+            _log.debug("[screen] %s base count=%d — late stage penalty applied", symbol, _bcnt)
+
+        # Volume contraction quality: each 20-day segment in base has lower avg volume
+        # Perfect contraction = disciplined selling pressure drying up (ideal VCP)
+        _vq = 0.0
+        try:
+            _v60 = df["Volume"].tail(60).reset_index(drop=True)
+            if len(_v60) >= 45:
+                _s1 = float(_v60.iloc[:20].mean())
+                _s2 = float(_v60.iloc[20:40].mean())
+                _s3 = float(_v60.iloc[40:].mean())
+                if _s1 > 0 and _s2 < _s1 and _s3 < _s2:
+                    _vq = 1.0
+                elif _s1 > 0 and (_s2 < _s1 or _s3 < _s2):
+                    _vq = 0.5
+        except Exception:
+            pass
+        result.vol_contraction_quality = _vq
+
         result.passed = True
         return result
 
