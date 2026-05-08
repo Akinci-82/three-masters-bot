@@ -984,11 +984,15 @@ def _simons_score(trend) -> float:
     rev_up_pts = 0.5 if getattr(trend, "eps_revision_up", False) else 0.0
     # Pocket pivot: up-day volume exceeds all prior down-day volumes = early institutional entry
     pp_pts = 0.25 if getattr(trend, "pocket_pivot", False) else 0.0
+    # Earnings acceleration: EPS growth rate accelerating Q-over-Q = highest-conviction Minervini setups
+    accel_pts = 0.5 if getattr(trend, "eps_accelerating", False) else 0.0
+    # 13-week accumulation: ≥8/13 up-volume weeks = sustained institutional demand (O'Neil breadth)
+    aw_pts = 0.25 if getattr(trend, "accum_weeks_strong", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
-               + inst_trend_pts + rev_up_pts + pp_pts, 10.0)
+               + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:

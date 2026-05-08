@@ -534,6 +534,45 @@ def check_positions() -> None:
         sym["mae_pct"] = min(sym.get("mae_pct", pnl_pct), pnl_pct)
         sym["mfe_pct"] = max(sym.get("mfe_pct", pnl_pct), pnl_pct)
 
+        # ── PM8: Max loss per trade cap — hard 2R floor (Tudor Jones) ──────────────
+        # GTC stops can be gapped through on bad news. This is the last-resort circuit breaker:
+        # if loss exceeds 2× initial risk per share, close immediately regardless of stop status.
+        _sli_ml = sym.get("stop_loss_initial", 0.0)
+        if (_sli_ml > 0
+                and _sli_ml < avg_cost
+                and not sym.get("max_loss_exited")
+                and not sym.get("time_stopped")):
+            _rps_ml     = avg_cost - _sli_ml            # risk per share (1R)
+            _max_loss_p = avg_cost - 2.0 * _rps_ml      # 2R loss floor (price level)
+            if cur_price < _max_loss_p:
+                _ml_rem = qty - sym.get("partial_qty", 0)
+                _log.warning(
+                    "[monitor] %s MAX LOSS CAP: cur $%.2f < 2R floor $%.2f "
+                    "(entry $%.2f, stop $%.2f, pnl=%.1f%%) — forced close",
+                    symbol, cur_price, _max_loss_p, avg_cost, _sli_ml, pnl_pct * 100)
+                _cancel_stop_orders(symbol)
+                if _ml_rem > 0 and _place_market_sell(symbol, _ml_rem):
+                    sym["max_loss_exited"] = True
+                    changed = True
+                    try:
+                        import requests as _rqml, os as _osml
+                        _tml = _osml.getenv("TELEGRAM_BOT_TOKEN", "")
+                        _cml = _osml.getenv("TELEGRAM_CHAT_ID", "")
+                        if _tml and _cml:
+                            _rqml.post(
+                                f"https://api.telegram.org/bot{_tml}/sendMessage",
+                                json={"chat_id": _cml, "parse_mode": "Markdown",
+                                      "text": (
+                                          f"🔴 *Max Loss Cap — {symbol}*\n"
+                                          f"Price ${cur_price:.2f} breached 2R floor ${_max_loss_p:.2f}\n"
+                                          f"Entry ${avg_cost:.2f} | Stop ${_sli_ml:.2f} | "
+                                          f"Loss {pnl_pct*100:.1f}%\n"
+                                          f"Tudor Jones hard floor — forced exit"
+                                      )},
+                                timeout=8)
+                    except Exception:
+                        pass
+
         # Quality-adjusted exits: elite setups get more room to run
         composite      = sym.get("composite_score", 0.0)
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
@@ -785,6 +824,33 @@ def check_positions() -> None:
                 except Exception as _me:
                     _log.debug("[monitor] ma20 trail %s: %s", symbol, _me)
 
+        # ── 8-Week Hold Rule: O'Neil fast mover detection ───────────────────────
+        # Stock that gains ≥20% within first 15 trading days = potential 100%+ winner.
+        # Override first partial: hold full position up to 8 weeks (40 trading days).
+        _ed_fm = sym.get("entry_date", "")
+        _td_fm = _trading_days_held(_ed_fm) if _ed_fm else 0
+        if (not sym.get("fast_mover")
+                and pnl_pct >= 0.20
+                and 0 < _td_fm <= 15):
+            sym["fast_mover"] = True
+            _log.info("[monitor] %s FAST MOVER: +%.1f%% in %d days — 8-week hold rule activated",
+                      symbol, pnl_pct * 100, _td_fm)
+            try:
+                import requests as _rqfm, os as _osfm
+                _tfm = _osfm.getenv("TELEGRAM_BOT_TOKEN", "")
+                _cfm = _osfm.getenv("TELEGRAM_CHAT_ID", "")
+                if _tfm and _cfm:
+                    _rqfm.post(
+                        f"https://api.telegram.org/bot{_tfm}/sendMessage",
+                        json={"chat_id": _cfm, "parse_mode": "Markdown",
+                              "text": (f"🚀 *Fast Mover — {symbol}*\n"
+                                       f"+{pnl_pct*100:.1f}% in {_td_fm} trading days\n"
+                                       f"O'Neil 8-week hold rule activated — "
+                                       f"holding full position to week 8")},
+                        timeout=8)
+            except Exception:
+                pass
+
         # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
         initial_qty = sym.get("initial_qty", qty)
         # Superperformance skip: composite ≥8 setups (elite VCPs) need more room before first partial
@@ -793,7 +859,8 @@ def check_positions() -> None:
         mm_pct = sym.get("measured_move_pct", 0.0) or 0.0
         partial2_trigger = max(mm_pct, 0.20) if mm_pct > 0.05 else 0.20
 
-        if pnl_pct >= partial1_trigger and not sym.get("partial1_done"):
+        _skip_b1_8w = sym.get("fast_mover") and _trading_days_held(sym.get("entry_date", "")) < 40
+        if pnl_pct >= partial1_trigger and not sym.get("partial1_done") and not _skip_b1_8w:
             sell_qty = max(1, round(initial_qty / 3))
             _lim1 = round(cur_price * 0.999, 2)  # 0.1% below market — fast fill, better price
             if _place_limit_sell(symbol, sell_qty, _lim1):
@@ -1041,6 +1108,68 @@ def check_positions() -> None:
                             )
                     except Exception:
                         pass
+
+        # ── Step RD: Reversal day — intraday new high closes in bottom 25% of range ────
+        # Minervini: stock makes a new recent high intraday but sellers overwhelm → close is weak.
+        # After ≥20% gain this pattern on high volume signals distribution at the top.
+        # Action: Telegram alert + raise stop to breakeven (if not already above).
+        if pnl_pct >= 0.20 and not sym.get("reversal_day_exited"):
+            _rd_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_rd_check_date") != _rd_today:
+                sym["_rd_check_date"] = _rd_today
+                try:
+                    import yfinance as _yf_rd
+                    _df_rd = _yf_rd.Ticker(symbol).history(
+                        period="60d", interval="1d", auto_adjust=True)
+                    if len(_df_rd) >= 30:
+                        _rd_high  = float(_df_rd["High"].iloc[-1])
+                        _rd_low   = float(_df_rd["Low"].iloc[-1])
+                        _rd_close = float(_df_rd["Close"].iloc[-1])
+                        _rd_30h   = float(_df_rd["High"].iloc[-31:-1].max())
+                        _rd_vol   = float(_df_rd["Volume"].iloc[-1])
+                        _rd_avgv  = float(_df_rd["Volume"].iloc[-21:-1].mean())
+                        _rd_range = _rd_high - _rd_low
+                        _rd_pos   = (_rd_close - _rd_low) / _rd_range if _rd_range > 0 else 1.0
+                        if (_rd_high > _rd_30h                         # new 30-day intraday high
+                                and _rd_pos <= 0.25                    # closes in bottom 25% of range
+                                and _rd_avgv > 0
+                                and _rd_vol > _rd_avgv * 1.4):         # above-avg volume = conviction
+                            _log.warning(
+                                "[monitor] %s REVERSAL DAY: intraday high $%.2f > 30d high $%.2f, "
+                                "close in bottom 25%% of range on %.1f× avg vol (pnl=+%.1f%%)",
+                                symbol, _rd_high, _rd_30h, _rd_vol / _rd_avgv, pnl_pct * 100)
+                            # Raise stop to breakeven if not already protected
+                            if not sym.get("breakeven_done"):
+                                _rd_rem = qty - sym.get("partial_qty", 0)
+                                if _rd_rem > 0:
+                                    _cancel_stop_orders(symbol)
+                                    _rd_oid = _place_stop(symbol, _rd_rem, round(avg_cost, 2))
+                                    if _rd_oid:
+                                        sym["breakeven_done"]  = True
+                                        sym["stop_order_id"]   = _rd_oid
+                                        sym["stop_loss"]       = avg_cost
+                                        changed = True
+                            try:
+                                import requests as _rqrd, os as _osrd
+                                _trd = _osrd.getenv("TELEGRAM_BOT_TOKEN", "")
+                                _crd = _osrd.getenv("TELEGRAM_CHAT_ID", "")
+                                if _trd and _crd:
+                                    _rqrd.post(
+                                        f"https://api.telegram.org/bot{_trd}/sendMessage",
+                                        json={"chat_id": _crd, "parse_mode": "Markdown",
+                                              "text": (
+                                                  f"⚠️ *Reversal Day — {symbol}*\n"
+                                                  f"New 30d intraday high ${_rd_high:.2f} "
+                                                  f"but closed in bottom 25%% of range\n"
+                                                  f"{_rd_vol/_rd_avgv:.1f}× avg vol — "
+                                                  f"distribution signal\n"
+                                                  f"Stop raised to breakeven ${avg_cost:.2f}"
+                                              )},
+                                        timeout=8)
+                            except Exception:
+                                pass
+                except Exception as _rde:
+                    _log.debug("[monitor] reversal_day %s: %s", symbol, _rde)
 
         # ── Step F: Pyramid — add 25% at +4% confirmation ──────────────────────
         # Minervini adds to winners: buy more when the breakout is confirmed

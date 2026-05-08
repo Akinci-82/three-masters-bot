@@ -360,6 +360,8 @@ class TrendResult:
     inst_ownership_increasing: bool = False  # ≥3 institutional holders filed 13F within 90 days
     eps_revision_up: bool     = False  # analyst EPS consensus revised up last 30 days (upLast30 > downLast30)
     pocket_pivot: bool        = False  # today up-vol > max prior down-day vol in last 10 days
+    eps_accelerating: bool    = False  # EPS growth rate accelerating Q-over-Q (Minervini SEPA core)
+    accum_weeks_strong: bool  = False  # ≥8/13 up-volume weeks = sustained institutional accumulation
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -807,6 +809,42 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.pocket_pivot = _pp
+
+        # Earnings acceleration: EPS growth rate increasing Q-over-Q = core Minervini SEPA criterion
+        # Accelerating growth (e.g. +20%,+35%,+50%) signals institutional conviction; decelerating = danger
+        _eps_accel = False
+        try:
+            _qe = ticker.quarterly_earnings
+            if _qe is not None and not _qe.empty and len(_qe) >= 4:
+                _qe_s = _qe.sort_index()
+                _growths = []
+                for _qi in range(1, len(_qe_s)):
+                    _prev_e = float(_qe_s["Earnings"].iloc[_qi - 1])
+                    _curr_e = float(_qe_s["Earnings"].iloc[_qi])
+                    if _prev_e != 0:
+                        _growths.append((_curr_e - _prev_e) / abs(_prev_e))
+                if len(_growths) >= 3:
+                    _eps_accel = (_growths[-1] > _growths[-2] > _growths[-3]
+                                  and _growths[-1] > 0 and _growths[-2] > 0)
+        except Exception:
+            pass
+        result.eps_accelerating = _eps_accel
+
+        # 13-week accumulation score: O'Neil up/down volume weeks ratio
+        # ≥8 of last 13 weeks closed up on positive volume = sustained institutional buying
+        _accum_strong = False
+        try:
+            _wk_acc = ticker.history(period="4mo", interval="1wk", auto_adjust=True)
+            if len(_wk_acc) >= 13:
+                _wk_acc = _wk_acc.tail(13).reset_index(drop=True)
+                _up_weeks = sum(
+                    1 for _wi in range(len(_wk_acc))
+                    if float(_wk_acc["Close"].iloc[_wi]) >= float(_wk_acc["Open"].iloc[_wi])
+                )
+                _accum_strong = _up_weeks >= 8
+        except Exception:
+            pass
+        result.accum_weeks_strong = _accum_strong
 
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)
