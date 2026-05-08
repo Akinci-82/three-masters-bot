@@ -674,20 +674,22 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     _log.info("[vcp] %s Haiku score=%d is_vcp=%s | %s",
               symbol, h_score, h_is_vcp, h_data.get("reason", "")[:80])
 
-    if not h_is_vcp:
+    _HAIKU_MIN_SCORE = 5  # require >= 5/10 confidence before spending on Sonnet
+    if not h_is_vcp or h_score < _HAIKU_MIN_SCORE:
+        _rej_tag = f"haiku_low_score={h_score}" if h_is_vcp else f"haiku_is_vcp=False_score={h_score}"
         return VCPResult(
             symbol=symbol, passed=False, current_price=price,
             breakout_level=breakout_lvl, stop_loss=stop_cand,
             pattern_depth_pct=quant.get("pattern_depth_pct", 0),
             contractions=quant.get("contractions", 0),
             breakout_volume=breakout_vol, last_candle=last_candle,
-            fail_reason=f"haiku_rejected_score={h_score} ({h_data.get('reason','')[:60]})",
+            fail_reason=f"{_rej_tag} ({h_data.get('reason','')[:60]})",
             ai_verdict="haiku_rejected",
             tier_used="haiku_rejected",
         )
 
     # ── Tier 2: Sonnet deep analysis ─────────────────────────────────────────
-    _log.info("[vcp] %s → Sonnet tier-2 (Haiku score=%d)", symbol, h_score)
+    _log.info("[vcp] %s → Sonnet tier-2 (Haiku score=%d/10)", symbol, h_score)
     s_prompt = _build_sonnet_prompt(symbol, df, quant, last_candle, fundamentals)
     s_data   = _call_sonnet(symbol, s_prompt)
 
@@ -764,8 +766,8 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             # "watch" = borderline setup — allow through but cap confidence at 0.70
             # so position sizing stays conservative
             if verdict == "watch":
-                confidence = min(confidence, 0.70)
-                _log.info("[vcp] %s Opus verdict=watch — capping confidence at 70%%", symbol)
+                confidence *= 0.85  # proportional discount; preserves relative nuance
+                _log.info("[vcp] %s Opus verdict=watch — confidence discounted 15%% to %.0f%%", symbol, confidence * 100)
 
     stop_loss = _atr_adjusted_stop(df, breakout, stop_loss)
     vol_multiweek = quant.get("vol_at_multiweek_low", False)

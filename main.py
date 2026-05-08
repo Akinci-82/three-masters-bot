@@ -2377,6 +2377,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                     _sa[_sig] = {"orders": 0, "wins": 0, "losses": 0, "total_r": 0.0}
                 _sa[_sig]["orders"] += 1
             _sa_file.write_text(_jsa.dumps(_sa, indent=2))
+            # Store active signal names in order_rec so position_monitor can close the loop
+            order_rec["active_signals"] = _active
         except Exception:
             pass
 

@@ -51,27 +51,48 @@ def _kelly_factor() -> float:
     """
     Half-Kelly fraction from trade journal win rate and average R.
     Full Kelly = W - (1-W)/R where W=win_rate, R=avg_win/avg_loss.
-    Half-Kelly applied for safety; clamped [0.5, 1.0]. Returns 1.0 if <10 trades.
+    Half-Kelly applied for safety; base clamped [0.5, 1.0]. Returns 1.0 if <10 trades.
+    Additional loss-streak multiplier: 3 losses -> 0.65x, 5+ losses -> 0.40x.
     """
     import json as _j
     from pathlib import Path as _P
     jpath = _P(__file__).parent / "logs" / "trade_journal.jsonl"
+    base_kelly = 1.0
     try:
         if not jpath.exists():
-            return 1.0
-        trades = [_j.loads(ln) for ln in jpath.read_text().splitlines() if ln.strip()]
-        if len(trades) < 10:
-            return 1.0
-        wins   = [t["r_multiple"] for t in trades if t.get("r_multiple", 0) > 0]
-        losses = [abs(t["r_multiple"]) for t in trades if t.get("r_multiple", 0) < 0]
-        if not wins or not losses:
-            return 1.0
-        w     = len(wins) / len(trades)
-        r     = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
-        kelly = w - (1 - w) / r
-        return float(max(0.5, min(1.0, kelly / 2.0)))
+            base_kelly = 1.0
+        else:
+            trades = [_j.loads(ln) for ln in jpath.read_text().splitlines() if ln.strip()]
+            if len(trades) < 10:
+                base_kelly = 1.0
+            else:
+                wins   = [t["r_multiple"] for t in trades if t.get("r_multiple", 0) > 0]
+                losses = [abs(t["r_multiple"]) for t in trades if t.get("r_multiple", 0) < 0]
+                if not wins or not losses:
+                    base_kelly = 1.0
+                else:
+                    w     = len(wins) / len(trades)
+                    r     = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+                    kelly = w - (1 - w) / r
+                    base_kelly = float(max(0.5, min(1.0, kelly / 2.0)))
     except Exception:
-        return 1.0
+        base_kelly = 1.0
+
+    # Loss-streak dampener: reduce sizing after consecutive losses
+    try:
+        streak = _load().get("consecutive_losses", 0)
+        if streak >= 5:
+            streak_mult = 0.40   # 5+ losses in a row — severe size reduction
+        elif streak >= 3:
+            streak_mult = 0.65   # 3-4 losses — meaningful reduction
+        else:
+            streak_mult = 1.0
+        if streak >= 3:
+            _log.info("[risk] Kelly dampened %.2f → %.2f (loss streak=%d)",
+                      base_kelly, base_kelly * streak_mult, streak)
+        return float(max(0.25, min(1.0, base_kelly * streak_mult)))
+    except Exception:
+        return base_kelly
 
 
 def _stop_distance_factor(entry_price: float, stop_price: float) -> float:

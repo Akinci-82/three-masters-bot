@@ -392,10 +392,12 @@ def _lookup_position_metadata(symbol: str) -> dict:
                         "composite_score":   float(order.get("composite_score", 0) or 0),
                         "measured_move_pct": float(order.get("measured_move_pct", 0) or 0),
                         "buy_stop":          float(order.get("buy_stop", 0) or 0),
+                        "active_signals":    list(order.get("active_signals", [])),
                     }
         except Exception:
             pass
-    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0, "measured_move_pct": 0.0, "buy_stop": 0.0}
+    return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0,
+            "measured_move_pct": 0.0, "buy_stop": 0.0, "active_signals": []}
 
 
 # Module-level: track which dates we've already sent each drawdown alert level
@@ -512,11 +514,28 @@ def check_positions() -> None:
     if not positions:
         return
 
-    from config import MONITOR as cfg
+    from config import MONITOR as cfg, RISK as _risk_cfg
     trail_pct         = cfg.get("trailing_stop_pct", 0.07)
     breakeven_trigger = cfg.get("breakeven_trigger", 0.08)
     partial_pct       = cfg.get("partial_exit_pct", 0.50)
     # composite-adjusted thresholds are set per-position inside the loop
+
+    # Soft-drawdown defensive mode: when portfolio approaching daily loss limit,
+    # tighten trailing stops and take profits earlier across ALL open positions.
+    _soft_dd_mode = False
+    try:
+        from risk_manager import get_state as _grs_sdd
+        _rs_sdd      = _grs_sdd()
+        _daily_pnl   = _rs_sdd.get("daily_pnl_pct", 0.0)
+        _warn_thresh = -(_risk_cfg.get("max_daily_loss_pct", 0.04) / 2)  # -2%
+        if _daily_pnl <= _warn_thresh:
+            _soft_dd_mode = True
+            trail_pct         = 0.05   # tighten from 7% → 5%
+            breakeven_trigger = 0.05   # breakeven sooner (5% vs 8%)
+            _log.info("[monitor] SOFT-DD MODE active (day_pnl=%.1f%%) — trail=5%% breakeven=5%%",
+                      _daily_pnl * 100)
+    except Exception:
+        pass
 
     state = _load_state()
     changed = False
@@ -538,6 +557,7 @@ def check_positions() -> None:
             "partial_done":          False,
             "breakeven_done":        False,
             "trailing_stop_placed":  False,
+                "active_signals":      meta.get("active_signals", []),
             "entry_date":            datetime.now(_ET).strftime("%Y-%m-%d"),
         })
         sym["last_price"] = cur_price   # keep last known price for close_trade P&L
@@ -878,16 +898,18 @@ def check_positions() -> None:
                     changed = True
 
         # ── Step Z: Failed breakout detection — exit if price falls back under pivot ──
-        # Within 5 trading days of entry: price back below buy_stop = failed breakout.
-        # Minervini exits immediately — cut losses before they compound.
+        # Up to 20 trading days: if price decisively back below pivot AND no meaningful
+        # gain has developed, the setup is dead. Minervini: pivot break = setup failure.
+        # Guard: skip if position is already a winner (pnl > +3%) — treat as a runner.
         _buy_stp_z = sym.get("buy_stop", 0.0)
         _ed_z      = sym.get("entry_date", "")
         if (_buy_stp_z > 0
                 and not sym.get("partial1_done")
                 and not sym.get("failed_breakout_done")
                 and _ed_z
-                and 1 <= _trading_days_held(_ed_z) <= 5
-                and cur_price < _buy_stp_z):
+                and 1 <= _trading_days_held(_ed_z) <= 20
+                and cur_price < _buy_stp_z * 0.99
+                and pnl_pct < 0.03):
             _rem_z = qty - sym.get("partial_qty", 0)
             _log.warning("[monitor] %s FAILED BREAKOUT — cur $%.2f < pivot $%.2f (day %d)",
                          symbol, cur_price, _buy_stp_z, _trading_days_held(_ed_z))
@@ -1794,12 +1816,15 @@ def check_positions() -> None:
                             "inst_ownership_increasing", "near_ath", "weekly_stage2",
                             "pead_hold",
                         ]
-                        _r_val = ((float(sym_data.get("last_price", 0))
-                                   - float(sym_data.get("avg_cost", 0)))
-                                  / max(float(sym_data.get("avg_cost", 0))
-                                        - float(sym_data.get("stop_loss_initial", 0)), 0.001))
-                        for _sig2 in _sig_names2:
-                            if _sig2 in _sa2 and sym_data.get(_sig2):
+                        _stop_init = float(sym_data.get("stop_loss_initial", 0) or 0)
+                        _avg_c     = float(sym_data.get("avg_cost", 0) or 0)
+                        _last_p    = float(sym_data.get("last_price", 0) or 0)
+                        _risk_ps   = max(_avg_c - _stop_init, _avg_c * 0.07, 0.001)
+                        _r_val     = (_last_p - _avg_c) / _risk_ps
+                        _won       = _last_p > _avg_c
+                        _active_sigs = sym_data.get("active_signals", [])
+                        for _sig2 in _active_sigs:
+                            if _sig2 in _sa2:
                                 if _won:
                                     _sa2[_sig2]["wins"]   += 1
                                 else:
