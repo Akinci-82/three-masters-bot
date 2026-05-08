@@ -87,6 +87,7 @@ def _tg(msg: str) -> bool:
 # ── Shutdown ──────────────────────────────────────────────────────────────────
 _SHUTDOWN = False
 _monitor_stop = threading.Event()
+_SCAN_LOCK    = threading.Lock()  # prevents concurrent scan runs
 
 
 def _signal_handler(sig, frame):
@@ -906,17 +907,29 @@ def _fetch_10y_yield_slope() -> float:
 
 def _dynamic_min_composite() -> float:
     """
-    Auto-raise MIN_COMPOSITE to 6.5 if low-score bucket (5.0–6.5) has negative expectancy.
-    Reads feedback_state.json written weekly. Returns 5.0 (default) or 6.5.
+    Auto-raise MIN_COMPOSITE based on bucket performance in feedback_state.json.
+    Bucket keys: "5.0-6.0", "6.0-7.0", "7.0-8.0", "8.0+".
+    Returns 5.0 (default), 6.0, or 7.0 depending on which buckets show negative expectancy.
     """
     try:
         import json as _j
-        fb  = _j.loads((LOG_DIR / "feedback_state.json").read_text())
-        bkt = fb.get("score_buckets", {}).get("5.0-6.5", {})
-        if bkt.get("count", 0) >= 5 and bkt.get("avg_r", 0.0) < 0:
-            _log.info("[score] Dynamic MIN raised to 6.5 — low-score bucket avg=%.2fR (%d trades)",
-                      bkt["avg_r"], bkt["count"])
-            return 6.5
+        fb      = _j.loads((LOG_DIR / "feedback_state.json").read_text())
+        buckets = fb.get("score_buckets", {})
+        bkt_lo  = buckets.get("5.0-6.0", {})
+        bkt_mid = buckets.get("6.0-7.0", {})
+
+        lo_bad  = bkt_lo.get("count", 0) >= 5 and bkt_lo.get("avg_r", 0.0) < 0
+        mid_bad = bkt_mid.get("count", 0) >= 5 and bkt_mid.get("avg_r", 0.0) < 0
+
+        if lo_bad and mid_bad:
+            _log.info("[score] Dynamic MIN raised to 7.0 — both low buckets negative "
+                      "(5-6: %.2fR/%d, 6-7: %.2fR/%d)",
+                      bkt_lo["avg_r"], bkt_lo["count"], bkt_mid["avg_r"], bkt_mid["count"])
+            return 7.0
+        if lo_bad:
+            _log.info("[score] Dynamic MIN raised to 6.0 — 5.0-6.0 bucket avg=%.2fR (%d trades)",
+                      bkt_lo["avg_r"], bkt_lo["count"])
+            return 6.0
     except Exception:
         pass
     return 5.0
@@ -1655,6 +1668,18 @@ def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
 # ── Main daily run ────────────────────────────────────────────────────────────
 def run_daily():
     """Execute the full Three Masters pipeline for today."""
+    if not _SCAN_LOCK.acquire(blocking=False):
+        _log.warning("[main] Scan already running — ignoring concurrent trigger")
+        _tg("⚠️ *Three Masters* — scan already in progress, duplicate trigger ignored")
+        return
+    try:
+        _run_daily_impl()
+    finally:
+        _SCAN_LOCK.release()
+
+
+def _run_daily_impl():
+    """Actual pipeline — always called under _SCAN_LOCK."""
     _heartbeat()
 
     today = str(date.today())
@@ -2163,6 +2188,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     except Exception:
         pass
 
+    _reject_reasons: dict[str, str] = {}
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
             _log.info("[main] Max new positions reached (%d) — stopping.", RISK["max_positions"])
@@ -2170,10 +2196,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
         if vcp.symbol in held_symbols:
             _log.info("[main] %s already held — skipping.", vcp.symbol)
+            _reject_reasons[vcp.symbol] = "already held"
             continue
 
         if vcp.symbol in orders_to_skip:
             _log.info("[main] %s — existing valid order retained.", vcp.symbol)
+            _reject_reasons[vcp.symbol] = "order retained"
             continue
 
         # Sector concentration check (max_positions_per_sector from config)
@@ -2181,6 +2209,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if sector_counts.get(sec, 0) >= max_per_sector:
             _log.info("[main] %s skipped — sector '%s' already at limit (%d/%d)",
                       vcp.symbol, sec, sector_counts.get(sec, 0), max_per_sector)
+            _reject_reasons[vcp.symbol] = f"sector cap ({sec})"
             continue
 
         # Correlation check: skip if too similar to any held position
@@ -2194,6 +2223,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if _super_cnt >= _max_super:
             _log.info("[main] %s skipped — super-sector '%s' at cap (%d/%d)",
                       vcp.symbol, _vcp_super, _super_cnt, _max_super)
+            _reject_reasons[vcp.symbol] = f"super-sector cap ({_vcp_super})"
             continue
 
         # Sector risk heat cap: never allocate >3% total risk to one sector
@@ -2202,6 +2232,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if _sec_risk >= 0.03:
             _log.info("[main] %s skipped — sector '%s' risk heat %.1f%% at 3%% cap",
                       vcp.symbol, sec, _sec_risk * 100)
+            _reject_reasons[vcp.symbol] = f"sector heat ({sec} {_sec_risk*100:.1f}%)"
             continue
 
         # Sector RS hard filter: reject if sector is bottom-half ranked with negative momentum
@@ -2213,10 +2244,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             if _sec_rnk > _n_rnk // 2 and sector_momentum.get(_sec_etf_v, 0) < -0.005:
                 _log.info("[main] %s skipped — sector '%s' rank %d/%d bottom-half, negative RS",
                           vcp.symbol, sec, _sec_rnk, _n_rnk)
+                _reject_reasons[vcp.symbol] = f"sector RS weak ({sec} rank {_sec_rnk}/{_n_rnk})"
                 continue
 
         if _is_correlated(vcp.symbol, held_symbols):
             _log.info("[main] %s skipped — high correlation with existing position", vcp.symbol)
+            _reject_reasons[vcp.symbol] = "correlation with held"
             continue
 
         # Adaptive risk: composite score → VIX-adjusted → regime/loss multipliers
@@ -2263,6 +2296,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             _log.info("[main] %s skipped — R:R %.1f:1 below minimum 2.5:1 "
                       "(stop too wide or measured move too small)",
                       vcp.symbol, sizing["rr_ratio"])
+            _reject_reasons[vcp.symbol] = f"R:R {sizing['rr_ratio']:.1f}:1 < 2.5"
             continue
 
         if sizing["notional"] > cash * 0.95:
@@ -2287,6 +2321,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if vcp.current_price >= vcp.breakout_level * 1.005:
             _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — skip",
                       vcp.symbol, vcp.current_price, vcp.breakout_level)
+            _reject_reasons[vcp.symbol] = "price extended past breakout"
             continue
 
         buy_order = place_buy_stop(vcp.symbol, sizing["shares"], vcp.breakout_level)
@@ -2354,8 +2389,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             vcp.last_candle, sec, getattr(vcp, "rs_rating", 0), vol_tag,
         )
 
-    report["orders_placed"] = orders_placed
-    report["completed_at"]  = datetime.now(timezone.utc).isoformat()
+    report["orders_placed"]   = orders_placed
+    report["reject_reasons"]  = _reject_reasons
+    report["completed_at"]    = datetime.now(timezone.utc).isoformat()
 
     _save_report(report)
     _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
@@ -2397,6 +2433,18 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         )
     if not orders:
         lines.append("No new orders — conditions not met.")
+
+    _noise = {"already held", "order retained", "price extended past breakout"}
+    _rej   = {sym: rsn for sym, rsn in report.get("reject_reasons", {}).items()
+              if rsn not in _noise}
+    if _rej:
+        lines.append("")
+        lines.append("*Rejected candidates:*")
+        for _rs, _rr in list(_rej.items())[:8]:
+            lines.append(f"  ✗ {_rs} — {_rr}")
+        if len(_rej) > 8:
+            lines.append(f"  … and {len(_rej)-8} more")
+
     if report.get("errors"):
         lines.append(f"\n⚠️ Errors: {'; '.join(report['errors'])}")
     _tg("\n".join(lines))

@@ -62,7 +62,7 @@ VCP = {
     "volume_decline_required":  True,
     "final_tight_pct":          0.10,
     "lookback_days":            60,
-    "min_confidence":           0.60,
+    "min_confidence":           0.65,
     "min_quality_score":        3,
     "breakout_volume_min":      1.5,   # today's volume ≥ 1.5x avg = breakout confirmed
     # Candlestick confirmation on entry candle
