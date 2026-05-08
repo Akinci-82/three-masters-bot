@@ -736,8 +736,13 @@ _CPI_2026  = [(1,15),(2,12),(3,12),(4,10),(5,13),(6,11),(7,15),(8,12),(9,10),(10
 def _is_macro_blackout() -> tuple[bool, str]:
     """Return (True, reason) if within 2 calendar days before FOMC or CPI release.
     Avoids new entries ahead of binary macro events that gap past any stop.
+    Exception: if today IS the FOMC day and the announcement has already passed
+    (20:00 UTC / 14:00 ET), the binary event is resolved — lift the blackout.
     """
+    from datetime import datetime, timezone
     today = date.today()
+    now_utc = datetime.now(timezone.utc)
+    _FOMC_ANNOUNCEMENT_UTC_HOUR = 20  # FOMC decision at 14:00 ET = 20:00 UTC
     for (m, d) in _FOMC_2026 + _CPI_2026:
         try:
             event = date(today.year, m, d)
@@ -746,6 +751,9 @@ def _is_macro_blackout() -> tuple[bool, str]:
         delta = (event - today).days
         if 0 <= delta <= 2:
             kind = "FOMC" if (m, d) in _FOMC_2026 else "CPI"
+            # FOMC event day after announcement: binary event resolved, skip blackout
+            if delta == 0 and kind == "FOMC" and now_utc.hour >= _FOMC_ANNOUNCEMENT_UTC_HOUR:
+                continue
             return True, f"{kind} {event}"
     return False, ""
 

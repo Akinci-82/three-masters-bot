@@ -112,7 +112,12 @@ Reads `logs/trade_journal.jsonl` (all-time) and reports:
 - **Limit exits**: B1/B2 partials use `_place_limit_sell` (cur_price×0.999, market fallback)
 - **Telegram proximity alerts**: once/day/position — stop within 2%, approaching +10%, earnings 3-7d
 
+
+## Patch 10 upgrades (added 2026-05-08)
+- **FOMC post-announcement lift**: `_is_macro_blackout()` now allows trades on FOMC day if UTC clock >= 20:00 (14:00 ET). Decision already announced => binary risk resolved. Pre-announcement protection (delta 1-2 days + same day before 20:00 UTC) unchanged.
+- **Why**: Scanner runs 22:30 CEST (20:30 UTC). Without this fix, evening scan on FOMC day blocked orders that would execute *next morning* -- after Fed reaction is fully priced in. CPI blackout logic unchanged (no single known announcement time).
 ## Commits (latest first)
+- `cf0a1b2` -- fix: lift FOMC blackout post-announcement (>=20:00 UTC same day) (2026-05-08)
 - `cf82859` — docs: README for Patches 8 and 9 (2026-05-07)
 - `daed90c` — Patch 9: VIX slope, EPS revision, RS vs sector, win streak, super-sector, limit exits, alerts (2026-05-07)
 - `dce9cef` — Patch 8: IPO filter, monthly Stage 2, rate slope, stop-limit, pivot trail, gap harvest (2026-05-07)
