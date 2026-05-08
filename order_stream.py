@@ -2,6 +2,13 @@
 Order fill notification via Alpaca trade-update stream (alpaca-trade-api v3).
 Sends Telegram alert the moment a buy-stop fills.
 Runs in a background daemon thread — restarts automatically on disconnect.
+
+Reconnect strategy:
+  The alpaca_trade_api library catches auth errors internally and retries with
+  only a 10ms delay — it never raises to our code. We work around this by
+  running stream.run() in a sub-thread and polling _trading_ws._running.
+  If auth doesn't succeed within CONNECT_TIMEOUT seconds we call stream.stop()
+  to break the library's internal loop and apply exponential backoff.
 """
 from __future__ import annotations
 import logging
@@ -11,9 +18,10 @@ import time
 
 _log = logging.getLogger(__name__)
 
-_RECONNECT_BASE  = 30   # seconds before first retry
-_RECONNECT_MAX   = 300  # cap at 5 minutes
-_HEALTHY_MIN_SEC = 120  # session is "healthy" if it ran > 2 min before dropping
+_CONNECT_TIMEOUT = 30   # seconds to wait for successful auth before giving up
+_RECONNECT_BASE  = 30   # base reconnect delay after normal disconnect
+_RECONNECT_MAX   = 300  # cap exponential backoff at 5 minutes
+_ALERT_FAIL_THRESHOLD = 3  # send Telegram alert after this many consecutive auth fails
 
 
 def _tg(msg: str) -> None:
@@ -65,6 +73,27 @@ def _handle_trade_update(data) -> None:
         _log.debug("[stream] handle_trade_update error: %s", e)
 
 
+def _stop_stream(stream) -> None:
+    """Stop stream safely — works even if event loop hasn't started yet."""
+    try:
+        stream.stop()
+    except Exception:
+        # _loop may be None if stream never started; set flag directly as fallback
+        try:
+            if stream._trading_ws:
+                stream._trading_ws._should_run = False
+        except Exception:
+            pass
+
+
+def _is_connected(stream) -> bool:
+    """Return True if the trading WebSocket has successfully authenticated."""
+    try:
+        return bool(stream._trading_ws._running)
+    except Exception:
+        return False
+
+
 def _stream_loop(stop_event: threading.Event) -> None:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -79,61 +108,89 @@ def _stream_loop(stop_event: threading.Event) -> None:
 
     import alpaca_trade_api as tradeapi
 
-    fail_count = 0  # consecutive fast-fail count for exponential backoff
+    fail_count   = 0   # consecutive auth-fail count
+    alerted      = False  # suppress duplicate Telegram alerts
 
     while not stop_event.is_set():
         t_start = time.monotonic()
-        try:
-            _log.info("[stream] Connecting to Alpaca trade stream...")
-            stream = tradeapi.Stream(
-                key_id=key,
-                secret_key=secret,
-                base_url=base,
-                data_feed="iex",
-            )
 
-            @stream.on_trade_update
-            async def on_trade_update(data):
-                _handle_trade_update(data)
+        stream = tradeapi.Stream(
+            key_id=key,
+            secret_key=secret,
+            base_url=base,
+            data_feed="iex",
+        )
 
-            stream.subscribe_trade_updates(on_trade_update)
-            stream.run()   # blocks until disconnect
+        @stream.on_trade_update
+        async def on_trade_update(data):
+            _handle_trade_update(data)
 
-            # Normal disconnect (stream.run() returned without exception)
-            elapsed = time.monotonic() - t_start
-            if elapsed >= _HEALTHY_MIN_SEC:
-                fail_count = 0  # healthy session — reset backoff
-            _log.info("[stream] Stream ended after %.0fs — reconnecting in %ds",
-                      elapsed, _RECONNECT_BASE)
-            stop_event.wait(_RECONNECT_BASE)
+        stream.subscribe_trade_updates(on_trade_update)
 
-        except Exception as e:
-            if stop_event.is_set():
+        # Run stream in a sub-thread so we can stop it externally on auth timeout.
+        # The library's internal _run_forever catches auth errors with a 10ms retry
+        # and never raises them to the caller — we must interrupt from outside.
+        stream_thread = threading.Thread(
+            target=stream.run, daemon=True, name="stream-ws"
+        )
+        stream_thread.start()
+
+        # Poll for successful auth (stream._trading_ws._running goes True on success)
+        deadline = time.monotonic() + _CONNECT_TIMEOUT
+        while time.monotonic() < deadline and not stop_event.is_set():
+            if _is_connected(stream):
                 break
+            time.sleep(1)
 
-            elapsed = time.monotonic() - t_start
+        if stop_event.is_set():
+            _stop_stream(stream)
+            stream_thread.join(timeout=10)
+            break
 
-            if elapsed < _HEALTHY_MIN_SEC:
-                # Fast fail: auth error, rate limit, or connection refused.
-                # The alpaca_trade_api library retries internally before raising,
-                # so by the time we get here it has already hammered Alpaca for
-                # several seconds. Apply exponential backoff to avoid HTTP 429 storms.
-                fail_count += 1
-                delay = min(_RECONNECT_BASE * (2 ** (fail_count - 1)), _RECONNECT_MAX)
-                _log.warning(
-                    "[stream] Fast fail #%d (%.0fs) — backoff %ds: %s",
-                    fail_count, elapsed, delay, e,
+        if not _is_connected(stream):
+            # Auth timed out — library is stuck in its internal retry loop.
+            # Stop it cleanly, apply exponential backoff before next attempt.
+            fail_count += 1
+            delay = min(_RECONNECT_BASE * (2 ** (fail_count - 1)), _RECONNECT_MAX)
+            _log.warning(
+                "[stream] Auth timeout after %ds (fail #%d) — stopping and waiting %ds",
+                _CONNECT_TIMEOUT, fail_count, delay,
+            )
+            _stop_stream(stream)
+            stream_thread.join(timeout=10)
+
+            if fail_count >= _ALERT_FAIL_THRESHOLD and not alerted:
+                _tg(
+                    f"⚠️ *Three Masters — WebSocket stream down*\n"
+                    f"Failed to authenticate {fail_count}× in a row.\n"
+                    f"Retrying every {delay//60}min. Position monitor (15 min) still active."
                 )
-            else:
-                # Healthy session dropped — reset backoff, short delay
-                fail_count = 0
-                delay = _RECONNECT_BASE
-                _log.warning(
-                    "[stream] Disconnected after %.0fs — reconnecting in %ds: %s",
-                    elapsed, delay, e,
-                )
+                alerted = True
 
             stop_event.wait(delay)
+            continue
+
+        # Successfully authenticated
+        if fail_count > 0:
+            _log.info("[stream] Auth recovered after %d failure(s)", fail_count)
+            if alerted:
+                _tg("✅ *Three Masters — WebSocket stream recovered*")
+        fail_count = 0
+        alerted    = False
+        _log.info("[stream] Connected to Alpaca trade stream")
+
+        # Wait for the stream to disconnect naturally
+        stream_thread.join()
+
+        if stop_event.is_set():
+            break
+
+        elapsed = time.monotonic() - t_start
+        _log.info(
+            "[stream] Disconnected after %.0fs — reconnecting in %ds",
+            elapsed, _RECONNECT_BASE,
+        )
+        stop_event.wait(_RECONNECT_BASE)
 
     _log.info("[stream] Order fill stream stopped")
 
