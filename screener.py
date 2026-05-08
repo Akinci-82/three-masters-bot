@@ -358,6 +358,8 @@ class TrendResult:
     weekly_breakout_aligned: bool = False  # daily breakout aligns with weekly 5-week high
     analyst_upgrades: bool    = False  # net analyst upgrades > downgrades in last 60 days
     inst_ownership_increasing: bool = False  # ≥3 institutional holders filed 13F within 90 days
+    eps_revision_up: bool     = False  # analyst EPS consensus revised up last 30 days (upLast30 > downLast30)
+    pocket_pivot: bool        = False  # today up-vol > max prior down-day vol in last 10 days
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -774,6 +776,37 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.inst_ownership_increasing = _inst_inc
+
+        # EPS revision momentum: analyst consensus raised for upcoming quarter/year
+        _eps_rev_up = False
+        try:
+            _rev_df = ticker.eps_revisions
+            if _rev_df is not None and not _rev_df.empty:
+                _up30   = int(_rev_df.get("upLast30days",   pd.Series([0])).sum())
+                _down30 = int(_rev_df.get("downLast30days", pd.Series([0])).sum())
+                _eps_rev_up = _up30 > _down30 and _up30 >= 2
+        except Exception:
+            pass
+        result.eps_revision_up = _eps_rev_up
+
+        # Pocket pivot: today's up-day volume exceeds the highest down-day volume
+        # in the prior 10 sessions — O'Neil/Morales early-entry confirmation signal
+        _pp = False
+        try:
+            if len(df) >= 12:
+                _df_pp = df.tail(11).reset_index(drop=True)
+                _down_vols = [
+                    float(_df_pp["Volume"].iloc[_i])
+                    for _i in range(1, len(_df_pp) - 1)
+                    if float(_df_pp["Close"].iloc[_i]) < float(_df_pp["Close"].iloc[_i - 1])
+                ]
+                _today_up = float(_df_pp["Close"].iloc[-1]) > float(_df_pp["Close"].iloc[-2])
+                _today_vol = float(_df_pp["Volume"].iloc[-1])
+                if _down_vols and _today_up and _today_vol > max(_down_vols):
+                    _pp = True
+        except Exception:
+            pass
+        result.pocket_pivot = _pp
 
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)

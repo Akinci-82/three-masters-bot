@@ -980,11 +980,15 @@ def _simons_score(trend) -> float:
     aug_pts = 0.25 if getattr(trend, "analyst_upgrades", False) else 0.0
     # Institutional accumulation trend: recent 13F filings = smart money building position
     inst_trend_pts = 0.25 if getattr(trend, "inst_ownership_increasing", False) else 0.0
+    # EPS revision momentum: analyst consensus raised = earnings acceleration (Minervini SEPA)
+    rev_up_pts = 0.5 if getattr(trend, "eps_revision_up", False) else 0.0
+    # Pocket pivot: up-day volume exceeds all prior down-day volumes = early institutional entry
+    pp_pts = 0.25 if getattr(trend, "pocket_pivot", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
-               + inst_trend_pts, 10.0)
+               + inst_trend_pts + rev_up_pts + pp_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -1848,6 +1852,16 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _tg("🛑 *Follow-Through Gate — entries paused*\nSPY >5%% below MA50, no FTD confirmed\nWaiting for O'Neil uptrend confirmation")
         max_new_pos = 0
 
+    # Intraday entry window: midday 11:00-14:30 ET = historically weaker breakout follow-through
+    # Morning momentum and EOD strength windows are preferred; halve new positions at midday.
+    import pytz as _pytz_iw
+    from datetime import time as _dtime
+    _now_et_iw = datetime.now(_pytz_iw.timezone("America/New_York")).time()
+    if _dtime(11, 0) <= _now_et_iw < _dtime(14, 30) and max_new_pos > 1:
+        _log.info("[tudor] Midday window (11:00-14:30 ET) — max_new_pos %d→%d (weaker follow-through)",
+                  max_new_pos, max(1, max_new_pos // 2))
+        max_new_pos = max(1, max_new_pos // 2)
+
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
             _log.info("[main] Max new positions reached (%d) — stopping.", RISK["max_positions"])
@@ -1909,11 +1923,28 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _atr_f    = _atr_volatility_factor(vcp.symbol, vcp.breakout_level)
         if _atr_f < 1.0:
             _log.info("[main] %s ATR factor %.0f%% — elevated volatility", vcp.symbol, _atr_f * 100)
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor
+        # Gap-up breakout: open above prior day's high = institutional conviction → +10% size
+        _gap_up_f = 1.0
+        try:
+            import yfinance as _yf_gap
+            _df_gap = _yf_gap.Ticker(vcp.symbol).history(
+                period="5d", interval="1d", auto_adjust=True)
+            if len(_df_gap) >= 2:
+                _gap_open   = float(_df_gap["Open"].iloc[-1])
+                _gap_prev_h = float(_df_gap["High"].iloc[-2])
+                if _gap_open > _gap_prev_h:
+                    _gap_up_f = 1.10
+                    _log.info("[main] %s gap-up breakout (open $%.2f > prior high $%.2f) — size +10%%",
+                              vcp.symbol, _gap_open, _gap_prev_h)
+        except Exception:
+            pass
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor * _gap_up_f
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
             _log.warning("[main] Cannot trade: %s", reason)
+            if any(k in reason.lower() for k in ("drawdown", "halted", "heat")):
+                _tg("🛡️ *Risk Gate — trading paused*\n" + f"`{reason}`")
             break
 
         try:
