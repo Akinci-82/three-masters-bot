@@ -1007,6 +1007,9 @@ def _simons_score(trend) -> float:
     # Base count: later bases have materially higher failure rates (Minervini SEPA)
     _bcnt_s  = getattr(trend, "base_count", 1)
     base_pts = 0.0 if _bcnt_s <= 2 else (-0.5 if _bcnt_s == 3 else -1.0)
+    # Base age: stale consolidations (>120 trading days) lose momentum (Minervini)
+    _bage    = getattr(trend, "base_age_days", 0)
+    bage_pts = 0.0 if _bage <= 60 else (-0.25 if _bage <= 120 else -0.5)
     # Volume contraction quality: consistent volume decline = controlled institutional base
     _vq_s   = getattr(trend, "vol_contraction_quality", 0.0)
     vq_pts  = 0.5 if _vq_s >= 1.0 else (0.25 if _vq_s >= 0.5 else 0.0)
@@ -1043,8 +1046,8 @@ def _simons_score(trend) -> float:
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
-               + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts
-               + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
+               + twt_pts + obv_pts + base_pts + bage_pts + vq_pts + ath_pts + ws2_pts + wba_pts
+               + aug_pts + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
                + insider_pts + indleader_pts + rev_accel_pts
                + twt2_pts + si_mo_pts + apt_pts, 10.0)
 
@@ -1728,11 +1731,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.info("[simons] Universe: %d symbols", len(symbols))
         screen_results = screen_universe(symbols=symbols)
         trend_passed = [r for r in screen_results if r.passed]
-        # RVOL pre-filter: remove dormant stocks (rvol_5d < 0.8) before expensive VCP analysis
+        # RVOL pre-filter: remove dormant (rvol_5d < 0.8) AND distribution (rvol_5d > 2.0)
+        # Upper bound: sustained elevated volume during the base = distribution, not dry-up
         _before_rvol = len(trend_passed)
-        trend_passed = [r for r in trend_passed if r.rvol_5d >= 0.8]
+        trend_passed = [r for r in trend_passed if 0.8 <= r.rvol_5d <= 2.0]
         if len(trend_passed) < _before_rvol:
-            _log.info("[main] RVOL filter: %d dormant candidates removed (rvol_5d < 0.8)",
+            _log.info("[main] RVOL filter: %d candidates removed (rvol outside 0.8-2.0)",
                       _before_rvol - len(trend_passed))
         # Market breadth: % of screened universe above MA50 (Tudor Jones signal)
         _breadth_pct = (sum(1 for r in screen_results if r.price > r.ma50 > 0)

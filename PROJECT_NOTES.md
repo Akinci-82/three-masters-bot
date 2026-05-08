@@ -113,11 +113,18 @@ Reads `logs/trade_journal.jsonl` (all-time) and reports:
 - **Telegram proximity alerts**: once/day/position — stop within 2%, approaching +10%, earnings 3-7d
 
 
+
+## Patch 11 upgrades (added 2026-05-08)
+- **RVOL upper cap** (`main.py`): RVOL filter now requires `0.8 <= rvol_5d <= 2.0`. Upper bound removes candidates with sustained elevated volume during the base — signals distribution, not the dry-up VCPs need. Dollar-ADV filter already existed at $5M (confirmed, not changed).
+- **Base age penalty** (`screener.py` + `main.py`): New `base_age_days` field = trading days since 52w high peak (base start). Added to `_simons_score`: 61-120 days = -0.25 pts, >120 days = -0.5 pts. Stale consolidations lose momentum and produce lower-quality breakouts.
+- **Claude VCP caching** (`vcp_analyzer.py`): `analyze()` now checks `logs/vcp_cache.json` before calling Claude. Cache key = `symbol:YYYY-MM-DD`. Hit if breakout_level within 2% of cached value. Cache expires after 1 day. Eliminates repeated Haiku→Sonnet→Opus calls for setups that haven't changed overnight.
+- **Backtest refactored** (`backtest.py`): Now uses Tier-0 quantitative VCP filter (no Claude API calls) + actual three-stage exit rules (breakeven at +8%, 33% partial at +10%, 33% at +20%, 5% trailing stop on runner, time stop at 15 days/<2% gain). Reports score-bucket breakdown (0-4/4-6/6-8/8-10) and exit reason stats — results now reflect actual strategy behavior.
 ## Patch 10 upgrades (added 2026-05-08)
 - **FOMC post-announcement lift**: `_is_macro_blackout()` now allows trades on FOMC day if UTC clock >= 20:00 (14:00 ET). Decision already announced => binary risk resolved. Pre-announcement protection (delta 1-2 days + same day before 20:00 UTC) unchanged.
 - **Why**: Scanner runs 22:30 CEST (20:30 UTC). Without this fix, evening scan on FOMC day blocked orders that would execute *next morning* -- after Fed reaction is fully priced in. CPI blackout logic unchanged (no single known announcement time).
 - **WebSocket stream monitoring loop** (`order_stream.py`): replaced bare `stream_thread.join()` with a 10 s polling loop. The old bare join hung forever if the WS stalled without firing a disconnect event -- reconnect never triggered. New loop also pings Alpaca REST every 90 s; if ping fails (auth error), stream is force-stopped and reconnects immediately via the existing exponential backoff.
 ## Commits (latest first)
+- `PENDING` -- Patch 11: RVOL cap, base age, Claude cache, backtest refactor (2026-05-08)
 - `PENDING` -- fix: WS stream polling loop + REST auth ping every 90s (order_stream.py) (2026-05-08)
 - `cf0a1b2` -- fix: lift FOMC blackout post-announcement (>=20:00 UTC same day) (2026-05-08)
 - `cf82859` — docs: README for Patches 8 and 9 (2026-05-07)

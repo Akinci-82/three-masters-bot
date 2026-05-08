@@ -351,6 +351,7 @@ class TrendResult:
     three_weeks_tight: bool   = False  # price in <=1.5% range for 3+ consecutive weeks (Minervini)
     obv_new_high: bool        = False  # OBV at 52w high = institutional accumulation in base
     base_count: int           = 1      # prior VCP bases last 18mo (1-2=fresh, 3+=late stage)
+    base_age_days: int        = 0      # trading days since 52w high peak (current base start)
     vol_contraction_quality: float = 0.0  # 0=none 0.5=partial 1.0=perfect vol decline in base
     near_ath: bool            = False  # price within 2% of 3-year high (no major overhead supply)
     weekly_stage2: bool       = False  # MA10w > MA30w AND MA30w slope rising (multi-TF Stage 2)
@@ -718,6 +719,19 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         result.base_count = min(_bcnt, 5)
         if _bcnt >= 3:
             _log.debug("[screen] %s base count=%d — late stage penalty applied", symbol, _bcnt)
+
+        # Base age: trading days since 52-week high (proxy for current base duration)
+        # Long bases (>120d) lose momentum; fresh bases (<60d) have best breakout odds
+        _base_age = 0
+        try:
+            _cl252 = df["Close"].tail(252)
+            _peak_idx = int(_cl252.values.argmax())
+            _base_age = len(_cl252) - 1 - _peak_idx
+        except Exception:
+            pass
+        result.base_age_days = _base_age
+        if _base_age > 120:
+            _log.debug("[screen] %s base age=%dd — old base, momentum penalty", symbol, _base_age)
 
         # Volume contraction quality: each 20-day segment in base has lower avg volume
         # Perfect contraction = disciplined selling pressure drying up (ideal VCP)

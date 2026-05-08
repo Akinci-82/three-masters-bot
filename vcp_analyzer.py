@@ -37,7 +37,68 @@ _HAIKU_MODEL  = CLAUDE_MODEL        # haiku-4-5-20251001
 _SONNET_MODEL = CLAUDE_MODEL_DEEP   # sonnet-4-6
 _OPUS_MODEL   = CLAUDE_MODEL_ULTRA  # opus-4-7
 
-_TOKEN_LOG = LOG_DIR / "token_usage.jsonl"
+_TOKEN_LOG  = LOG_DIR / "token_usage.jsonl"
+_VCP_CACHE  = LOG_DIR / "vcp_cache.json"
+
+
+def _load_vcp_cache() -> dict:
+    try:
+        if _VCP_CACHE.exists():
+            raw = json.loads(_VCP_CACHE.read_text())
+            from datetime import timedelta
+            cutoff = str(date.today() - timedelta(days=1))
+            return {k: v for k, v in raw.items() if v.get("date", "") >= cutoff}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_vcp_cache(cache: dict) -> None:
+    try:
+        _VCP_CACHE.parent.mkdir(exist_ok=True)
+        _VCP_CACHE.write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass
+
+
+def _serialize_result(r) -> dict:
+    import dataclasses
+    d = {}
+    for fld in dataclasses.fields(r):
+        if fld.name == "df":
+            continue
+        v = getattr(r, fld.name)
+        if isinstance(v, (bool, int, float, str)):
+            d[fld.name] = v
+        else:
+            d[fld.name] = str(v)
+    return d
+
+
+def _deserialize_result(d: dict):
+    import dataclasses
+    fields = {fld.name: fld for fld in dataclasses.fields(VCPResult)}
+    kwargs = {}
+    for name, fld in fields.items():
+        if name == "df":
+            kwargs[name] = None
+            continue
+        if name not in d:
+            continue
+        raw = d[name]
+        typ = str(fld.type)
+        try:
+            if "bool" in typ:
+                kwargs[name] = bool(raw)
+            elif "int" in typ:
+                kwargs[name] = int(raw)
+            elif "float" in typ:
+                kwargs[name] = float(raw)
+            else:
+                kwargs[name] = raw
+        except Exception:
+            kwargs[name] = raw
+    return VCPResult(**kwargs)
 
 
 def _get_client() -> anthropic.Anthropic:
@@ -590,6 +651,20 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     breakout_lvl = quant.get("breakout_level", price)   # handle HIGH
     stop_cand    = quant.get("stop_loss_candidate", price * 0.93)  # handle LOW
 
+    # -- Cache: skip Claude if same breakout setup seen today ---------------
+    _vcp_cache = _load_vcp_cache()
+    _cache_key = f"{symbol}:{date.today().isoformat()}"
+    if _cache_key in _vcp_cache:
+        _cached = _vcp_cache[_cache_key]
+        _cached_lvl = float(_cached.get("breakout_level", 0.0))
+        if _cached_lvl > 0 and abs(breakout_lvl / _cached_lvl - 1) < 0.02:
+            _log.info("[vcp] %s CACHE HIT -- skipping Claude (breakout=%.2f)",
+                      symbol, _cached_lvl)
+            try:
+                return _deserialize_result(_cached)
+            except Exception as _ce:
+                _log.debug("[vcp] cache deserialize error %s: %s", symbol, _ce)
+
     # ── Tier 1: Haiku pre-screen ─────────────────────────────────────────────
     h_prompt = _build_haiku_prompt(symbol, df, quant, last_candle)
     h_data   = _call_haiku(symbol, h_prompt)
@@ -717,6 +792,15 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
         _log.info("[vcp] ✓ %s | conf=%.0f%% | entry=$%.2f SL=$%.2f Q%d/5 candle=%s%s [%s]",
                   symbol, confidence * 100, breakout, stop_loss, quality,
                   last_candle, vol_tag, tier_label)
+    # Cache result so same symbol skips Claude re-analysis tonight
+    try:
+        _cd = _serialize_result(result)
+        _cd["date"] = str(date.today())
+        _vcp_cache[_cache_key] = _cd
+        _save_vcp_cache(_vcp_cache)
+    except Exception as _se:
+        _log.debug("[vcp] cache save failed %s: %s", symbol, _se)
+
     return result
 
 
