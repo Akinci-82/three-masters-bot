@@ -116,7 +116,9 @@ Reads `logs/trade_journal.jsonl` (all-time) and reports:
 ## Patch 10 upgrades (added 2026-05-08)
 - **FOMC post-announcement lift**: `_is_macro_blackout()` now allows trades on FOMC day if UTC clock >= 20:00 (14:00 ET). Decision already announced => binary risk resolved. Pre-announcement protection (delta 1-2 days + same day before 20:00 UTC) unchanged.
 - **Why**: Scanner runs 22:30 CEST (20:30 UTC). Without this fix, evening scan on FOMC day blocked orders that would execute *next morning* -- after Fed reaction is fully priced in. CPI blackout logic unchanged (no single known announcement time).
+- **WebSocket stream monitoring loop** (`order_stream.py`): replaced bare `stream_thread.join()` with a 10 s polling loop. The old bare join hung forever if the WS stalled without firing a disconnect event -- reconnect never triggered. New loop also pings Alpaca REST every 90 s; if ping fails (auth error), stream is force-stopped and reconnects immediately via the existing exponential backoff.
 ## Commits (latest first)
+- `PENDING` -- fix: WS stream polling loop + REST auth ping every 90s (order_stream.py) (2026-05-08)
 - `cf0a1b2` -- fix: lift FOMC blackout post-announcement (>=20:00 UTC same day) (2026-05-08)
 - `cf82859` — docs: README for Patches 8 and 9 (2026-05-07)
 - `daed90c` — Patch 9: VIX slope, EPS revision, RS vs sector, win streak, super-sector, limit exits, alerts (2026-05-07)

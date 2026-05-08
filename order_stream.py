@@ -174,11 +174,31 @@ def _stream_loop(stop_event: threading.Event) -> None:
         alerted    = False
         _log.info("[stream] Connected to Alpaca trade stream")
 
-        # Wait for the stream to disconnect naturally
-        stream_thread.join()
+        # Monitor the connected stream every 60 s instead of a bare join().
+        # A bare join() hangs forever if the WS stalls without firing a disconnect.
+        _REST_PING_INTERVAL = 90   # ping Alpaca REST every 90 s to verify auth
+        _t_last_ping = time.monotonic()
+
+        while not stop_event.is_set() and stream_thread.is_alive():
+            now = time.monotonic()
+            if now - _t_last_ping >= _REST_PING_INTERVAL:
+                try:
+                    import broker as _bk_ping
+                    _bk_ping.get_account()
+                    _t_last_ping = now
+                except Exception as _ping_err:
+                    _log.error("[stream] REST ping failed — forcing reconnect: %s", _ping_err)
+                    _stop_stream(stream)
+                    break
+            stop_event.wait(10)
 
         if stop_event.is_set():
+            _stop_stream(stream)
+            stream_thread.join(timeout=10)
             break
+
+        # Give stream thread a moment to clean up before we reconnect
+        stream_thread.join(timeout=10)
 
         elapsed = time.monotonic() - t_start
         _log.info(
