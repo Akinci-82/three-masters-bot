@@ -974,10 +974,55 @@ def _simons_score(trend) -> float:
     ath_pts = 0.5 if getattr(trend, "near_ath", False) else 0.0
     # Weekly Stage 2: MA10w > MA30w + MA30w slope rising = multi-timeframe alignment
     ws2_pts = 0.5 if getattr(trend, "weekly_stage2", False) else 0.0
+    # Weekly breakout alignment: daily pivot coincides with weekly 5-week high breakout
+    wba_pts = 0.5 if getattr(trend, "weekly_breakout_aligned", False) else 0.0
+    # Analyst upgrades: net positive analyst activity = institutional attention building
+    aug_pts = 0.25 if getattr(trend, "analyst_upgrades", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
-               + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts, 10.0)
+               + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts + wba_pts + aug_pts, 10.0)
+
+
+def _qqq_size_factor() -> float:
+    """
+    Returns 0.75 when QQQ is below its 50-day MA — growth stocks in unfavorable regime.
+    VCPs are predominantly growth stocks; QQQ weakness = direct headwind.
+    """
+    try:
+        import yfinance as _yf_qq
+        _qqq = _yf_qq.Ticker("QQQ").history(
+            period="80d", interval="1d", auto_adjust=True)["Close"]
+        if len(_qqq) >= 51:
+            _ma50_qq = float(_qqq.tail(50).mean())
+            if float(_qqq.iloc[-1]) < _ma50_qq:
+                _log.info("[tudor] QQQ below MA50 — growth regime weak, sizing capped 75%%")
+                return 0.75
+    except Exception:
+        pass
+    return 1.0
+
+
+def _fetch_credit_spread_factor() -> float:
+    """
+    Returns 0.80 when HYG/LQD ratio drops >2% over 5 days — widening credit spreads
+    signal risk-off before it shows in equities. Leading indicator vs VIX (coincident).
+    """
+    try:
+        import yfinance as _yf_cs
+        import pandas as _pd_cs
+        _cs_df = _yf_cs.download(["HYG", "LQD"], period="15d", interval="1d",
+                                   auto_adjust=True, progress=False)["Close"]
+        if "HYG" in _cs_df.columns and "LQD" in _cs_df.columns and len(_cs_df) >= 6:
+            _ratio   = _cs_df["HYG"] / _cs_df["LQD"]
+            _chg5d   = (float(_ratio.iloc[-1]) - float(_ratio.iloc[-6])) / float(_ratio.iloc[-6])
+            if _chg5d < -0.02:
+                _log.info("[tudor] Credit spread widening (HYG/LQD %.1f%% 5d) — sizing 80%%",
+                          abs(_chg5d) * 100)
+                return 0.80
+    except Exception:
+        pass
+    return 1.0
 
 
 def _extended_market_factor() -> float:
@@ -1438,6 +1483,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.info("[simons] Universe: %d symbols", len(symbols))
         screen_results = screen_universe(symbols=symbols)
         trend_passed = [r for r in screen_results if r.passed]
+        # RVOL pre-filter: remove dormant stocks (rvol_5d < 0.8) before expensive VCP analysis
+        _before_rvol = len(trend_passed)
+        trend_passed = [r for r in trend_passed if r.rvol_5d >= 0.8]
+        if len(trend_passed) < _before_rvol:
+            _log.info("[main] RVOL filter: %d dormant candidates removed (rvol_5d < 0.8)",
+                      _before_rvol - len(trend_passed))
         # Market breadth: % of screened universe above MA50 (Tudor Jones signal)
         _breadth_pct = (sum(1 for r in screen_results if r.price > r.ma50 > 0)
                         / max(len(screen_results), 1))
@@ -1544,6 +1595,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                   spy_pct * 100)
 
     _extended_factor = _extended_market_factor()
+    _qqq_factor      = _qqq_size_factor()
+    _cs_factor       = _fetch_credit_spread_factor()
 
     # ── Macro blackout: skip new orders within 2 days of FOMC/CPI ────────────
     _blackout, _blackout_reason = _is_macro_blackout()
@@ -1810,7 +1863,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _atr_f    = _atr_volatility_factor(vcp.symbol, vcp.breakout_level)
         if _atr_f < 1.0:
             _log.info("[main] %s ATR factor %.0f%% — elevated volatility", vcp.symbol, _atr_f * 100)
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
@@ -1838,6 +1891,20 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             _log.info("[main] %s notional $%.0f > cash $%.0f — skip",
                       vcp.symbol, sizing["notional"], cash)
             continue
+
+        # Liquidity gate: position must not exceed 2% of 20-day avg dollar volume
+        try:
+            import yfinance as _yf_liq
+            _liq = _yf_liq.Ticker(vcp.symbol).history(
+                period="30d", interval="1d", auto_adjust=True)
+            if len(_liq) >= 20:
+                _adv = float((_liq["Close"] * _liq["Volume"]).tail(20).mean())
+                if _adv > 0 and sizing["notional"] > _adv * 0.02:
+                    _log.info("[main] %s skipped — notional $%.0f > 2%% avg dollar vol ($%.0f)",
+                              vcp.symbol, sizing["notional"], _adv)
+                    continue
+        except Exception:
+            pass
 
         if vcp.current_price >= vcp.breakout_level * 1.005:
             _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — skip",

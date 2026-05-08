@@ -354,6 +354,9 @@ class TrendResult:
     vol_contraction_quality: float = 0.0  # 0=none 0.5=partial 1.0=perfect vol decline in base
     near_ath: bool            = False  # price within 2% of 3-year high (no major overhead supply)
     weekly_stage2: bool       = False  # MA10w > MA30w AND MA30w slope rising (multi-TF Stage 2)
+    rvol_5d: float            = 0.0   # 5d avg vol / 60d avg vol (>1.5 = stock is in play)
+    weekly_breakout_aligned: bool = False  # daily breakout aligns with weekly 5-week high
+    analyst_upgrades: bool    = False  # net analyst upgrades > downgrades in last 60 days
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -702,9 +705,21 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             pass
         result.vol_contraction_quality = _vq
 
-        # Near ATH + weekly Stage 2: single 3-year weekly fetch
+        # RVOL 5-day: uses df already fetched — no extra API call
+        _rvol_5d = 0.0
+        try:
+            _rv_recent = float(df["Volume"].tail(5).mean())
+            _rv_base   = float(df["Volume"].tail(65).iloc[:-5].mean())
+            if _rv_base > 0:
+                _rvol_5d = round(_rv_recent / _rv_base, 2)
+        except Exception:
+            pass
+        result.rvol_5d = _rvol_5d
+
+        # Near ATH + weekly Stage 2 + weekly breakout alignment: single 3-year weekly fetch
         _near_ath = False
         _wk_s2    = False
+        _wk_bo    = False
         try:
             _wk3y = ticker.history(period="3y", interval="1wk", auto_adjust=True)
             if len(_wk3y) >= 10:
@@ -717,10 +732,36 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     _ma30w     = float(_c3y.tail(30).mean())
                     _ma30w_prv = float(_c3y.iloc[-34:-4].mean())
                     _wk_s2     = _ma10w > _ma30w and _ma30w > _ma30w_prv
+                if len(_wk3y) >= 6:
+                    # Weekly breakout alignment: current week high >= 5-week prior high
+                    _wk5h = float(_wk3y["High"].iloc[-6:-1].max())
+                    _wk_bo = float(_wk3y["High"].iloc[-1]) >= _wk5h
         except Exception:
             pass
-        result.near_ath      = _near_ath
-        result.weekly_stage2 = _wk_s2
+        result.near_ath               = _near_ath
+        result.weekly_stage2          = _wk_s2
+        result.weekly_breakout_aligned = _wk_bo
+
+        # Analyst upgrades: net Buy/Outperform > Sell/Underperform in last 60 days
+        _analyst_up = False
+        try:
+            _upg_df = ticker.upgrades_downgrades
+            if _upg_df is not None and not _upg_df.empty:
+                _upg_df = _upg_df.reset_index()
+                _dcol = next((c for c in _upg_df.columns if "date" in c.lower()), None)
+                _gcol = next((c for c in _upg_df.columns
+                              if "tograde" in c.lower() or "action" in c.lower()), None)
+                if _dcol and _gcol:
+                    _upg_df["_dt"] = pd.to_datetime(_upg_df[_dcol], utc=True, errors="coerce")
+                    _cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=60)
+                    _gr = _upg_df[_upg_df["_dt"] >= _cutoff][_gcol].str.lower()
+                    _pos = int(_gr.str.contains("buy|outperform|overweight|upgrade").sum())
+                    _neg = int(_gr.str.contains("sell|underperform|underweight|downgrade").sum())
+                    _analyst_up = _pos > _neg and _pos >= 1
+        except Exception:
+            pass
+        result.analyst_upgrades = _analyst_up
+
         if _near_ath:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)
         if _wk_s2:

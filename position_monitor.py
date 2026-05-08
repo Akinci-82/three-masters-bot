@@ -482,6 +482,7 @@ def check_positions() -> None:
             meta = _lookup_position_metadata(symbol)
             sym["_meta_loaded"]       = True
             sym["stop_loss"]          = meta["stop_loss"]
+            sym["stop_loss_initial"]  = meta["stop_loss"]  # preserved for R-multiple calc
             sym["quality_score"]      = meta["quality_score"]
             sym["composite_score"]    = meta["composite_score"]
             sym["measured_move_pct"]  = meta["measured_move_pct"]
@@ -886,6 +887,34 @@ def check_positions() -> None:
                         changed = True
                         _log.info("[monitor] %s PROFIT LOCK +15%%: stop raised to +7%% ($%.2f)",
                                   symbol, _lock_stop)
+
+        # ── Step R: 2R profit lock — when gain reaches 2R, stop moves to 1R ──────
+        # More precise than the +8% breakeven: uses actual risk of this specific trade.
+        # A 5% stop trade needs +10% to hit 2R; a 3% stop needs only +6%.
+        _sli = sym.get("stop_loss_initial", 0.0)
+        _rps = (avg_cost - _sli) if _sli > 0 and _sli < avg_cost else 0.0
+        if (_rps > 0
+                and not sym.get("two_r_stop_done")
+                and not sym.get("partial2_done")
+                and (cur_price - avg_cost) >= 2 * _rps):
+            _one_r_stop = round(avg_cost + _rps, 2)
+            _cur_stp_r  = sym.get("stop_loss", 0.0)
+            if _one_r_stop > _cur_stp_r:
+                _rem_r = qty - sym.get("partial_qty", 0)
+                if _rem_r > 0:
+                    _cancel_stop_orders(symbol)
+                    _r_oid = _place_stop(symbol, _rem_r, _one_r_stop)
+                    if _r_oid:
+                        sym["two_r_stop_done"] = True
+                        sym["breakeven_done"]  = True
+                        sym["stop_loss"]       = _one_r_stop
+                        sym["stop_order_id"]   = _r_oid
+                        changed = True
+                        _log.info(
+                            "[monitor] %s 2R LOCK: stop $%.2f → $%.2f "
+                            "(pnl=+%.1f%%, 1R=$%.2f)",
+                            symbol, _cur_stp_r, _one_r_stop,
+                            pnl_pct * 100, _rps)
 
         # ── Step G2: Runner upgrade — widen trail to 8% when past 2× measured move ─
         # Position has proven itself past double the expected target; give the runner room.
