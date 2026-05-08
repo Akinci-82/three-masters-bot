@@ -4,14 +4,16 @@ Sends Telegram alert the moment a buy-stop fills.
 Runs in a background daemon thread — restarts automatically on disconnect.
 """
 from __future__ import annotations
-import asyncio
 import logging
 import os
 import threading
 import time
 
 _log = logging.getLogger(__name__)
-_RECONNECT_DELAY = 30
+
+_RECONNECT_BASE  = 30   # seconds before first retry
+_RECONNECT_MAX   = 300  # cap at 5 minutes
+_HEALTHY_MIN_SEC = 120  # session is "healthy" if it ran > 2 min before dropping
 
 
 def _tg(msg: str) -> None:
@@ -46,15 +48,15 @@ def _handle_trade_update(data) -> None:
         if event == "fill":
             _log.info("[stream] FILL %s %dsh @ $%.2f", symbol, qty_fill, avg_fill)
             _tg(
-                f"\u2705 *ORDER FILLED* \u2014 *{symbol}*\n"
+                f"✅ *ORDER FILLED* — *{symbol}*\n"
                 f"Filled: {qty_fill:.0f}sh @ ${avg_fill:.2f}\n"
-                f"Trailing stop will be placed at next monitor cycle (\u226415 min)."
+                f"Trailing stop will be placed at next monitor cycle (≤15 min)."
             )
         elif event == "partial_fill":
             _log.info("[stream] PARTIAL FILL %s %.0f/%.0f sh @ $%.2f",
                       symbol, qty_fill, qty_total, avg_fill)
             _tg(
-                f"\u26a1 *PARTIAL FILL* \u2014 *{symbol}*\n"
+                f"⚡ *PARTIAL FILL* — *{symbol}*\n"
                 f"Filled: {qty_fill:.0f}/{qty_total:.0f}sh @ ${avg_fill:.2f}"
             )
         elif event == "canceled":
@@ -77,7 +79,10 @@ def _stream_loop(stop_event: threading.Event) -> None:
 
     import alpaca_trade_api as tradeapi
 
+    fail_count = 0  # consecutive fast-fail count for exponential backoff
+
     while not stop_event.is_set():
+        t_start = time.monotonic()
         try:
             _log.info("[stream] Connecting to Alpaca trade stream...")
             stream = tradeapi.Stream(
@@ -94,12 +99,41 @@ def _stream_loop(stop_event: threading.Event) -> None:
             stream.subscribe_trade_updates(on_trade_update)
             stream.run()   # blocks until disconnect
 
+            # Normal disconnect (stream.run() returned without exception)
+            elapsed = time.monotonic() - t_start
+            if elapsed >= _HEALTHY_MIN_SEC:
+                fail_count = 0  # healthy session — reset backoff
+            _log.info("[stream] Stream ended after %.0fs — reconnecting in %ds",
+                      elapsed, _RECONNECT_BASE)
+            stop_event.wait(_RECONNECT_BASE)
+
         except Exception as e:
             if stop_event.is_set():
                 break
-            _log.warning("[stream] Disconnected: %s — reconnecting in %ds",
-                         e, _RECONNECT_DELAY)
-            stop_event.wait(_RECONNECT_DELAY)
+
+            elapsed = time.monotonic() - t_start
+
+            if elapsed < _HEALTHY_MIN_SEC:
+                # Fast fail: auth error, rate limit, or connection refused.
+                # The alpaca_trade_api library retries internally before raising,
+                # so by the time we get here it has already hammered Alpaca for
+                # several seconds. Apply exponential backoff to avoid HTTP 429 storms.
+                fail_count += 1
+                delay = min(_RECONNECT_BASE * (2 ** (fail_count - 1)), _RECONNECT_MAX)
+                _log.warning(
+                    "[stream] Fast fail #%d (%.0fs) — backoff %ds: %s",
+                    fail_count, elapsed, delay, e,
+                )
+            else:
+                # Healthy session dropped — reset backoff, short delay
+                fail_count = 0
+                delay = _RECONNECT_BASE
+                _log.warning(
+                    "[stream] Disconnected after %.0fs — reconnecting in %ds: %s",
+                    elapsed, delay, e,
+                )
+
+            stop_event.wait(delay)
 
     _log.info("[stream] Order fill stream stopped")
 
