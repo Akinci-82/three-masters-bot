@@ -95,6 +95,7 @@ class VCPResult:
     vol_at_multiweek_low: bool = False
     measured_move_pct: float = 0.0     # Claude estimate: full base height / entry price
     pattern_type: str  = "vcp"          # "vcp" | "cwh" | "both"
+    catalyst_score: float = 0.0         # parsed from ai_reasoning: strong/weak catalyst signals
 
     @property
     def risk_reward(self) -> float:
@@ -198,6 +199,21 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
     depth = (pattern_high - current_low) / pattern_high
     if depth > cfg.get("max_depth_from_high", 0.35):
         return False, {"reason": f"pattern_too_deep_{depth:.1%}"}
+
+    # Handle depth rule: handle must not retrace >50% of cup advance
+    # Deep handles = failed breakout attempts or distribution — Minervini rejects these
+    _cup_bottom   = float(df_r["Low"].iloc[:-10].min())
+    _cup_advance  = pattern_high - _cup_bottom
+    _handle_depth = pattern_high - current_low
+    if _cup_advance > 0 and _handle_depth / _cup_advance > 0.50:
+        return False, {"reason": f"handle_too_deep_{_handle_depth/_cup_advance:.0%}_of_cup"}
+
+    # Base freshness: pattern high must have formed >= 25 bars ago (base has matured)
+    # A fresh pivot means price is still correcting; true VCP needs time to consolidate
+    _high_idx       = int(high.argmax())
+    _bars_since_high = len(high) - _high_idx - 1
+    if _bars_since_high < 25:
+        return False, {"reason": f"pattern_high_too_recent_{_bars_since_high}bars"}
 
     # Final handle: last 10 bars.
     # Breakout = handle HIGH, stop = handle LOW — correct Minervini pivot levels.

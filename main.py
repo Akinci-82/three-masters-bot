@@ -788,7 +788,16 @@ def _minervini_score(vcp) -> float:
     vol_b  = 0.5 if getattr(vcp, "vol_at_multiweek_low", False) else 0.0
     bvol_b = 0.5 if getattr(vcp, "breakout_volume", False) else 0.0
     rs_b   = 1.0 if getattr(vcp, "rs_line_at_high", False) else 0.0
-    return min(q + conf + tight_b + vol_b + bvol_b + rs_b, 10.0)
+    # Catalyst scoring: parse ai_reasoning for positive/negative catalyst keywords
+    _ai_text = getattr(vcp, "ai_reasoning", "").lower()
+    _pos_kws = ("strong catalyst", "positive news", "earnings beat", "guidance raised",
+                "buyback", "fda approval", "contract win", "record revenue")
+    _neg_kws = ("weak catalyst", "no catalyst", "negative news", "earnings miss",
+                "guidance cut", "investigation", "recall")
+    _cat_pts = 0.25 * sum(1 for k in _pos_kws if k in _ai_text)
+    _cat_pts -= 0.25 * sum(1 for k in _neg_kws if k in _ai_text)
+    _cat_pts = max(min(_cat_pts, 0.5), -0.5)
+    return min(q + conf + tight_b + vol_b + bvol_b + rs_b + _cat_pts, 10.0)
 
 
 def _fetch_vix_slope() -> float:
@@ -961,10 +970,14 @@ def _simons_score(trend) -> float:
     # Volume contraction quality: consistent volume decline = controlled institutional base
     _vq_s   = getattr(trend, "vol_contraction_quality", 0.0)
     vq_pts  = 0.5 if _vq_s >= 1.0 else (0.25 if _vq_s >= 0.5 else 0.0)
+    # Near 3-year ATH: no overhead supply from prior distribution zones
+    ath_pts = 0.5 if getattr(trend, "near_ath", False) else 0.0
+    # Weekly Stage 2: MA10w > MA30w + MA30w slope rising = multi-timeframe alignment
+    ws2_pts = 0.5 if getattr(trend, "weekly_stage2", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
-               + twt_pts + obv_pts + base_pts + vq_pts, 10.0)
+               + twt_pts + obv_pts + base_pts + vq_pts + ath_pts + ws2_pts, 10.0)
 
 
 def _extended_market_factor() -> float:
@@ -1746,6 +1759,14 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if _super_cnt >= _max_super:
             _log.info("[main] %s skipped — super-sector '%s' at cap (%d/%d)",
                       vcp.symbol, _vcp_super, _super_cnt, _max_super)
+            continue
+
+        # Sector risk heat cap: never allocate >3% total risk to one sector
+        _sec_risk = sum(v for s, v in _rs_now.get("positions_risk", {}).items()
+                        if get_sector(s) == sec)
+        if _sec_risk >= 0.03:
+            _log.info("[main] %s skipped — sector '%s' risk heat %.1f%% at 3%% cap",
+                      vcp.symbol, sec, _sec_risk * 100)
             continue
 
         if _is_correlated(vcp.symbol, held_symbols):

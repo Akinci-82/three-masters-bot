@@ -352,6 +352,8 @@ class TrendResult:
     obv_new_high: bool        = False  # OBV at 52w high = institutional accumulation in base
     base_count: int           = 1      # prior VCP bases last 18mo (1-2=fresh, 3+=late stage)
     vol_contraction_quality: float = 0.0  # 0=none 0.5=partial 1.0=perfect vol decline in base
+    near_ath: bool            = False  # price within 2% of 3-year high (no major overhead supply)
+    weekly_stage2: bool       = False  # MA10w > MA30w AND MA30w slope rising (multi-TF Stage 2)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -699,6 +701,30 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         except Exception:
             pass
         result.vol_contraction_quality = _vq
+
+        # Near ATH + weekly Stage 2: single 3-year weekly fetch
+        _near_ath = False
+        _wk_s2    = False
+        try:
+            _wk3y = ticker.history(period="3y", interval="1wk", auto_adjust=True)
+            if len(_wk3y) >= 10:
+                _ath3    = float(_wk3y["High"].max())
+                _wk_cur  = float(_wk3y["Close"].iloc[-1])
+                _near_ath = _wk_cur >= _ath3 * 0.98
+                if len(_wk3y) >= 35:
+                    _c3y       = _wk3y["Close"]
+                    _ma10w     = float(_c3y.tail(10).mean())
+                    _ma30w     = float(_c3y.tail(30).mean())
+                    _ma30w_prv = float(_c3y.iloc[-34:-4].mean())
+                    _wk_s2     = _ma10w > _ma30w and _ma30w > _ma30w_prv
+        except Exception:
+            pass
+        result.near_ath      = _near_ath
+        result.weekly_stage2 = _wk_s2
+        if _near_ath:
+            _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)
+        if _wk_s2:
+            _log.debug("[screen] %s weekly Stage 2 confirmed", symbol)
 
         result.passed = True
         return result

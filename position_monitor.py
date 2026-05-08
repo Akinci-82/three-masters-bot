@@ -503,6 +503,27 @@ def check_positions() -> None:
                     _log.warning("[monitor] %s slippage >1%% (%.1f%%) — "
                                  "fill=$%.2f planned=$%.2f",
                                  symbol, _slip * 100, avg_cost, _planned)
+            # Breakout volume validation: if fill-day volume < 1.5x 60-day avg, tighten stop
+            # Low-volume breakouts have 3x higher failure rate — Minervini hard rule
+            try:
+                import yfinance as _yf_bv
+                _bv_df = _yf_bv.Ticker(symbol).history(
+                    period="90d", interval="1d", auto_adjust=True)
+                if len(_bv_df) >= 61:
+                    _bv_avg   = float(_bv_df["Volume"].iloc[-61:-1].mean())
+                    _bv_today = float(_bv_df["Volume"].iloc[-1])
+                    if _bv_avg > 0 and _bv_today < _bv_avg * 1.5:
+                        sym["weak_breakout_vol"] = True
+                        if sym.get("stop_loss", 0) > 0:
+                            _new_sl = round(avg_cost * 0.95, 2)
+                            if _new_sl > sym["stop_loss"]:
+                                _log.info("[monitor] %s weak breakout vol (%.0f%% of avg) — "
+                                          "tightening stop $%.2f -> $%.2f",
+                                          symbol, _bv_today / _bv_avg * 100,
+                                          sym["stop_loss"], _new_sl)
+                                sym["stop_loss"] = _new_sl
+            except Exception:
+                pass
             changed = True
 
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
