@@ -600,21 +600,38 @@ def check_positions() -> None:
         # Once per day: verify expected stop is still active; re-place if missing.
         _sv_today = datetime.now(_ET).strftime("%Y-%m-%d")
         if (sym.get("trailing_stop_placed")
-                and sym.get("stop_order_id")
                 and sym.get("_sv_date") != _sv_today
                 and not sym.get("time_stopped")
                 and not sym.get("max_loss_exited")):
             sym["_sv_date"] = _sv_today
             try:
-                _open_ords = _get_open_orders(symbol)
-                _stop_ids  = {o.get("id") for o in _open_ords
-                              if o.get("type") in ("stop", "trailing_stop", "stop_limit")}
-                if sym["stop_order_id"] not in _stop_ids and not _stop_ids:
-                    _sv_price = sym.get("stop_loss", round(avg_cost * 0.93, 2))
+                _open_ords  = _get_open_orders(symbol)
+                _stop_ords  = [o for o in _open_ords
+                               if o.get("type") in ("stop", "trailing_stop", "stop_limit")
+                               and o.get("side") == "sell"]
+                _stop_ids   = {o["id"] for o in _stop_ords}
+                _tracked_id = sym.get("stop_order_id", "")
+
+                if _tracked_id in _stop_ids:
+                    pass  # stop still active and tracked — nothing to do
+
+                elif _stop_ids:
+                    # A stop exists but under a different ID (e.g. trailing stop replaced hard stop).
+                    # Update tracking instead of alarming — this is NOT a missing stop.
+                    _new_id = max(_stop_ords, key=lambda o: o.get("submitted_at",""))["id"]
+                    _log.info("[monitor] %s stop ID changed %s → %s (stop active — updating tracking)",
+                              symbol, _tracked_id, _new_id)
+                    sym["stop_order_id"] = _new_id
+                    changed = True
+
+                else:
+                    # No stop orders found at all — genuine miss, re-place.
+                    # Guard against stop_loss=0.0 in state (falls back to 7% under avg cost).
+                    _sv_price = sym.get("stop_loss") or round(avg_cost * 0.93, 2)
                     _sv_rem   = qty - sym.get("partial_qty", 0)
-                    _log.warning("[monitor] %s STOP MISSING (was %s) — re-placing at $%.2f",
-                                 symbol, sym["stop_order_id"], _sv_price)
-                    _sv_oid = _place_stop(symbol, _sv_rem, _sv_price) if _sv_rem > 0 else None
+                    _log.warning("[monitor] %s STOP MISSING (was %s) — re-placing trailing stop %.0f%% trail",
+                                 symbol, _tracked_id, 7.0)
+                    _sv_oid = _place_trailing_stop(symbol, _sv_rem, 0.07) if _sv_rem > 0 else None
                     if _sv_oid:
                         sym["stop_order_id"] = _sv_oid
                         changed = True
@@ -623,13 +640,14 @@ def check_positions() -> None:
                         _tsv = _ossv.getenv("TELEGRAM_BOT_TOKEN", "")
                         _csv2 = _ossv.getenv("TELEGRAM_CHAT_ID", "")
                         if _tsv and _csv2:
+                            _status = "Re-placed 7% trailing stop" if _sv_oid else "Re-place FAILED — check manually"
                             _rqsv.post(
                                 f"https://api.telegram.org/bot{_tsv}/sendMessage",
                                 json={"chat_id": _csv2, "parse_mode": "Markdown",
                                       "text": (
                                           f"\u26a0\ufe0f *Stop Missing — {symbol}*\n"
                                           f"GTC stop not found on Alpaca\n"
-                                          f"Re-placed at ${_sv_price:.2f}"
+                                          f"{_status}"
                                       )},
                                 timeout=8)
                     except Exception:
