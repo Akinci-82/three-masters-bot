@@ -35,7 +35,9 @@ def _heartbeat_age_minutes() -> float | None:
         if not ts:
             return None
         dt  = datetime.fromisoformat(ts)
-        return round((datetime.utcnow() - dt).total_seconds() / 60, 1)
+        from datetime import timezone as _tz
+        dt_utc = dt.astimezone(_tz.utc) if dt.tzinfo else dt.replace(tzinfo=_tz.utc)
+        return round((datetime.now(_tz.utc) - dt_utc).total_seconds() / 60, 1)
     except Exception:
         return None
 
