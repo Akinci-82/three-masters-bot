@@ -678,6 +678,11 @@ def check_positions() -> None:
             _cancel_stop_orders(symbol)
             if _rem_z > 0 and _place_market_sell(symbol, _rem_z):
                 sym["failed_breakout_done"] = True
+                try:
+                    from risk_manager import record_pivot_failure as _rpf
+                    _rpf(symbol)
+                except Exception:
+                    pass
                 changed = True
                 try:
                     import requests as _rz, os as _oz

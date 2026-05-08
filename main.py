@@ -1570,12 +1570,13 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     held_symbols = {p["symbol"] for p in positions}
 
     # Re-entry cooldown: skip symbols stopped out within the last 5 trading days
-    from risk_manager import check_reentry_cooldown
+    from risk_manager import check_reentry_cooldown, check_pivot_failure_cooldown
     _before_cd = len(vcp_passed)
     vcp_passed  = [r for r in vcp_passed if not check_reentry_cooldown(r.symbol)]
+    vcp_passed  = [r for r in vcp_passed if not check_pivot_failure_cooldown(r.symbol)]
     _skipped_cd = _before_cd - len(vcp_passed)
     if _skipped_cd:
-        _log.info("[main] %d candidate(s) in re-entry cooldown — skipped", _skipped_cd)
+        _log.info("[main] %d candidate(s) in re-entry/pivot-failure cooldown — skipped", _skipped_cd)
 
     # Smart order management: retain unchanged orders, cancel stale/moved ones
     orders_to_skip = _smart_order_management(vcp_passed, held_symbols)
@@ -1612,6 +1613,20 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # ── Three Masters composite scoring: weight all three layers ─────────────
     _rs_now = _get_rs()
     _current_vix = _fetch_vix()
+    # VIX spike: if VIX jumps >15% in a single session, markets are in sudden distress
+    _vix_spike_today = False
+    try:
+        import yfinance as _yf_vs
+        _vix_hist = _yf_vs.Ticker("^VIX").history(period="5d", interval="1d", auto_adjust=False)
+        if len(_vix_hist) >= 2:
+            _vix_prev = float(_vix_hist["Close"].iloc[-2])
+            _vix_chg  = (_current_vix - _vix_prev) / _vix_prev if _vix_prev > 0 else 0.0
+            if _vix_chg > 0.15:
+                _vix_spike_today = True
+                _log.warning("[tudor] VIX SPIKE: %.1f → %.1f (+%.0f%%) — sudden market distress",
+                             _vix_prev, _current_vix, _vix_chg * 100)
+    except Exception:
+        pass
     _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
     sector_momentum, sector_stage2 = _sector_momentum_scores()
     _power_trend      = _fetch_power_trend()
@@ -1728,6 +1743,12 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             f"no new orders (Tudor Jones: never add risk on a bad day)")
         max_new_pos = 0
 
+    # VIX spike filter: single-day VIX jump >15% = sudden market distress → pause entries
+    if _vix_spike_today and max_new_pos > 0:
+        _log.warning("[tudor] VIX SPIKE >15%% — all new orders blocked for today")
+        _tg("🚨 *VIX Spike — orders paused*\nVIX jumped >15% today — no new breakout entries (sudden market distress)")
+        max_new_pos = 0
+
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
             _log.info("[main] Max new positions reached (%d) — stopping.", RISK["max_positions"])
@@ -1768,6 +1789,17 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             _log.info("[main] %s skipped — sector '%s' risk heat %.1f%% at 3%% cap",
                       vcp.symbol, sec, _sec_risk * 100)
             continue
+
+        # Sector RS hard filter: reject if sector is bottom-half ranked with negative momentum
+        _sec_etf_v = _SECTOR_ETF_MAP.get(sec)
+        if _sec_etf_v and sector_momentum:
+            _all_rnk = sorted(sector_momentum.keys(), key=lambda e: -sector_momentum[e])
+            _n_rnk   = len(_all_rnk)
+            _sec_rnk = (_all_rnk.index(_sec_etf_v) + 1) if _sec_etf_v in _all_rnk else _n_rnk
+            if _sec_rnk > _n_rnk // 2 and sector_momentum.get(_sec_etf_v, 0) < -0.005:
+                _log.info("[main] %s skipped — sector '%s' rank %d/%d bottom-half, negative RS",
+                          vcp.symbol, sec, _sec_rnk, _n_rnk)
+                continue
 
         if _is_correlated(vcp.symbol, held_symbols):
             _log.info("[main] %s skipped — high correlation with existing position", vcp.symbol)
