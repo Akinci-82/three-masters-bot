@@ -613,6 +613,26 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             result.fail_reason = f"eps_declining({eps_g:.0%})"
             return result
 
+        # Balance sheet quality gate: Minervini — avoid financially stressed companies
+        # FCF < 0 = burning cash; D/E ≥ 2.0 = over-leveraged; current ratio < 1 = liquidity risk
+        try:
+            _bs_info = ticker.info
+            _fcf     = _bs_info.get("freeCashflow")
+            _de      = _bs_info.get("debtToEquity")        # reported as percentage, e.g. 150 = 1.5×
+            _cr      = _bs_info.get("currentRatio")
+            _bs_fail = None
+            if _fcf is not None and float(_fcf) < 0:
+                _bs_fail = f"fcf_negative(${float(_fcf)/1e6:.0f}M)"
+            elif _de is not None and float(_de) > 200:     # >200 = D/E > 2.0×
+                _bs_fail = f"debt_equity_high({float(_de)/100:.1f}x)"
+            elif _cr is not None and float(_cr) < 1.0:
+                _bs_fail = f"current_ratio_low({float(_cr):.2f})"
+            if _bs_fail:
+                result.fail_reason = _bs_fail
+                return result
+        except Exception:
+            pass    # yfinance data missing — allow through, don't block on data gaps
+
         result.rs_line_at_high = _rs_line_new_high(close, spy_close)
         if result.rs_line_at_high:
             _log.debug("[screen] %s RS line at 52-week high — strong signal", symbol)

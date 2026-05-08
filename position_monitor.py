@@ -1629,6 +1629,39 @@ def check_positions() -> None:
                 portfolio_value = get_account()["portfolio_value"]
                 close_trade(sym, pnl_pct, portfolio_value)   # start_value read from risk_state
                 _journal_trade(sym, sym_data, pnl_pct, portfolio_value)
+
+                # OP1: Update signal accuracy on trade close
+                try:
+                    import json as _jsa2, os as _osa2
+                    _sa_path = _osa2.path.join(_osa2.path.dirname(__file__),
+                                               "logs", "signal_accuracy.json")
+                    if _osa2.path.exists(_sa_path):
+                        _sa2 = _jsa2.loads(open(_sa_path).read())
+                        _r_mult = float(sym_data.get("composite_score", 0))
+                        _won    = pnl_pct > 0
+                        _sig_names2 = [
+                            "rs_line_at_high", "rs_line_leading", "eps_accelerating",
+                            "rev_accelerating", "three_weeks_tight", "pocket_pivot",
+                            "insider_buying", "industry_leader", "eps_revision_up",
+                            "accum_weeks_strong", "analyst_pt_upside",
+                            "inst_ownership_increasing", "near_ath", "weekly_stage2",
+                            "pead_hold",
+                        ]
+                        _r_val = ((float(sym_data.get("last_price", 0))
+                                   - float(sym_data.get("avg_cost", 0)))
+                                  / max(float(sym_data.get("avg_cost", 0))
+                                        - float(sym_data.get("stop_loss_initial", 0)), 0.001))
+                        for _sig2 in _sig_names2:
+                            if _sig2 in _sa2 and sym_data.get(_sig2):
+                                if _won:
+                                    _sa2[_sig2]["wins"]   += 1
+                                else:
+                                    _sa2[_sig2]["losses"] += 1
+                                _sa2[_sig2]["total_r"] = round(
+                                    _sa2[_sig2].get("total_r", 0.0) + _r_val, 3)
+                        open(_sa_path, "w").write(_jsa2.dumps(_sa2, indent=2))
+                except Exception:
+                    pass
                 # Re-entry cooldown: block stop-outs from re-entering for 5 trading days
                 if pnl_pct < 0:
                     record_stop_out(sym)

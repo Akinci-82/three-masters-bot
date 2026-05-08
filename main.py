@@ -332,6 +332,38 @@ def _send_morning_briefing() -> None:
             except Exception:
                 pass
 
+        # ── PM12: Pre-market gap alert for last night's scan candidates ──────────
+        # Stocks screened last night that weren't ordered but are now moving pre-market
+        # can signal today's best breakout opportunity before market opens.
+        try:
+            import json as _jpm, yfinance as _yf_pm
+            _rpt_files = sorted(REPORT_DIR.glob("*.json"), reverse=True)
+            if _rpt_files:
+                _last_rpt = _jpm.loads(_rpt_files[0].read_text())
+                _scanned  = [
+                    s for s in _last_rpt.get("vcp_passed", [])
+                    if s not in {p["symbol"] for p in positions}
+                ]
+                _pm_alerts = []
+                for _pm_sym in _scanned[:12]:   # cap at 12 to avoid rate-limit
+                    try:
+                        _fi_pm    = _yf_pm.Ticker(_pm_sym).fast_info
+                        _pre_pm   = getattr(_fi_pm, "last_price", None)
+                        _prev_pm  = getattr(_fi_pm, "previous_close", None)
+                        if _pre_pm and _prev_pm and _prev_pm > 0:
+                            _g = (_pre_pm - _prev_pm) / _prev_pm
+                            if _g >= 0.03:
+                                _pm_alerts.append(
+                                    f"  🔥 *{_pm_sym}* +{_g*100:.1f}%% pre-market"
+                                    f" ${_pre_pm:.2f} — scan candidate breaking out")
+                    except Exception:
+                        pass
+                if _pm_alerts:
+                    lines.append("\n*Pre-market breakout candidates:*")
+                    lines.extend(_pm_alerts)
+        except Exception as _pme:
+            _log.debug("[briefing] PM12 scan candidates: %s", _pme)
+
         _tg("\n".join(lines))
         _log.info("[briefing] Morning briefing sent")
     except Exception as e:
@@ -1103,6 +1135,24 @@ def _extended_market_factor() -> float:
     return 1.0
 
 
+def _fetch_dxy_factor() -> float:
+    """DXY rising >2% in 20 days = dollar strength = headwind for growth stocks.
+    Uses UUP (Invesco Dollar Bullish ETF) as proxy. Returns 0.85 on strong dollar.
+    """
+    try:
+        import yfinance as _yf_dxy
+        _dxy = _yf_dxy.Ticker("UUP").history(period="30d", interval="1d", auto_adjust=True)["Close"]
+        if len(_dxy) >= 21:
+            _dxy_ret = float(_dxy.iloc[-1] / _dxy.iloc[-21] - 1)
+            if _dxy_ret > 0.02:
+                _log.info("[main] DXY +%.1f%% (20d) — dollar strength, risk_pct -15%%",
+                          _dxy_ret * 100)
+                return 0.85
+    except Exception:
+        pass
+    return 1.0
+
+
 def _portfolio_beta_factor(positions: list) -> float:
     """Weighted portfolio beta vs SPY over 60 days.
     If beta > 1.5 (over-concentrated in high-beta names) → size new entries at 80%%.
@@ -1235,6 +1285,41 @@ def _compute_ad_divergence(breadth_pct: float) -> bool:
         return False
 
 
+_VTS_CACHE: tuple[float, float] = (0.0, 0.0)
+
+def _vix_term_structure_pts() -> float:
+    """VIX / VIX3M ratio as precision market-timing signal.
+    Backwardation (VIX > VIX3M * 1.05) = fear spike usually exhausting → +0.25 Tudor pts.
+    Deep contango (VIX3M > VIX * 1.15) = market pricing in rising future risk → -0.25 pts.
+    Cached 4 hours.
+    """
+    global _VTS_CACHE
+    _vts_pts, _vts_ts = _VTS_CACHE
+    import time as _time_vts
+    if _time_vts.time() - _vts_ts < 14400:
+        return _vts_pts
+    try:
+        import yfinance as _yf_vts
+        _vd = _yf_vts.download(["^VIX", "^VIX3M"], period="5d", interval="1d",
+                                progress=False, auto_adjust=False)["Close"]
+        _vix_now  = float(_vd["^VIX"].dropna().iloc[-1])
+        _vix3m    = float(_vd["^VIX3M"].dropna().iloc[-1])
+        if _vix3m > 0:
+            _ratio = _vix_now / _vix3m
+            if _ratio > 1.05:
+                _pts = 0.25    # backwardation: fear spike, often marks short-term bottom
+            elif _ratio < (1 / 1.15):
+                _pts = -0.25   # deep contango: market pricing in sustained future vol
+            else:
+                _pts = 0.0
+        else:
+            _pts = 0.0
+        _VTS_CACHE = (_pts, _time_vts.time())
+        return _pts
+    except Exception:
+        return 0.0
+
+
 _YC_CACHE:  tuple[bool, float] = (False, 0.0)
 _CSW_CACHE: tuple[bool, float] = (False, 0.0)
 
@@ -1323,7 +1408,9 @@ def _tudor_score(risk_state: dict, regime: str, breadth_pct: float = 0.5,
     yc_pts  = -0.5 if _yield_curve_inverted() else 0.0
     # Credit spreads: HYG falling relative to TLT = institutional risk-off signal
     csw_pts = -0.5 if _credit_spreads_wide() else 0.0
-    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts + ad_div_pts + yc_pts + csw_pts, 10.0)
+    # VIX term structure: backwardation = fear exhausting (+0.25); deep contango = rising risk (-0.25)
+    vts_pts = _vix_term_structure_pts()
+    return min(reg_pts + loss_pts + heat_pts + breadth_pts + power_pts + pcr_pts + rate_pts + vix_pts + dist_pts + nh_nl_pts + breadth_dir_pts + ad_div_pts + yc_pts + csw_pts + vts_pts, 10.0)
 
 
 def _composite_score(vcp, trend, risk_state: dict, regime: str,
@@ -1750,6 +1837,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _qqq_factor      = _qqq_size_factor()
     _cs_factor       = _fetch_credit_spread_factor()
     _beta_f          = _portfolio_beta_factor(positions)
+    _dxy_f           = _fetch_dxy_factor()
 
     # ── Macro blackout: skip new orders within 2 days of FOMC/CPI ────────────
     _blackout, _blackout_reason = _is_macro_blackout()
@@ -2090,7 +2178,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                               vcp.symbol, _gap_open, _gap_prev_h)
         except Exception:
             pass
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor * _gap_up_f * _beta_f
+        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor * _gap_up_f * _beta_f * _dxy_f
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
@@ -2174,6 +2262,27 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
         held_symbols.add(vcp.symbol)
+
+        # OP1: Log active signals for this order to signal_accuracy.json
+        try:
+            import json as _jsa
+            _sa_file = LOG_DIR / "signal_accuracy.json"
+            _sa = _jsa.loads(_sa_file.read_text()) if _sa_file.exists() else {}
+            _sig_names = [
+                "rs_line_at_high", "rs_line_leading", "eps_accelerating", "rev_accelerating",
+                "three_weeks_tight", "pocket_pivot", "insider_buying", "industry_leader",
+                "eps_revision_up", "accum_weeks_strong", "analyst_pt_upside",
+                "inst_ownership_increasing", "near_ath", "weekly_stage2",
+                "pead_hold",
+            ]
+            _active = [s for s in _sig_names if getattr(trend_r, s, False)]
+            for _sig in _active:
+                if _sig not in _sa:
+                    _sa[_sig] = {"orders": 0, "wins": 0, "losses": 0, "total_r": 0.0}
+                _sa[_sig]["orders"] += 1
+            _sa_file.write_text(_jsa.dumps(_sa, indent=2))
+        except Exception:
+            pass
 
         vol_tag = " 🔥" if vcp.breakout_volume else ""
         _log.info(
