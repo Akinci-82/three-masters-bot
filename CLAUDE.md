@@ -20,20 +20,32 @@ Kvantitativ screening av 500+ S&P 500-aktier med Minervinis Trend Template:
 - Earnings ≥7 dagar bort
 - Veckodiagram: pris över MA10w + MA40w
 - Veckodiagram: senaste 4 veckors H-L < 15% av pris (tight base)
+- Månadsdiagram: pris över MA10m + MA40m (Stage 2 på tre tidshorisonter)
 - RS-line (aktie/SPY) på 52-veckors high → högsta prioritet
+- Weinstein Stage-klassificering: Stage 2 = bonus, Stage 3/4 = avdrag
+- Earnings acceleration: EPS-tillväxt accelererar Q-för-Q (Minervini SEPA-kärna)
+- Institutionellt ägande ≥ 5% (skydd mot pump-stocks utan smart money)
+- Market cap ≥ $500M | Pris ≥ $10 | Daglig dollar-volym ≥ $5M
 
 ### Lager 2 — Mark Minervini (vcp_analyzer.py)
 VCP-mönsteranalys via Claude AI i tre nivåer:
 - **Tier 0 (kvant):** segmentbaserad kontraktionskontroll, volymuttorkning (5d avg < 60% av 100d avg)
+- **Multi-handle detektion:** räknar distinkta swing-toppar — 3+ handles = +1 quality score bonus
 - **Tier 1 (Haiku):** kort prompt — bekräfta/avvisa VCP
 - **Tier 2 (Sonnet):** full 60-bars OHLCV-analys — breakout-nivå, stop, confidence, quality score
 - ATR-justerad stop: klämmer pivot-stop till 1–3× ATR
 
 ### Lager 3 — Paul Tudor Jones (risk_manager.py + position_monitor.py)
 - Riskstorlek: 1,5% per trade (→2% vid hög confidence)
+- **VIX-skalning:** VIX<15=100%, 15-20=90%, 20-25=80%, 25-30=65%, >30=50%
+- **Beta-justerad storlek:** beta>2.0=70%, beta>1.5=85%
 - Consecutive loss factor: 1 förlust=75%, 2=50%, 3+=33%
 - Marknadsregim: SPY vs MA200 (bull/neutral/bear) — bear blockerar alla ordrar
-- Max 8 positioner | Max 2 per sektor
+- **Bear-regim hedge:** köper SH (invers S&P500) vid bear-signal, 0.5% risk
+- **NH/NL hard block:** om NH/NL-ratio <0.25 i icke-bull regim → inga nya positioner
+- **Distribution days (IBD):** ≥5 dagar = −1.5 Tudor-poäng, ≥3 = −0.5
+- **Tvånivå-sektor-skip:** bottom-3 + neg momentum = alltid skip; bottom-half + neg = skip
+- Max 8 positioner | Max 2 per sektor | Max 60% i samma super-sektor
 - Portfolio heat-tak: 8%
 - Daglig förlustgräns: −4% | Drawdown-halt: −12%
 - Korrelationsguard: skippa om r≥0,80 med befintlig position
@@ -42,22 +54,47 @@ VCP-mönsteranalys via Claude AI i tre nivåer:
 
 | Steg | Trigger | Åtgärd |
 |------|---------|--------|
-| A | Position syns första gången | Lägg 7% trailing stop |
-| B | Vinst ≥ +15% | Sälj 50%, strama trailing stop till 5% |
+| A | Position syns första gången | ATR-dynamisk trailing stop (2×ATR, 4–12%) |
+| B1 | Vinst ≥ +10% (elite: +15%) | Sälj 33% |
+| P | Vinst 12–20%, dag 3+, över MA20 | **Pyramid: köp 30% extra** |
+| B2 | Vinst ≥ +20% (el. measured move) | Sälj 33% till, strama trailing till 5% |
 | C | Vinst ≥ +8% | Flytta stop till breakeven |
 | D | Hållen ≥15 handelsdagar OCH vinst <+2% | Time stop — stäng trög position |
+
+## Skyddsfilter mot spekulationsaktier
+
+Screener blockar aktivt följande typer (i ordning):
+1. Pris < $10
+2. Volym < 500k/dag eller dollar-volym < $5M/dag
+3. Marknadsregim bear (SPY >8% under MA200)
+4. Market cap < $500M
+5. EPS sjunkande >10%
+6. **Institutionellt ägande < 5%** ← stoppar pump-stocks, pre-revenue biotech m.fl.
+7. Balance sheet-problem (negativt FCF, hög skuldsättning)
+8. 4-veckors bas för bred (>15% H-L range)
+9. Månadsdiagram under MA10m
+10. VCP-mönster saknas (Tier 0→1→2 måste alla godkännas)
+
+## Re-entry cooldown
+
+| Situation | Cooldown |
+|-----------|----------|
+| Vanlig stop-out | 5 handelsdagar |
+| Stop-out på pyramiderad position | **2 handelsdagar** (shakeout ≠ botten-misslyckande) |
+| Pivotmisslyckande (dubbel failure) | 45 handelsdagar |
 
 ## Viktiga filer
 
 | Fil | Syfte |
 |-----|-------|
-| `main.py` | Orkestratör — regime, sektor, korrelation, sizing, ordrar |
-| `screener.py` | Simons: Trend Template + RS-line + weekly tight base |
-| `vcp_analyzer.py` | Minervini: VCP Tier 0→1→2, ATR-stop, vol dry-up |
-| `risk_manager.py` | Tudor Jones: sizing, circuit breakers |
-| `position_monitor.py` | Tudor Jones: trailing stop, partial exit, time stop |
+| `main.py` | Orkestratör — regime, sektor, korrelation, sizing, ordrar, VWAP-check |
+| `screener.py` | Simons: Trend Template + RS-line + weekly/monthly Stage 2 + inst.ägande |
+| `vcp_analyzer.py` | Minervini: VCP Tier 0→1→2, multi-handle, ATR-stop, vol dry-up |
+| `risk_manager.py` | Tudor Jones: sizing, circuit breakers, cooldown (5d/2d/45d) |
+| `position_monitor.py` | Tudor Jones: ATR trailing stop, partial exit, pyramid, time stop |
 | `position_sync.py` | Synk Alpaca↔bot-state (SyncError blockerar all handel) |
-| `broker.py` | Alpaca-ordrar |
+| `broker.py` | Alpaca-ordrar (buy-stop, sell-stop, market buy/sell) |
+| `backtest.py` | Backtesting: `--symbols`, `--years`, `--min-score`, `--out` |
 | `telegram_commands.py` | Tvåvägs-Telegram: /status /orders /positions /cancel /help |
 | `order_stream.py` | WebSocket fill-notifieringar |
 | `dashboard.py` | Flask-dashboard på port 5002 |
@@ -67,11 +104,25 @@ VCP-mönsteranalys via Claude AI i tre nivåer:
 
 | Fil | Innehåll |
 |-----|---------|
-| `logs/three_masters.log` | Huvudlogg |
+| `logs/stdout.log` | Huvudlogg (stdout + stderr) |
 | `logs/risk_state.json` | Live: heat, daglig P&L, consecutive losses |
-| `logs/monitor_state.json` | Per position: entry_date, stop order-ID, partial exit |
+| `logs/monitor_state.json` | Per position: entry_date, stop order-ID, partial/pyramid exit |
 | `logs/trade_journal.jsonl` | Avslutade trades med R-multiples |
 | `logs/sync_audit.jsonl` | Varje sync-körning (audit trail) |
+| `logs/weekly_backtest.json` | Senaste automatiska veckobacktest (skrivs varje söndag) |
+| `logs/feedback_state.json` | Win rate, expectancy, score-bucket-analys |
+| `logs/signal_accuracy.json` | Vilka screener-signaler korrelerar med vinst |
+
+## Automatiska jobb
+
+| Tid | Jobb |
+|-----|------|
+| 22:30 CEST dagligen | Daglig scan (Simons→Minervini→Tudor Jones) |
+| 15:15 CEST dagligen | Morning briefing (premarket-volym, PM12-lista) |
+| Var 15:e min (marknadstid) | Position monitor (trailing stop, partial, pyramid) |
+| 16:00 CEST (10:00 ET) | Opening range check (VWAP, volym, SPY/QQQ) |
+| Söndag 07:00 UTC (09:00 CEST) | **Auto backtest** (1 år, min-score 6.5) → Telegram |
+| Fredag kväll | Veckorapport (trades, stats, backtest-summary) till Telegram |
 
 ## Telegram-kommandon
 
@@ -95,9 +146,52 @@ journalctl --user -u three-masters-bot -f
 # Kör scan manuellt (test)
 cd /home/habil/three-masters-bot && venv/bin/python main.py --run-now
 
+# Kör backtest manuellt
+venv/bin/python backtest.py --years 1 --min-score 6.5
+
 # Visa risk-state
 cat logs/risk_state.json
 
 # Visa senaste trades
 tail -20 logs/trade_journal.jsonl | python3 -m json.tool
 ```
+
+## Ändringshistorik (senaste patches)
+
+### patch-17 — Strategi-förbättringar session 2 (2026-05-09)
+**screener.py**
+- Institutionellt ägande ≥ 5% som hårt filter (blockerar pump-stocks)
+
+**vcp_analyzer.py**
+- Multi-handle detektion: räknar swing-toppar i basen
+- 3+ handles → quality_score +1 (capped vid 5)
+- Handle-kontext skickas till Sonnet-prompten
+
+**broker.py**
+- `place_market_buy()` tillagd (används för pyramidering)
+
+**position_monitor.py**
+- Steg P (Pyramid): köper 30% extra vid +12–20% vinst, dag 3+, över MA20
+- `_place_market_buy()` REST-hjälpfunktion tillagd
+- Kortare re-entry cooldown (2 dagar) efter pyramid stop-out
+
+**risk_manager.py**
+- `record_stop_out()` får `cooldown_days`-parameter (default 5, pyramid=2)
+- `check_reentry_cooldown()` läser dynamiskt cooldown_days från state
+
+**Crontab**
+- Veckovis backtest varje söndag 07:00 UTC
+
+**main.py**
+- Fredagsrapporten inkluderar senaste backtest-summary från `logs/weekly_backtest.json`
+
+### patch-16 — Strategi-förbättringar session 1 (tidigare)
+- ATR-dynamisk trailing stop (2×ATR, 4–12%) i position_monitor.py
+- Beta-justerad positionsstorlek (`_beta_size_factor()`) i main.py
+- Bear-regim SH inverse ETF hedge i main.py
+- Hard NH/NL-block vid ratio <0.25 i main.py
+- Tvånivå-sektor-skip i main.py
+- Weinstein Stage 2-klassificering i screener.py + scoring i main.py
+- Premarket-volymtagg i morning briefing (main.py)
+- Förbättrad veckorapport: best/worst trades + avg hold (main.py)
+- VWAP-bekräftelse i opening range check (main.py)

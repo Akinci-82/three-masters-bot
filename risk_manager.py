@@ -272,17 +272,21 @@ def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
               symbol, pnl_pct * 100, state["open_risk_pct"] * 100, daily_pnl * 100)
 
 
-def record_stop_out(symbol: str, breakout_level: float = 0.0):
-    """Record a stop-out so the symbol is in re-entry cooldown for 5 trading days.
-    Stores breakout_level so check_reentry_cooldown can require price recovery.
+def record_stop_out(symbol: str, breakout_level: float = 0.0, cooldown_days: int = 5):
+    """Record a stop-out so the symbol is in re-entry cooldown.
+    Default 5 trading days; pass cooldown_days=2 for pyramided positions
+    (shorter cooldown because stop-out after a pyramid often reflects a shakeout
+    of the add-on shares, not a full base failure).
     """
     state = _load()
     state.setdefault("stop_out_cooldown", {})[symbol] = {
         "date":           str(date.today()),
         "breakout_level": round(breakout_level, 2),
+        "cooldown_days":  cooldown_days,
     }
     _save(state)
-    _log.info("[risk] %s stop-out recorded — 5-day cooldown (pivot=$%.2f)", symbol, breakout_level)
+    _log.info("[risk] %s stop-out recorded — %d-day cooldown (pivot=$%.2f)",
+              symbol, cooldown_days, breakout_level)
 
 
 def check_reentry_cooldown(symbol: str, current_price: float = 0.0) -> bool:
@@ -297,16 +301,18 @@ def check_reentry_cooldown(symbol: str, current_price: float = 0.0) -> bool:
     if isinstance(entry, str):
         stop_date_str   = entry
         prior_breakout  = 0.0
+        _cd_days        = 5
     else:
         stop_date_str   = entry.get("date", "")
         prior_breakout  = float(entry.get("breakout_level", 0.0))
+        _cd_days        = int(entry.get("cooldown_days", 5))
     if not stop_date_str:
         return False
     try:
         from pandas.tseries.offsets import BDay
         import pandas as _pd
         stop_dt      = _pd.Timestamp(stop_date_str)
-        cooldown_end = stop_dt + BDay(5)
+        cooldown_end = stop_dt + BDay(_cd_days)
         in_cooldown  = _pd.Timestamp.today() < cooldown_end
         if not in_cooldown:
             # Time cooldown expired — also check pivot recovery

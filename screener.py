@@ -369,6 +369,7 @@ class TrendResult:
     three_weeks_tight: bool   = False  # last 3 weekly closes within 1.5% (O'Neil institutional hold)
     short_mo_pts: float       = 0.0   # short interest monthly change: +0.25 covering, -0.25 building
     analyst_pt_upside: bool   = False  # analyst consensus PT > current price × 1.25
+    weinstein_stage: int      = 2      # 1=base, 2=uptrend, 3=top, 4=downtrend (Weinstein)
     fail_reason: str          = ""
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -612,6 +613,13 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             return result
         if eps_g is not None and eps_g < -0.10:
             result.fail_reason = f"eps_declining({eps_g:.0%})"
+            return result
+        # Institutional ownership floor: real VCP stocks have institutional sponsorship.
+        # Speculative pump-stocks, pre-revenue biotech and lottery tickets have near-zero
+        # institutional ownership. ≥5% = at least one serious fund has done due diligence.
+        # Only block if yfinance returns a confident reading (not None).
+        if inst_pct is not None and inst_pct < 0.05:
+            result.fail_reason = f"institutional_ownership_too_low({inst_pct:.1%})"
             return result
 
         # Balance sheet quality gate: Minervini — avoid financially stressed companies
@@ -1012,6 +1020,26 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             _log.info("[screen] %s near 3-year ATH — no overhead supply", symbol)
         if _wk_s2:
             _log.debug("[screen] %s weekly Stage 2 confirmed", symbol)
+
+        # ── Weinstein Stage classifier (Stan Weinstein method) ─────────────────
+        # Stage 1: Basing — price sideways near MA200, MA200 flat
+        # Stage 2: Advancing — price above rising MA200 (we only trade Stage 2)
+        # Stage 3: Top — price extended, MA200 still rising but decelerating
+        # Stage 4: Declining — price below MA200
+        try:
+            _ma200_slope_pct = ma200_slope  # already computed above
+            _pct_above_ma200 = (price - ma200) / ma200 if ma200 > 0 else 0
+            if price < ma200:
+                result.weinstein_stage = 4  # Stage 4: below MA200
+            elif _ma200_slope_pct <= 0.001:
+                result.weinstein_stage = 1  # Stage 1: flat MA200 = basing
+            elif _pct_above_ma200 > 0.20 and _ma200_slope_pct < 0.002:
+                result.weinstein_stage = 3  # Stage 3: extended, MA200 decelerating
+            else:
+                result.weinstein_stage = 2  # Stage 2: price above rising MA200
+            _log.debug("[screen] %s Weinstein Stage %d", symbol, result.weinstein_stage)
+        except Exception:
+            result.weinstein_stage = 2
 
         result.passed = True
         return result

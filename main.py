@@ -333,9 +333,10 @@ def _send_morning_briefing() -> None:
             except Exception:
                 pass
 
-        # ── PM12: Pre-market gap alert for last night's scan candidates ──────────
-        # Stocks screened last night that weren't ordered but are now moving pre-market
-        # can signal today's best breakout opportunity before market opens.
+        # ── PM12: Pre-market gap + volume screen for last night's scan candidates ──
+        # Stocks screened last night that weren't ordered but are now moving pre-market.
+        # Also checks premarket volume vs 30-day average to flag genuine breakouts
+        # vs low-conviction price moves (Minervini: volume confirms institutional intent).
         try:
             import json as _jpm, yfinance as _yf_pm
             _rpt_files = sorted(REPORT_DIR.glob("*.json"), reverse=True)
@@ -353,10 +354,32 @@ def _send_morning_briefing() -> None:
                         _prev_pm  = getattr(_fi_pm, "previous_close", None)
                         if _pre_pm and _prev_pm and _prev_pm > 0:
                             _g = (_pre_pm - _prev_pm) / _prev_pm
-                            if _g >= 0.03:
+                            if _g >= 0.02:
+                                # Check premarket volume via 1m bars
+                                _vol_tag = ""
+                                try:
+                                    _pm_1m = _yf_pm.Ticker(_pm_sym).history(
+                                        period="1d", interval="1m",
+                                        prepost=True, auto_adjust=True)
+                                    _pm_only = _pm_1m[
+                                        _pm_1m.index.tz_convert("America/New_York")
+                                        .time < __import__("datetime").time(9, 30)
+                                    ] if not _pm_1m.empty else _pm_1m
+                                    _pm_vol = float(_pm_only["Volume"].sum()) if not _pm_only.empty else 0
+                                    _avg30_df = _yf_pm.Ticker(_pm_sym).history(
+                                        period="30d", interval="1d", auto_adjust=True)
+                                    _avg30 = float(_avg30_df["Volume"].tail(30).mean()) if len(_avg30_df) >= 5 else 0
+                                    if _avg30 > 0:
+                                        _pm_vol_ratio = _pm_vol / (_avg30 * 0.15)  # vs ~15% typical premarket share
+                                        if _pm_vol_ratio >= 2.0:
+                                            _vol_tag = f" 🔥 vol {_pm_vol_ratio:.1f}×avg"
+                                        elif _pm_vol_ratio >= 1.0:
+                                            _vol_tag = f" vol {_pm_vol_ratio:.1f}×avg"
+                                except Exception:
+                                    pass
                                 _pm_alerts.append(
-                                    f"  🔥 *{_pm_sym}* +{_g*100:.1f}%% pre-market"
-                                    f" ${_pre_pm:.2f} — scan candidate breaking out")
+                                    f"  {'🔥' if _g>=0.03 else '📈'} *{_pm_sym}* "
+                                    f"+{_g*100:.1f}% pre-market ${_pre_pm:.2f}{_vol_tag}")
                     except Exception:
                         pass
                 if _pm_alerts:
@@ -459,6 +482,21 @@ def _opening_range_check() -> None:
                 except Exception:
                     vol_ok = True
 
+                # VWAP check: price must be above VWAP (institutional support)
+                # Below VWAP = selling pressure dominates, breakout momentum is fake
+                _vwap_ok = True
+                try:
+                    if not df1.empty and len(df1) >= 2:
+                        _tp   = (df1["High"] + df1["Low"] + df1["Close"]) / 3
+                        _vwap = float((_tp * df1["Volume"]).cumsum().iloc[-1]
+                                      / df1["Volume"].cumsum().iloc[-1])
+                        _vwap_ok = cur_price >= _vwap * 0.995
+                        if not _vwap_ok:
+                            _log.info("[or_check] %s price $%.2f below VWAP $%.2f",
+                                      sym, cur_price, _vwap)
+                except Exception:
+                    pass
+
                 if cur_price < stop_p * 0.998:
                     cancel_all_orders(sym)
                     rs = _lrs()
@@ -468,6 +506,16 @@ def _opening_range_check() -> None:
                     cancelled.append((sym, "no_price_confirm", cur_price, stop_p, 0))
                     _log.info("[or_check] CANCEL %s — price $%.2f below stop $%.2f",
                               sym, cur_price, stop_p)
+                elif not _vwap_ok:
+                    cancel_all_orders(sym)
+                    rs = _lrs()
+                    rs.get("positions_risk", {}).pop(sym, None)
+                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                    _srs(rs)
+                    vol_pct = vol_30min / vol_daily if vol_daily > 0 else 0
+                    cancelled.append((sym, "below_vwap", cur_price, stop_p, vol_pct))
+                    _log.info("[or_check] CANCEL %s — price $%.2f below VWAP (selling pressure)",
+                              sym, cur_price)
                 elif not vol_ok:
                     cancel_all_orders(sym)
                     rs = _lrs()
@@ -491,7 +539,12 @@ def _opening_range_check() -> None:
             lines = [f"🕙 *Opening Range Check (10:00 ET)*",
                      f"SPY {spy_chg:+.1%} | QQQ {qqq_chg:+.1%}"]
             for sym, reason, cur, stop, vol in cancelled:
-                tag = "no price confirm" if reason == "no_price_confirm" else f"weak vol {vol:.0%}"
+                if reason == "no_price_confirm":
+                    tag = f"price ${cur:.2f} < stop ${stop:.2f}"
+                elif reason == "below_vwap":
+                    tag = "below VWAP — selling pressure"
+                else:
+                    tag = f"weak vol {vol:.0%}"
                 lines.append(f"  ❌ *{sym}* ${cur:.2f} — {tag}")
             for sym, vol in kept:
                 lines.append(f"  ✅ *{sym}* — price + vol ({vol:.0%}) confirmed")
@@ -682,6 +735,65 @@ def _send_weekly_report(portfolio_value: float) -> None:
             lines.append(ret_line)
         lines.append(f"Portfolio: ${portfolio_value:,.0f}")
 
+        # ── Best & worst trades (all-time) ───────────────────────────────────
+        if total_trades >= 3:
+            _all_trades = []
+            if journal_file.exists():
+                for _atl in journal_file.read_text().splitlines():
+                    try:
+                        _all_trades.append(json.loads(_atl))
+                    except Exception:
+                        pass
+            if _all_trades:
+                _best  = max(_all_trades, key=lambda t: t.get("r_multiple", 0))
+                _worst = min(_all_trades, key=lambda t: t.get("r_multiple", 0))
+                lines.append("")
+                lines.append("*Best & worst trades (all-time):*")
+                lines.append(
+                    f"  🏆 {_best.get('symbol','?')}: "
+                    f"{_best.get('r_multiple',0):+.2f}R "
+                    f"({_best.get('pnl_pct',0):+.1f}%) on {_best.get('ts','?')[:10]}")
+                lines.append(
+                    f"  💔 {_worst.get('symbol','?')}: "
+                    f"{_worst.get('r_multiple',0):+.2f}R "
+                    f"({_worst.get('pnl_pct',0):+.1f}%) on {_worst.get('ts','?')[:10]}")
+
+        # ── Avg hold time: days-to-exit per trade ─────────────────────────────
+        if total_trades >= 3 and _all_trades:
+            import numpy as _np_ht
+            _hold_days = []
+            for _ht in _all_trades:
+                try:
+                    _ent = _ht.get("entry_date") or _ht.get("ts", "")[:10]
+                    _ext = _ht.get("ts", "")[:10]
+                    if _ent and _ext and len(_ent) == 10 and len(_ext) == 10:
+                        _hd = int(_np_ht.busday_count(_ent, _ext))
+                        if 0 < _hd < 120:
+                            _hold_days.append(_hd)
+                except Exception:
+                    pass
+            if _hold_days:
+                _avg_hold = sum(_hold_days) / len(_hold_days)
+                lines.append(f"  Avg hold: {_avg_hold:.0f} trading days")
+
+        # ── Last backtest results (written by Sunday cron job) ───────────────
+        try:
+            _bt_file = LOG_DIR / "weekly_backtest.json"
+            if _bt_file.exists():
+                import json as _jbt
+                _bt = _jbt.loads(_bt_file.read_text())
+                _bt_date = _bt.get("run_date", "?")
+                _bt_n    = _bt.get("total_trades", 0)
+                _bt_wr   = _bt.get("win_rate", 0)
+                _bt_exp  = _bt.get("expectancy", 0)
+                _bt_cagr = _bt.get("cagr_pct", 0)
+                lines.append("")
+                lines.append(f"*Backtest ({_bt_date}, 1yr):*")
+                lines.append(f"  {_bt_n} trades  WR={_bt_wr:.0%}  "
+                              f"E={_bt_exp:+.2f}R  CAGR={_bt_cagr:.1f}%")
+        except Exception:
+            pass
+
         _tg("\n".join(lines))
         _log.info("[weekly] Weekly report sent")
     except Exception as e:
@@ -758,26 +870,21 @@ _CPI_2026  = [(1,15),(2,12),(3,12),(4,10),(5,13),(6,11),(7,15),(8,12),(9,10),(10
 
 
 def _is_macro_blackout() -> tuple[bool, str]:
-    """Return (True, reason) if within 2 calendar days before FOMC or CPI release.
-    Avoids new entries ahead of binary macro events that gap past any stop.
-    Exception: if today IS the FOMC day and the announcement has already passed
-    (20:00 UTC / 14:00 ET), the binary event is resolved — lift the blackout.
+    """Return (True, reason) if within 1-2 calendar days BEFORE an FOMC or CPI release.
+    Avoids new entries ahead of binary macro events that can gap past any stop.
+    On the event day itself (delta=0): the scan runs at 22:30 CEST (20:30 UTC),
+    always after US market close. Both FOMC (14:00 ET) and CPI (08:30 ET) are
+    resolved before the scan — lift the blackout.
     """
-    from datetime import datetime, timezone
     today = date.today()
-    now_utc = datetime.now(timezone.utc)
-    _FOMC_ANNOUNCEMENT_UTC_HOUR = 20  # FOMC decision at 14:00 ET = 20:00 UTC
     for (m, d) in _FOMC_2026 + _CPI_2026:
         try:
             event = date(today.year, m, d)
         except ValueError:
             continue
         delta = (event - today).days
-        if 0 <= delta <= 2:
+        if 1 <= delta <= 2:
             kind = "FOMC" if (m, d) in _FOMC_2026 else "CPI"
-            # FOMC event day after announcement: binary event resolved, skip blackout
-            if delta == 0 and kind == "FOMC" and now_utc.hour >= _FOMC_ANNOUNCEMENT_UTC_HOUR:
-                continue
             return True, f"{kind} {event}"
     return False, ""
 
@@ -1051,6 +1158,9 @@ def _simons_score(trend) -> float:
     vq_pts  = 0.5 if _vq_s >= 1.0 else (0.25 if _vq_s >= 0.5 else 0.0)
     # Near 3-year ATH: no overhead supply from prior distribution zones
     ath_pts = 0.5 if getattr(trend, "near_ath", False) else 0.0
+    # Weinstein Stage: Stage 2 (advancing) = neutral; Stage 3 (topping) = -0.5 penalty
+    _ws = getattr(trend, "weinstein_stage", 2)
+    ws_pts = 0.5 if _ws == 2 else (-0.5 if _ws == 3 else 0.0)
     # Weekly Stage 2: MA10w > MA30w + MA30w slope rising = multi-timeframe alignment
     ws2_pts = 0.5 if getattr(trend, "weekly_stage2", False) else 0.0
     # Weekly breakout alignment: daily pivot coincides with weekly 5-week high breakout
@@ -1085,7 +1195,7 @@ def _simons_score(trend) -> float:
                + twt_pts + obv_pts + base_pts + bage_pts + vq_pts + ath_pts + ws2_pts + wba_pts
                + aug_pts + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
                + insider_pts + indleader_pts + rev_accel_pts
-               + twt2_pts + si_mo_pts + apt_pts, 10.0)
+               + twt2_pts + si_mo_pts + apt_pts + ws_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -1237,6 +1347,28 @@ def _portfolio_beta_factor(positions: list) -> float:
             _log.info("[main] Portfolio beta=%.2f > 1.5 — new entry size reduced 20%%",
                       _port_beta)
             return 0.80
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def _beta_size_factor(symbol: str) -> float:
+    """Reduce position size for high-beta stocks.
+    Beta > 2.0 → 0.70, Beta 1.5-2.0 → 0.85, else 1.0.
+    Uses yfinance info; cached per symbol for the session.
+    """
+    try:
+        import yfinance as _yf_bt
+        _beta = _yf_bt.Ticker(symbol).info.get("beta")
+        if _beta is None:
+            return 1.0
+        _beta = float(_beta)
+        if _beta > 2.0:
+            _log.info("[main] %s beta=%.1f → size 70%%", symbol, _beta)
+            return 0.70
+        if _beta > 1.5:
+            _log.info("[main] %s beta=%.1f → size 85%%", symbol, _beta)
+            return 0.85
         return 1.0
     except Exception:
         return 1.0
@@ -1864,9 +1996,43 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # ── Market regime filter ─────────────────────────────────────────────────
     regime, spy_price, spy_ma200, spy_pct = _check_market_regime()
     if regime == "bear":
-        msg = (f"SPY ${spy_price:.0f} is {abs(spy_pct):.1f}% below MA200 "
-               f"— bear market. {len(vcp_passed)} VCP setup(s) found but no orders placed.")
-        _log.warning("[main] BEAR regime — skipping order placement. %d VCPs found.", len(vcp_passed))
+        _cands_str = ", ".join(r.symbol for r in vcp_passed) or "none"
+        _log.warning("[main] BEAR regime — skipping long order placement. %d VCPs found.", len(vcp_passed))
+
+        # ── Bear-regime hedge: buy SH (ProShares Short S&P500, 1×inverse) ────
+        # Tudor Jones rule: in confirmed bear markets, hold inverse positions to
+        # profit from continued downside. 1x inverse (SH) only — no leverage.
+        _bear_hedge_placed = False
+        _sh_held = any(p["symbol"] in ("SH", "PSQ") for p in positions)
+        if not _sh_held:
+            try:
+                import yfinance as _yf_sh
+                from broker import place_buy_stop as _pbs_sh
+                from risk_manager import position_size as _psz_sh, register_trade as _reg_sh
+                _sh_fi = _yf_sh.Ticker("SH").fast_info
+                _sh_px = float(getattr(_sh_fi, "last_price", None) or
+                               getattr(_sh_fi, "regularMarketPrice", 0))
+                if _sh_px > 0:
+                    _sh_stop = round(_sh_px * 0.95, 2)   # 5% stop on the hedge
+                    _sh_sz   = _psz_sh(portfolio_value, _sh_px, _sh_stop, risk_pct=0.005)
+                    if _sh_sz["shares"] >= 1:
+                        _sh_oid = _pbs_sh("SH", _sh_sz["shares"], _sh_px)
+                        if _sh_oid:
+                            _reg_sh("SH", _sh_sz["risk_pct"])
+                            _bear_hedge_placed = True
+                            _log.info("[main] BEAR HEDGE: SH %d sh @ $%.2f (1%% risk)",
+                                      _sh_sz["shares"], _sh_px)
+                            _tg(f"🐻 *Bear Hedge Placed — SH*\n"
+                                f"{_sh_sz['shares']} shares @ ${_sh_px:.2f} "
+                                f"(risk ${_sh_sz['risk_amount']:.0f})\n"
+                                f"SPY {spy_pct*100:+.1f}% vs MA200 — bear market confirmed")
+            except Exception as _sh_e:
+                _log.warning("[main] Bear hedge (SH) failed: %s", _sh_e)
+
+        msg = (f"SPY ${spy_price:.0f} is {abs(spy_pct):.1f}% below MA200 — bear market.\n"
+               f"VCP setups found: {_cands_str}\n"
+               f"No long orders placed."
+               + (" SH hedge placed." if _bear_hedge_placed else ""))
         _tg(f"🐻 *Three Masters — Bear Regime*\n{msg}")
         report["summary"] = "bear_regime_no_orders"
         report["vcp_found_no_orders"] = [r.symbol for r in vcp_passed]
@@ -1876,9 +2042,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # ── Breadth gate: pause entries when broad market is deteriorating ────────
     if _breadth_pct < 0.45 and regime != "bull":
+        _cands_str = ", ".join(r.symbol for r in vcp_passed) or "none"
         msg = (f"Market breadth {_breadth_pct*100:.0f}% above MA50 (threshold 45%) "
-               f"in {regime.upper()} regime — pausing new orders. "
-               f"{len(vcp_passed)} VCP setup(s) found.")
+               f"in {regime.upper()} regime.\n"
+               f"VCP setups found: {_cands_str}\n"
+               f"No orders placed — pausing entries during broad market deterioration.")
         _log.warning("[main] BREADTH GATE — %.0f%% above MA50 in %s regime",
                      _breadth_pct * 100, regime)
         _tg(f"\U0001f4c9 *Three Masters — Breadth Gate*\n{msg}")
@@ -1902,9 +2070,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # ── Macro blackout: skip new orders within 2 days of FOMC/CPI ────────────
     _blackout, _blackout_reason = _is_macro_blackout()
     if _blackout:
+        _cands_str = ", ".join(r.symbol for r in vcp_passed) or "none"
         msg = (f"\U0001f4c5 *Macro Blackout \u2014 {_blackout_reason}*\n"
-               f"{len(vcp_passed)} VCP setup(s) found but no orders placed.\n"
-               f"FOMC/CPI within 2 days \u2014 avoiding binary event risk.")
+               f"VCP setups found: {_cands_str}\n"
+               f"No orders placed \u2014 FOMC/CPI in 1\u20132 days, avoiding binary event risk.")
         _log.warning("[main] MACRO BLACKOUT (%s) \u2014 skipping order placement",
                      _blackout_reason)
         _tg(msg)
@@ -1924,9 +2093,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             if (_dte_fn(p["symbol"]) or 99) <= 7
         ]
         if len(_earn_this_week) >= 2:
+            _vcp_cands_str = ", ".join(r.symbol for r in vcp_passed) or "none"
             _msg_ec = (
                 f"📅 *Earnings Cluster — {len(_earn_this_week)} positions reporting this week*\n"
-                f"{', '.join(_earn_this_week)}\n"
+                f"Held positions: {', '.join(_earn_this_week)}\n"
+                f"VCP setups found: {_vcp_cands_str}\n"
                 f"No new orders placed — reducing binary risk concentration."
             )
             _log.warning("[tudor] EARNINGS CLUSTER: %d positions report this week (%s) — blocking new orders",
@@ -2062,6 +2233,17 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _log.info("[tudor] NH/NL ratio=%.2f (%s)", _nh_nl_ratio,
               "expanding(+0.5)" if _nh_nl_ratio >= 1.5 else
               ("deteriorating(-1.0)" if _nh_nl_ratio < 0.5 else "neutral"))
+
+    # ── Hard NH/NL internal deterioration block ───────────────────────────────
+    # NH/NL < 0.25 in neutral/bear regime = critically collapsing tape.
+    # Tudor Jones: "when market internals are screaming, listen — don't fight it."
+    if _nh_nl_ratio < 0.25 and regime != "bull" and max_new_pos > 0:
+        _log.warning("[tudor] NH/NL CRITICAL (%.2f) in %s regime — all new orders blocked",
+                     _nh_nl_ratio, regime)
+        _tg(f"🚨 *Market Internals Gate*\n"
+            f"NYSE NH/NL ratio {_nh_nl_ratio:.2f} — critically few new highs\n"
+            f"No new orders in {regime.upper()} regime (Tudor Jones internal breadth rule)")
+        max_new_pos = 0
     _log.info("[tudor] PCR=%.2f (%s)", _current_pcr,
               "fear+0.5" if _current_pcr > 1.0 else ("greed-0.5" if _current_pcr < 0.6 else "neutral"))
     scored  = []
@@ -2235,13 +2417,23 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             _reject_reasons[vcp.symbol] = f"sector heat ({sec} {_sec_risk*100:.1f}%)"
             continue
 
-        # Sector RS hard filter: reject if sector is bottom-half ranked with negative momentum
+        # Sector RS hard filter: two-tier block
+        # Tier 1 (hard): bottom-3 sectors AND momentum < -1% → always skip
+        # Tier 2 (soft): bottom-half AND momentum < -0.5% → skip (unchanged)
         _sec_etf_v = _SECTOR_ETF_MAP.get(sec)
         if _sec_etf_v and sector_momentum:
             _all_rnk = sorted(sector_momentum.keys(), key=lambda e: -sector_momentum[e])
             _n_rnk   = len(_all_rnk)
             _sec_rnk = (_all_rnk.index(_sec_etf_v) + 1) if _sec_etf_v in _all_rnk else _n_rnk
-            if _sec_rnk > _n_rnk // 2 and sector_momentum.get(_sec_etf_v, 0) < -0.005:
+            _sec_mom = sector_momentum.get(_sec_etf_v, 0)
+            # Tier 1: hard skip — bottom-3 with clearly negative momentum
+            if _sec_rnk > _n_rnk - 3 and _sec_mom < -0.01:
+                _log.info("[main] %s skipped — sector '%s' rank %d/%d (bottom-3), RS %.1f%% — hard skip",
+                          vcp.symbol, sec, _sec_rnk, _n_rnk, _sec_mom * 100)
+                _reject_reasons[vcp.symbol] = f"sector bottom-3 negative ({sec} rank {_sec_rnk}/{_n_rnk})"
+                continue
+            # Tier 2: soft skip — bottom-half with any negative momentum
+            if _sec_rnk > _n_rnk // 2 and _sec_mom < -0.005:
                 _log.info("[main] %s skipped — sector '%s' rank %d/%d bottom-half, negative RS",
                           vcp.symbol, sec, _sec_rnk, _n_rnk)
                 _reject_reasons[vcp.symbol] = f"sector RS weak ({sec} rank {_sec_rnk}/{_n_rnk})"
@@ -2253,8 +2445,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             continue
 
         # Adaptive risk: composite score → VIX-adjusted → regime/loss multipliers
-        base_risk = RISK["risk_per_trade_pct"]
-        _atr_f    = _atr_volatility_factor(vcp.symbol, vcp.breakout_level)
+        base_risk  = RISK["risk_per_trade_pct"]
+        _atr_f     = _atr_volatility_factor(vcp.symbol, vcp.breakout_level)
+        _sym_beta_f = _beta_size_factor(vcp.symbol)
         if _atr_f < 1.0:
             _log.info("[main] %s ATR factor %.0f%% — elevated volatility", vcp.symbol, _atr_f * 100)
         # Gap-up breakout: open above prior day's high = institutional conviction → +10% size
@@ -2272,7 +2465,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                               vcp.symbol, _gap_open, _gap_prev_h)
         except Exception:
             pass
-        risk_pct  = _adaptive_risk_pct(composite, base_risk, _current_vix) * regime_size_factor * loss_factor * win_factor * _atr_f * _extended_factor * _qqq_factor * _cs_factor * _gap_up_f * _beta_f * _dxy_f
+        risk_pct  = (_adaptive_risk_pct(composite, base_risk, _current_vix)
+                     * regime_size_factor * loss_factor * win_factor
+                     * _atr_f * _sym_beta_f * _extended_factor * _qqq_factor
+                     * _cs_factor * _gap_up_f * _beta_f * _dxy_f)
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:
@@ -2446,6 +2642,20 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             lines.append(f"  ✗ {_rs} — {_rr}")
         if len(_rej) > 8:
             lines.append(f"  … and {len(_rej)-8} more")
+
+    _blocked = report.get("vcp_found_no_orders", [])
+    if _blocked and not orders and not _rej:
+        _summary = report.get("summary", "")
+        _gate = (_summary.replace("macro_blackout_", "Macro blackout: ")
+                         .replace("bear_regime_no_orders", "Bear regime")
+                         .replace("breadth_gate_", "Breadth gate: ").replace("_no_orders", "")
+                         .replace("earnings_cluster_", "Earnings cluster: ").replace("_positions", " positions"))
+        lines.append("")
+        lines.append(f"*Blocked by {_gate}:*")
+        for sym in _blocked[:10]:
+            lines.append(f"  ⏸ {sym}")
+        if len(_blocked) > 10:
+            lines.append(f"  … and {len(_blocked)-10} more")
 
     if report.get("errors"):
         lines.append(f"\n⚠️ Errors: {'; '.join(report['errors'])}")

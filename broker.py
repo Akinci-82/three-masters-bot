@@ -171,6 +171,25 @@ def place_market_sell(symbol: str, qty: int) -> dict | None:
         return None
 
 
+def place_market_buy(symbol: str, qty: int) -> dict | None:
+    """Immediate market buy (used for pyramiding into confirmed winners)."""
+    try:
+        order = _retry(
+            get_api().submit_order,
+            MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            ),
+        )
+        _log.info("[broker] MARKET-BUY %s qty=%d id=%s", symbol, qty, order.id)
+        return {"id": str(order.id), "symbol": symbol, "qty": qty, "type": "market_buy"}
+    except Exception as e:
+        _log.error("[broker] MARKET-BUY %s FAILED: %s", symbol, e)
+        return None
+
+
 def cancel_all_orders(symbol: str | None = None) -> int:
     """Cancel all open orders, or only for a specific symbol. Idempotent - safe to retry."""
     try:

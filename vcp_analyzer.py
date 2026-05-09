@@ -296,6 +296,25 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
 
     breakout_vol = _check_breakout_volume(df, cfg.get("breakout_volume_min", 1.5))
 
+    # Multi-handle detection: count distinct swing highs in the base using a simple
+    # peak filter — a bar is a "handle peak" if its high is the highest of the 5 bars
+    # on each side. Each peak = one corrective cycle. 3-handle VCPs are the highest
+    # quality (stock has retested resistance multiple times with decreasing volume).
+    _n_handles = 1
+    try:
+        _h_arr = high.values
+        _peaks = []
+        for _pi in range(5, len(_h_arr) - 5):
+            if _h_arr[_pi] == max(_h_arr[_pi - 5: _pi + 6]):
+                # Must be > 1% above surrounding context to qualify as a distinct handle
+                _local_min = min(_h_arr[max(0, _pi - 5): _pi + 6])
+                if _local_min > 0 and (_h_arr[_pi] - _local_min) / _local_min > 0.01:
+                    if not _peaks or _pi - _peaks[-1] >= 5:
+                        _peaks.append(_pi)
+        _n_handles = max(1, len(_peaks))
+    except Exception:
+        _n_handles = 1
+
     return True, {
         "contractions":           n_contractions,
         "pattern_depth_pct":      depth,
@@ -307,6 +326,7 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
         "breakout_volume":        breakout_vol,
         "breakout_level":         last10_h,    # pivot HIGH of handle
         "stop_loss_candidate":    last10_l,    # pivot LOW of handle
+        "n_handles":              _n_handles,
     }
 
 
@@ -434,6 +454,15 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle
     news_headlines = _get_recent_news(symbol, n=4)
     news_ctx = f"\n\n## Recent News (catalyst check)\n{news_headlines}"
 
+    n_handles = quant.get("n_handles", 1)
+    handle_ctx = (
+        f"\n- MULTI-HANDLE BASE: {n_handles} corrective cycles detected — "
+        "each handle tighter than previous (highest quality VCP signal)"
+        if n_handles >= 3 else
+        f"\n- TWO-HANDLE BASE: {n_handles} corrective cycles — solid structure"
+        if n_handles == 2 else ""
+    )
+
     return f"""You are executing Mark Minervini's VCP analysis protocol on {symbol}.
 
 ## Price Data (last {len(recent)} trading days, vol avg={vol_avg:,})
@@ -446,7 +475,7 @@ Date        High    Low     Close   Volume
 - MA50=${ma50:.2f} | MA200=${ma200:.2f} | Current=${float(close.iloc[-1]):.2f}
 - Quant segment ranges (oldest→newest): {seg_str}
 - Depth from pattern high: {quant.get('pattern_depth_pct',0):.1%}
-- Handle range (last 10 bars): {quant.get('tight_rng_pct',0):.1%}{vol_ctx}{candle_ctx}{news_ctx}
+- Handle range (last 10 bars): {quant.get('tight_rng_pct',0):.1%}{handle_ctx}{vol_ctx}{candle_ctx}{news_ctx}
 
 ## Analysis Protocol — follow each step:
 
@@ -706,6 +735,14 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     contractions = int(s_data.get("contractions_identified") or quant.get("contractions", 0))
     tight_pct   = float(s_data.get("tight_area_pct") or quant.get("tight_rng_pct", 0))
     quality     = int(s_data.get("quality_score", 0))
+    # Multi-handle bonus: 3+ handles = highest-conviction base, cap quality at 5
+    _n_hdl = quant.get("n_handles", 1)
+    if _n_hdl >= 3:
+        quality = min(5, quality + 1)
+        _log.info("[vcp] %s multi-handle base (%d handles) → quality boosted to %d",
+                  symbol, _n_hdl, quality)
+    elif _n_hdl == 2 and quality < 5:
+        quality = min(5, quality + 0)  # two-handle: no boost but already factored in prompt
     min_conf    = cfg.get("min_confidence", 0.65)
     min_quality = cfg.get("min_quality_score", 3)
 

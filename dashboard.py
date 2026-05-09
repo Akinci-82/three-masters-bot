@@ -25,6 +25,27 @@ BASE = Path(__file__).parent
 _sector_cache:   dict[str, str]  = {}
 _earnings_cache: dict[str, dict] = {}   # sym → {checked_at, result}
 _spy_cache:      dict[str, list] = {}   # start_date → [{date,value}]
+_regime_cache:   dict            = {}   # date → regime string
+
+
+def _compute_regime() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _regime_cache.get("date") == today:
+        return _regime_cache.get("regime", "bull")
+    try:
+        import yfinance as yf
+        df = yf.Ticker("SPY").history(period="220d", interval="1d", auto_adjust=True)
+        if len(df) >= 200:
+            c     = df["Close"]
+            ma200 = float(c.tail(200).mean())
+            cur   = float(c.iloc[-1])
+            pct   = (cur - ma200) / ma200
+            r     = "bull" if pct > 0.02 else "bear" if pct < -0.02 else "neutral"
+            _regime_cache.update({"date": today, "regime": r})
+            return r
+    except Exception:
+        pass
+    return "bull"
 
 
 def _get_sector(symbol: str) -> str:
@@ -416,10 +437,50 @@ def create_app():
     .btn-csv { font-size:11px; background:var(--surface2); border:1px solid var(--border); color:var(--muted); padding:3px 10px; border-radius:6px; cursor:pointer; text-decoration:none; font-family:inherit; transition:color 0.15s; }
     .btn-csv:hover { color:var(--text); }
 
+    /* ── Regime badge ───────────────────────────────────────────────── */
+    .regime-bull    { display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;background:var(--green-bg);color:var(--green);border:1px solid rgba(34,211,165,0.2); }
+    .regime-neutral { display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;background:var(--yellow-bg);color:var(--yellow);border:1px solid rgba(251,191,36,0.2); }
+    .regime-bear    { display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;background:var(--red-bg);color:var(--red);border:1px solid rgba(248,113,113,0.2); }
+
+    /* ── Stat-grid with 6 cards ─────────────────────────────────────── */
+    .stat-grid { grid-template-columns:repeat(6,1fr) !important; }
+
+    /* ── Steps badges ───────────────────────────────────────────────── */
+    .step-done   { display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;font-size:10px;font-weight:700;background:var(--green-bg);color:var(--green); }
+    .step-pending{ display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;font-size:10px;font-weight:700;background:var(--surface2);color:var(--muted);border:1px solid var(--border); }
+    .steps-wrap  { display:flex;gap:3px;align-items:center; }
+
+    /* ── Vol / RS-high badges on orders ─────────────────────────────── */
+    .vol-confirmed{ font-size:11px;font-weight:700;color:var(--green); }
+    .rs-at-high   { font-size:11px;font-weight:700;color:var(--yellow);margin-left:4px; }
+
+    /* ── Composite / quality score ──────────────────────────────────── */
+    .cs-badge { font-size:12px;font-weight:700;font-variant-numeric:tabular-nums; }
+    .cs-high  { color:var(--green); }
+    .cs-mid   { color:var(--yellow); }
+    .cs-low   { color:var(--muted); }
+
+    /* ── Column header tooltip ──────────────────────────────────────── */
+    thead th[title] { cursor:help;border-bottom:1px dashed var(--border); }
+
+    /* ── Signal accuracy panel ──────────────────────────────────────── */
+    .sig-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;padding:16px 20px; }
+    .sig-row  { display:flex;align-items:center;justify-content:space-between;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;gap:8px; }
+    .sig-name { font-size:12px;color:var(--text);flex:1; }
+    .sig-stats{ display:flex;align-items:center;gap:8px;font-size:11px;font-variant-numeric:tabular-nums; }
+    .sig-wr   { font-weight:700; }
+    .sig-r    { color:var(--muted); }
+    .sig-n    { color:var(--muted);font-size:10px; }
+    .sig-empty{ padding:20px;text-align:center;color:var(--muted);font-size:13px; }
+
+    /* ── Stop price cell ────────────────────────────────────────────── */
+    .stop-raised { font-size:10px;color:var(--green);margin-left:4px; }
+
     /* ── Mobile ─────────────────────────────────────────────────────── */
+    @media (max-width:1200px) { .stat-grid { grid-template-columns:repeat(3,1fr) !important; } }
     @media (max-width:1100px) { .three-col { grid-template-columns:1fr 1fr; } }
-    @media (max-width:900px)  { body { padding:16px; } .stat-grid { grid-template-columns:repeat(2,1fr); } .two-col { grid-template-columns:1fr; } .three-col { grid-template-columns:1fr; } }
-    @media (max-width:540px)  { .stat-grid { grid-template-columns:1fr 1fr; } .header-right { display:none; } .pipe-arrow { display:none; } .pipeline { justify-content:space-around; } .calc-result.show { grid-template-columns:repeat(2,1fr); } }
+    @media (max-width:900px)  { body { padding:16px; } .stat-grid { grid-template-columns:repeat(2,1fr) !important; } .two-col { grid-template-columns:1fr; } .three-col { grid-template-columns:1fr; } }
+    @media (max-width:540px)  { .stat-grid { grid-template-columns:1fr 1fr !important; } .header-right { display:none; } .pipe-arrow { display:none; } .pipeline { justify-content:space-around; } .calc-result.show { grid-template-columns:repeat(2,1fr); } }
   </style>
 </head>
 <body>
@@ -434,6 +495,7 @@ def create_app():
       </div>
     </div>
     <div class="header-right">
+      <span id="regime-badge"></span>
       <button class="calc-toggle" onclick="document.getElementById('calc-panel').classList.toggle('open')">&#x1F9EE; Position Calculator</button>
       <div class="countdown">Next scan <span id="countdown">—</span></div>
       <button class="theme-btn" onclick="toggleTheme()" title="Toggle dark/light">&#x25D1;</button>
@@ -467,6 +529,11 @@ def create_app():
       <div class="stat-label">Status</div>
       <div id="s-status" style="margin-top:4px">—</div>
       <div class="stat-sub" id="s-losses" style="margin-top:10px">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label" title="Andel S&amp;P 500-aktier ovanför sitt 50-dagars glidande medelvärde">Market Breadth</div>
+      <div class="stat-value" id="s-breadth">—</div>
+      <div class="stat-sub" id="s-breadth-sub">% above MA50</div>
     </div>
   </div>
 
@@ -603,11 +670,17 @@ def create_app():
     <div class="table-scroll">
       <table>
         <thead><tr>
-          <th>Symbol</th><th>Sector</th><th>Days</th><th>RS</th><th>Earnings</th>
+          <th>Symbol</th><th>Qty</th><th>Sector</th><th>Days</th>
+          <th title="BE=Breakeven höjd (+8%), P1=50% partiell exit (+15%), P2=2:a partiell exit">Steps</th>
+          <th title="Relative Strength Rating mot SPY (0–100)">RS</th>
+          <th title="Nästa earnings-datum">Earnings</th>
           <th>Avg Cost</th><th>Current</th><th>P&amp;L %</th><th>P&amp;L $</th>
-          <th>MAE / MFE</th><th>SL Distance</th><th>Max Risk</th>
+          <th title="Maximum Adverse Excursion / Maximum Favorable Excursion — sämsta och bästa kurs sedan entry">MAE / MFE</th>
+          <th title="Stop-loss: nuvarande pris och initial pris">Stop $</th>
+          <th title="Avstånd i % från nuvarande pris till stop-loss">SL Distance</th>
+          <th title="Maximalt riskbelopp i USD om stop triggas">Max Risk</th>
         </tr></thead>
-        <tbody id="positions-body"><tr class="empty-row"><td colspan="12">Loading…</td></tr></tbody>
+        <tbody id="positions-body"><tr class="empty-row"><td colspan="15">Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -619,9 +692,26 @@ def create_app():
     </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>Symbol</th><th>Qty</th><th>Stop</th><th>Current</th><th>Gap</th><th>R:R</th><th>Confidence</th></tr></thead>
+        <thead><tr>
+          <th>Symbol</th><th>Qty</th><th>Stop</th><th>Current</th><th>Gap</th>
+          <th title="Vol=volymsbekräftad breakout, ⭐=RS-line på 52v-high">Vol / RS</th>
+          <th title="Risk:Reward-ratio (mål: ≥2.5:1)">R:R</th>
+          <th title="AI-konfidenspoäng från Minervini Tier 2-analys (0–100%)">Conf</th>
+          <th title="Quality Score 0–5 (Minervini breakout-kvalitet)">Q</th>
+          <th title="Composite Score 0–10 (Simons 60% + Minervini 30% + Tudor Jones 10%)">Score</th>
+        </tr></thead>
         <tbody id="orders-body"></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- ── Signal Accuracy ─────────────────────────────────────────────────── -->
+  <div class="table-card">
+    <button class="screener-toggle" onclick="this.nextElementSibling.classList.toggle('open')">
+      &#9660; Signal Accuracy — win rate per screener-signal (klicka för att visa)
+    </button>
+    <div class="screener-body" id="signal-accuracy-body">
+      <div class="sig-empty">Laddar…</div>
     </div>
   </div>
 
@@ -715,9 +805,24 @@ def create_app():
 
     function earnBadge(e) {
       if (!e) return '<span class="earn-ok">—</span>';
-      if (e.days_until <= 7)  return `<span class="earn-soon">&#9888; ${e.days_until}d</span>`;
-      if (e.days_until <= 21) return `<span class="earn-warn">&#9675; ${e.days_until}d</span>`;
-      return `<span class="earn-ok">${e.days_until}d</span>`;
+      const dateStr = e.date ? new Date(e.date+'T00:00:00').toLocaleDateString('sv-SE',{month:'short',day:'numeric'}) : '';
+      const label   = dateStr ? `${dateStr} (${e.days_until}d)` : `${e.days_until}d`;
+      if (e.days_until <= 7)  return `<span class="earn-soon" title="${e.date||''}">&#9888; ${label}</span>`;
+      if (e.days_until <= 21) return `<span class="earn-warn" title="${e.date||''}">&#9675; ${label}</span>`;
+      return `<span class="earn-ok" title="${e.date||''}">${label}</span>`;
+    }
+
+    function stepsBadge(p) {
+      const be = p.breakeven_done  ? '<span class="step-done"  title="Breakeven höjd">BE</span>'  : '<span class="step-pending" title="Väntar på +8%">BE</span>';
+      const p1 = p.partial1_done   ? '<span class="step-done"  title="50% såld vid +15%">P1</span>' : '<span class="step-pending" title="Väntar på +15%">P1</span>';
+      const p2 = p.partial2_done   ? '<span class="step-done"  title="2:a partiell exit gjord">P2</span>' : '<span class="step-pending" title="Ännu ej">P2</span>';
+      return `<div class="steps-wrap">${be}${p1}${p2}</div>`;
+    }
+
+    function csBadge(v) {
+      if (v === null || v === undefined || v === 0) return '<span class="muted">—</span>';
+      const cls = v >= 7 ? 'cs-high' : v >= 5 ? 'cs-mid' : 'cs-low';
+      return `<span class="cs-badge ${cls}">${Number(v).toFixed(1)}</span>`;
     }
 
     function rsBadge(rs) {
@@ -885,6 +990,20 @@ def create_app():
           : `<span class="badge badge-green"><span class="badge-dot"></span>Active</span>`;
         document.getElementById('s-losses').textContent = `Consec. losses: ${d.losses}`;
 
+        // Regime badge
+        const regime = d.regime || 'bull';
+        const regimeCls = regime === 'bear' ? 'regime-bear' : regime === 'neutral' ? 'regime-neutral' : 'regime-bull';
+        const regimeIcon = regime === 'bear' ? '🐻' : regime === 'neutral' ? '⚡' : '🐂';
+        document.getElementById('regime-badge').innerHTML = `<span class="${regimeCls}">${regimeIcon} ${regime.toUpperCase()}</span>`;
+
+        // Market breadth
+        const bEl = document.getElementById('s-breadth');
+        if (d.market_breadth !== null && d.market_breadth !== undefined) {
+          bEl.textContent = d.market_breadth + '%';
+          bEl.style.color = d.market_breadth > 60 ? 'var(--green)' : d.market_breadth < 40 ? 'var(--red)' : 'var(--yellow)';
+          document.getElementById('s-breadth-sub').textContent = d.market_breadth > 50 ? '% above MA50 — broad strength' : '% above MA50 — weakening breadth';
+        }
+
         // DD + Sharpe badges
         const ddEl = document.getElementById('dd-badge');
         if (d.drawdown_pct!==null && d.drawdown_pct!==undefined) {
@@ -946,10 +1065,22 @@ def create_app():
         const pos = d.positions||[];
         document.getElementById('pos-count').textContent = pos.length+' position'+(pos.length!==1?'s':'');
         document.getElementById('positions-body').innerHTML = pos.length
-          ? pos.map(p=>`<tr>
+          ? pos.map(p=>{
+              const slCell = p.stop_loss
+                ? (() => {
+                    const raised = p.stop_loss_initial && p.stop_loss > p.stop_loss_initial;
+                    return `<span class="num" style="font-size:12px;font-variant-numeric:tabular-nums">$${p.stop_loss}`
+                      + (raised ? `<span class="stop-raised" title="Höjd från $${p.stop_loss_initial}">&#9650;</span>` : '')
+                      + (p.stop_loss_initial && p.stop_loss === p.stop_loss_initial ? `<span class="muted" style="font-size:10px;margin-left:4px">(initial)</span>` : '')
+                      + '</span>';
+                  })()
+                : '<span class="muted">—</span>';
+              return `<tr>
               <td><span class="sym">${p.symbol}</span></td>
+              <td class="num muted">${p.qty!==undefined?p.qty:'—'}</td>
               <td><span class="sector-badge">${p.sector||'—'}</span></td>
               <td class="num muted">${p.days_held!==null?p.days_held+'d':'—'}</td>
+              <td>${stepsBadge(p)}</td>
               <td>${rsBadge(p.rs_rating)}</td>
               <td>${earnBadge(p.earnings)}</td>
               <td class="num">${fmt(p.avg_cost)}</td>
@@ -957,10 +1088,11 @@ def create_app():
               <td>${pnlBadge(p.pnl_pct,'%')}</td>
               <td>${pnlBadge(p.pnl_usd,'')}</td>
               <td class="muted" style="font-size:12px;font-variant-numeric:tabular-nums">${p.mae_pct!==null?p.mae_pct.toFixed(1)+'% / '+p.mfe_pct.toFixed(1)+'%':'—'}</td>
+              <td>${slCell}</td>
               <td>${slBar(p.sl_dist_pct)}</td>
               <td class="num muted">${p.max_risk_usd!==null?fmt(p.max_risk_usd):'—'}</td>
-            </tr>`).join('')
-          : '<tr class="empty-row"><td colspan="12">No open positions</td></tr>';
+            </tr>`;}).join('')
+          : '<tr class="empty-row"><td colspan="15">No open positions</td></tr>';
 
         // Orders
         const ord = d.orders||[];
@@ -968,15 +1100,20 @@ def create_app():
         if (ord.length) {
           document.getElementById('orders-count').textContent = ord.length+' order'+(ord.length!==1?'s':'');
           document.getElementById('orders-body').innerHTML = ord.map(o=>{
-            const meta=(d.today_report?.orders_placed||[]).find(x=>x.symbol===o.symbol)||{};
-            return `<tr>
-              <td><span class="sym">${o.symbol}</span></td>
+            const volCell  = o.breakout_vol ? '<span class="vol-confirmed" title="Volym bekräftad">🔥</span>' : '<span class="muted">—</span>';
+            const rsHi     = o.rs_line_high ? '<span class="rs-at-high" title="RS-line på 52v-high">⭐</span>' : '';
+            const tooltip  = o.vcp_notes ? ` title="${o.vcp_notes.replace(/"/g,"'")}"` : '';
+            return `<tr${tooltip} style="${o.vcp_notes?'cursor:help':''}">
+              <td><span class="sym">${o.symbol}</span>${rsHi}</td>
               <td class="num muted">${o.qty}</td>
               <td class="num">$${o.stop}</td>
               <td class="num">$${o.current}</td>
               <td class="${o.gap_pct<2?'gap-close':'muted'}">+${o.gap_pct}%</td>
-              <td class="muted">${meta.rr_ratio?meta.rr_ratio+':1':'—'}</td>
-              <td class="muted">${meta.vcp_confidence?(meta.vcp_confidence*100).toFixed(0)+'%':'—'}</td>
+              <td>${volCell}</td>
+              <td class="muted">${o.rr_ratio?o.rr_ratio+':1':'—'}</td>
+              <td class="muted">${o.vcp_confidence?(o.vcp_confidence*100).toFixed(0)+'%':'—'}</td>
+              <td class="muted">${o.quality_score||'—'}</td>
+              <td>${csBadge(o.composite_score)}</td>
             </tr>`;
           }).join('');
         }
@@ -1004,6 +1141,37 @@ def create_app():
               <td><span class="r-badge ${(t.r_multiple||0)>=1?'r-win':'r-loss'}">${t.r_multiple}R</span></td>
             </tr>`).join('')
           : '<tr class="empty-row"><td colspan="7">No closed trades yet</td></tr>';
+
+        // Signal accuracy
+        const sa   = d.signal_accuracy || {};
+        const saEl = document.getElementById('signal-accuracy-body');
+        const saEntries = Object.entries(sa).filter(([,v])=>v.wins+v.losses>0);
+        const SIG_LABELS = {
+          rs_line_at_high:'RS-line på 52v-high', rs_line_leading:'RS-line ledande',
+          eps_accelerating:'EPS-acceleration', rev_accelerating:'Omsättningstillväxt',
+          three_weeks_tight:'3 Weeks Tight', pocket_pivot:'Pocket Pivot',
+          insider_buying:'Insider Buying', industry_leader:'Industry Leader',
+          eps_revision_up:'EPS-revision upp', accum_weeks_strong:'Starka ackumulationsveckor',
+          analyst_pt_upside:'Analytiker PT-upside', inst_ownership_increasing:'Inst. ägande ökar',
+          near_ath:'Nära ATH', weekly_stage2:'Veckodiagram Stage 2',
+          pead_hold:'PEAD Hold', vol_contraction_quality:'Vol-kontraktion',
+          weekly_stage2:'Veckodiagram Stage 2', analyst_upgrades:'Analytiker-uppgraderingar',
+          at_52w_high:'52v-high', obv_new_high:'OBV New High',
+          weekly_breakout_aligned:'Weekly Breakout Aligned',
+        };
+        if (saEntries.length === 0) {
+          saEl.innerHTML = '<div class="sig-empty">Ingen data ännu — win rates byggs upp efter avslutade trades.</div>';
+        } else {
+          const sorted = saEntries.sort(([,a],[,b])=>(b.wins+b.losses)-(a.wins+a.losses));
+          saEl.innerHTML = '<div class="sig-grid">' + sorted.map(([key,v])=>{
+            const n  = v.wins + v.losses;
+            const wr = n > 0 ? (v.wins/n*100).toFixed(0)+'%' : '—';
+            const avgR = n > 0 ? (v.total_r/n).toFixed(2)+'R' : '—';
+            const wrColor = v.wins/n >= 0.6 ? 'color:var(--green)' : v.wins/n >= 0.4 ? 'color:var(--yellow)' : 'color:var(--red)';
+            const label = SIG_LABELS[key] || key.replace(/_/g,' ');
+            return `<div class="sig-row"><span class="sig-name">${label}</span><span class="sig-stats"><span class="sig-wr" style="${wrColor}">${wr}</span><span class="sig-r">${avgR}</span><span class="sig-n">(${n})</span></span></div>`;
+          }).join('') + '</div>';
+        }
 
         // Activity feed
         const acts = d.activity_feed||[];
@@ -1091,6 +1259,15 @@ def _build_state() -> dict:
     risk    = _read_json(BASE / "logs" / "risk_state.json")
     journal = _read_jsonl(BASE / "logs" / "trade_journal.jsonl", tail=15)
     monitor = _read_json(BASE / "logs" / "monitor_state.json")
+
+    signal_accuracy = _read_json(BASE / "logs" / "signal_accuracy.json")
+
+    breadth_raw    = _read_json(BASE / "logs" / "breadth_history.json")
+    market_breadth = None
+    if isinstance(breadth_raw, list) and breadth_raw:
+        market_breadth = round(float(breadth_raw[-1]) * 100, 1)
+
+    regime = _compute_regime()
 
     # Latest daily report
     report_dir   = BASE / "reports"
@@ -1203,31 +1380,53 @@ def _build_state() -> dict:
             mae_pct = round(mon.get("mae_pct",0)*100,2) if mon.get("mae_pct") is not None else None
             mfe_pct = round(mon.get("mfe_pct",0)*100,2) if mon.get("mfe_pct") is not None else None
 
+            sl_initial = float(mon.get("stop_loss_initial", sl)) if mon else sl
             positions.append({
-                "symbol":      sym,
-                "qty":         qty,
-                "avg_cost":    round(avg,2),
-                "current":     round(cur,2),
-                "pnl_pct":     round((cur-avg)/avg*100,2),
-                "pnl_usd":     round((cur-avg)*qty,2),
-                "sector":      _get_sector(sym),
-                "days_held":   days_held,
-                "rs_rating":   rs_lookup.get(sym),
-                "earnings":    _get_earnings(sym),
-                "mae_pct":     mae_pct,
-                "mfe_pct":     mfe_pct,
-                "stop_loss":   round(sl,2) if sl>0 else None,
-                "sl_dist_pct": sl_dist_pct,
-                "max_risk_usd":max_risk_usd,
+                "symbol":           sym,
+                "qty":              qty,
+                "avg_cost":         round(avg,2),
+                "current":          round(cur,2),
+                "pnl_pct":          round((cur-avg)/avg*100,2),
+                "pnl_usd":          round((cur-avg)*qty,2),
+                "sector":           _get_sector(sym),
+                "days_held":        days_held,
+                "rs_rating":        rs_lookup.get(sym),
+                "earnings":         _get_earnings(sym),
+                "mae_pct":          mae_pct,
+                "mfe_pct":          mfe_pct,
+                "stop_loss":        round(sl,2) if sl>0 else None,
+                "stop_loss_initial":round(sl_initial,2) if sl_initial>0 else None,
+                "sl_dist_pct":      sl_dist_pct,
+                "max_risk_usd":     max_risk_usd,
+                "breakeven_done":   mon.get("breakeven_done", False) if mon else False,
+                "partial1_done":    mon.get("partial1_done", False) if mon else False,
+                "partial2_done":    mon.get("partial2_done", False) if mon else False,
+                "quality_score":    mon.get("quality_score", 0) if mon else 0,
+                "composite_score":  mon.get("composite_score", 0.0) if mon else 0.0,
+                "measured_move_pct":mon.get("measured_move_pct", 0.0) if mon else 0.0,
             })
 
+        rpt_order_map = {o["symbol"]: o for o in today_report.get("orders_placed", [])}
         for o in [x for x in all_stop_orders if x.get("side")=="buy"]:
-            sym  = o["symbol"]
-            stop = float(o["stop_price"])
+            sym   = o["symbol"]
+            stop  = float(o["stop_price"])
+            rpt_o = rpt_order_map.get(sym, {})
             try:   cur_p = float(yf.Ticker(sym).fast_info.last_price)
             except: cur_p = stop
-            orders.append({"symbol":sym,"qty":int(float(o["qty"])),"stop":round(stop,2),
-                           "current":round(cur_p,2),"gap_pct":round((stop-cur_p)/cur_p*100,2)})
+            orders.append({
+                "symbol":          sym,
+                "qty":             int(float(o["qty"])),
+                "stop":            round(stop,2),
+                "current":         round(cur_p,2),
+                "gap_pct":         round((stop-cur_p)/cur_p*100,2),
+                "breakout_vol":    rpt_o.get("breakout_vol", False),
+                "vcp_notes":       rpt_o.get("vcp_notes", ""),
+                "quality_score":   rpt_o.get("quality_score", 0),
+                "composite_score": round(rpt_o.get("composite_score", 0.0), 2),
+                "rs_line_high":    rpt_o.get("rs_line_high", False),
+                "rr_ratio":        rpt_o.get("rr_ratio"),
+                "vcp_confidence":  rpt_o.get("vcp_confidence"),
+            })
     except Exception as e:
         equity = round(float(risk.get("portfolio_value",0)),2)
         _log.debug("[dash] Live fetch failed: %s", e)
@@ -1263,6 +1462,9 @@ def _build_state() -> dict:
         "spy_history":      spy_history,
         "recent_logs":      recent_logs,
         "activity_feed":    activity_feed,
+        "regime":           regime,
+        "market_breadth":   market_breadth,
+        "signal_accuracy":  signal_accuracy,
     }
 
 

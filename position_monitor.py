@@ -160,6 +160,28 @@ def _place_market_sell(symbol: str, qty: int) -> bool:
         return False
 
 
+def _place_market_buy(symbol: str, qty: int) -> bool:
+    """Market buy for pyramiding into confirmed winners during market hours."""
+    try:
+        body = {
+            "symbol": symbol,
+            "qty":    str(qty),
+            "side":   "buy",
+            "type":   "market",
+            "time_in_force": "day",
+        }
+        r = requests.post(
+            f"{_alpaca_base()}/orders",
+            json=body, headers=_alpaca_headers(), timeout=10
+        )
+        r.raise_for_status()
+        _log.info("[monitor] Market buy %d × %s submitted (pyramid)", qty, symbol)
+        return True
+    except Exception as e:
+        _log.error("[monitor] market_buy(%s, %d) FAILED: %s", symbol, qty, e)
+        return False
+
+
 def _place_limit_sell(symbol: str, qty: int, limit_price: float) -> bool:
     """Limit sell for partial exits — captures slightly better fills than market."""
     try:
@@ -557,7 +579,7 @@ def check_positions() -> None:
             "partial_done":          False,
             "breakeven_done":        False,
             "trailing_stop_placed":  False,
-                "active_signals":      meta.get("active_signals", []),
+            "active_signals":        [],
             "entry_date":            datetime.now(_ET).strftime("%Y-%m-%d"),
         })
         sym["last_price"] = cur_price   # keep last known price for close_trade P&L
@@ -608,6 +630,31 @@ def check_positions() -> None:
             sym["composite_score"]    = meta["composite_score"]
             sym["measured_move_pct"]  = meta["measured_move_pct"]
             sym["buy_stop"]           = meta["buy_stop"]
+            sym["active_signals"]     = meta.get("active_signals", [])
+
+            # ATR-dynamic trailing stop: 2×ATR(14) as trail %, clamped 4-12%.
+            # Low-vol stocks get tighter stops; high-vol stocks get room to breathe.
+            try:
+                import yfinance as _yf_atr_m
+                _df_atr_m = _yf_atr_m.Ticker(symbol).history(
+                    period="30d", interval="1d", auto_adjust=True)
+                if len(_df_atr_m) >= 15:
+                    _hi_m = _df_atr_m["High"].values
+                    _lo_m = _df_atr_m["Low"].values
+                    _cl_m = _df_atr_m["Close"].values
+                    _tr_m = [max(_hi_m[i] - _lo_m[i],
+                                 abs(_hi_m[i] - _cl_m[i - 1]),
+                                 abs(_lo_m[i] - _cl_m[i - 1]))
+                             for i in range(1, len(_cl_m))]
+                    _atr14 = sum(_tr_m[-14:]) / 14
+                    _raw_trail = (_atr14 * 2) / avg_cost if avg_cost > 0 else trail_pct
+                    sym["atr_trail_pct"] = round(max(0.04, min(0.12, _raw_trail)), 4)
+                    _log.info("[monitor] %s ATR trail: 2×ATR=%.1f%%",
+                              symbol, sym["atr_trail_pct"] * 100)
+                else:
+                    sym["atr_trail_pct"] = trail_pct
+            except Exception:
+                sym["atr_trail_pct"] = trail_pct
             if meta["stop_loss"] > 0:
                 _log.info("[monitor] %s meta: SL=$%.2f Q%d composite=%.1f",
                           symbol, meta["stop_loss"], meta["quality_score"],
@@ -926,11 +973,12 @@ def check_positions() -> None:
                     _log.info("[monitor] %s HARD STOP at $%.2f (VCP pivot low)",
                               symbol, stop_loss_level)
             else:
-                oid = _place_trailing_stop(symbol, qty, trail_pct)
+                _eff_trail = sym.get("atr_trail_pct", trail_pct)
+                oid = _place_trailing_stop(symbol, qty, _eff_trail)
                 if oid:
                     sym["trailing_stop_placed"] = True
                     sym["stop_order_id"] = oid
-                    sym["stop_type"] = "trailing"
+                    sym["stop_type"] = "atr_trailing"
                     changed = True
 
         # ── Step Z: Failed breakout detection — exit if price falls back under pivot ──
@@ -1141,13 +1189,59 @@ def check_positions() -> None:
                           " — runner with 5%% trailing",
                           symbol, sell_qty2, cur_price, pnl_pct * 100)
                 # Tighten trailing stop for the remaining ~34% runner
+                # Use tighter of ATR-derived trail or 5% fixed
                 runner_qty = initial_qty - sym["partial_qty"]
                 if runner_qty > 0:
                     _cancel_stop_orders(symbol)
-                    oid2 = _place_trailing_stop(symbol, runner_qty, 0.05)
+                    _runner_trail = min(sym.get("atr_trail_pct", 0.05), 0.05)
+                    oid2 = _place_trailing_stop(symbol, runner_qty, _runner_trail)
                     sym["trailing_stop_placed"] = True
                     if oid2:
                         sym["stop_order_id"] = oid2
+
+        # ── Step P: Pyramid — add 30% of initial qty after first partial ────────
+        # Conditions: partial1 already taken (position proved itself), gain 12–20%,
+        # held at least 3 trading days, not yet pyramided, market is open.
+        # Uses market order — pyramid shares are entered at current price.
+        if (sym.get("partial1_done")
+                and not sym.get("pyramid_done")
+                and not sym.get("partial2_done")
+                and 0.12 <= pnl_pct <= 0.20):
+            _pyr_days = _trading_days_held(sym.get("entry_date", ""))
+            if _pyr_days >= 3:
+                _pyr_qty = max(1, round(sym.get("initial_qty", qty) * 0.30))
+                _pyr_above_ma20 = False
+                try:
+                    import yfinance as _yf_pyr
+                    _df_pyr = _yf_pyr.Ticker(symbol).history(
+                        period="40d", interval="1d", auto_adjust=True)
+                    if len(_df_pyr) >= 20:
+                        _ma20_pyr = float(_df_pyr["Close"].rolling(20).mean().iloc[-1])
+                        _pyr_above_ma20 = cur_price > _ma20_pyr
+                except Exception:
+                    _pyr_above_ma20 = True  # assume OK if data unavailable
+                if _pyr_above_ma20:
+                    if _place_market_buy(symbol, _pyr_qty):
+                        sym["pyramid_done"]  = True
+                        sym["pyramid_qty"]   = _pyr_qty
+                        sym["pyramid_price"] = cur_price
+                        changed = True
+                        _log.info("[monitor] ✓ %s PYRAMID: added %d sh @ $%.2f (+%.1f%%, day %d)",
+                                  symbol, _pyr_qty, cur_price, pnl_pct * 100, _pyr_days)
+                        try:
+                            import requests as _rqp, os as _osp
+                            _tokp = _osp.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _cidp = _osp.getenv("TELEGRAM_CHAT_ID", "")
+                            if _tokp and _cidp:
+                                _rqp.post(
+                                    f"https://api.telegram.org/bot{_tokp}/sendMessage",
+                                    json={"chat_id": _cidp, "parse_mode": "Markdown",
+                                          "text": (f"📈 *Pyramid* — {symbol}\n"
+                                                   f"Added {_pyr_qty} shares @ ${cur_price:.2f} "
+                                                   f"(+{pnl_pct*100:.1f}%, day {_pyr_days})")},
+                                    timeout=8)
+                        except Exception:
+                            pass
 
         # ── Step C: Move stop to breakeven at +8% (if no partial yet) ───────────
         elif pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
@@ -1592,9 +1686,12 @@ def check_positions() -> None:
                         open(_sa_path, "w").write(_jsa2.dumps(_sa2, indent=2))
                 except Exception:
                     pass
-                # Re-entry cooldown: block stop-outs from re-entering for 5 trading days
+                # Re-entry cooldown: shorter if pyramid was added (shakeout of add-on
+                # shares ≠ full base failure), normal 5 days otherwise
                 if pnl_pct < 0:
-                    record_stop_out(sym, breakout_level=float(sym_data.get("buy_stop", 0.0)))
+                    _cd = 2 if sym_data.get("pyramid_done") else 5
+                    record_stop_out(sym, breakout_level=float(sym_data.get("buy_stop", 0.0)),
+                                    cooldown_days=_cd)
             except Exception as e:
                 _log.warning("[monitor] close_trade %s failed: %s", sym, e)
 
