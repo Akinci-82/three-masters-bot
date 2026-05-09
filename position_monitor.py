@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 
 import pytz
 import requests
@@ -41,8 +41,10 @@ def _alpaca_base() -> str:
 
 
 def _market_is_open() -> bool:
-    now_et = datetime.now(_ET).time()
-    return _MARKET_OPEN <= now_et < _MARKET_CLOSE
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:   # Saturday=5, Sunday=6
+        return False
+    return _MARKET_OPEN <= now_et.time() < _MARKET_CLOSE
 
 
 # ── State persistence ─────────────────────────────────────────────────────────
@@ -1701,6 +1703,20 @@ def check_positions() -> None:
 
 # ── Background thread entry point ─────────────────────────────────────────────
 
+def _seconds_until_market_open() -> int:
+    """Seconds until next NYSE open (09:30 ET on a weekday).
+    Used to sleep through weekends and after-hours without wasteful polling.
+    """
+    now_et = datetime.now(_ET)
+    # Find next weekday with market open
+    candidate = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    if now_et.time() >= _MARKET_OPEN:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return max(60, int((candidate - now_et).total_seconds()))
+
+
 def run_monitor(interval_minutes: int = 15,
                 stop_event: threading.Event | None = None) -> None:
     """Run the position monitor in a blocking loop. Launch from a daemon thread."""
@@ -1710,6 +1726,15 @@ def run_monitor(interval_minutes: int = 15,
     _log.info("[monitor] Position monitor started (interval=%d min)", interval_minutes)
 
     while not stop_event.is_set():
+        now_et = datetime.now(_ET)
+        if now_et.weekday() >= 5 or now_et.time() >= _MARKET_CLOSE:
+            # Weekend or after close — sleep until next market open
+            secs = _seconds_until_market_open()
+            _log.info("[monitor] Market closed — sleeping %dh %dm until next open",
+                      secs // 3600, (secs % 3600) // 60)
+            stop_event.wait(secs)
+            continue
+
         try:
             check_positions()
         except Exception as e:

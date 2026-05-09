@@ -2709,6 +2709,14 @@ def _alpaca_connectivity_watchdog(stop_event: threading.Event) -> None:
     _last_alert: float = 0.0
 
     while not stop_event.is_set():
+        # Skip watchdog pings on weekends — Alpaca paper API is still up but
+        # there's nothing to monitor and no trades to protect
+        import pytz as _pytz_wd
+        _now_et_wd = datetime.now(_pytz_wd.timezone("America/New_York"))
+        if _now_et_wd.weekday() >= 5:
+            stop_event.wait(_INTERVAL)
+            continue
+
         try:
             import broker as _bk_wd
             _bk_wd.get_account()   # lightweight ping - uses _retry internally
