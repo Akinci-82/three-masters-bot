@@ -689,11 +689,17 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         if result.rs_line_leading:
             _log.info("[screen] %s RS LINE LEADING price breakout — elite setup", symbol)
         # RS trending: RS line slope improving over 4w > 8w > 12w = momentum building
-        if len(close) >= 60 and len(spy_close) >= 60:
-            _rs_now = float(close.iloc[-1])  / float(spy_close.iloc[-1])
-            _rs_4w  = float(close.iloc[-21]) / float(spy_close.iloc[-21])
-            _rs_8w  = float(close.iloc[-42]) / float(spy_close.iloc[-42])
-            result.rs_trending = (_rs_now > _rs_4w > _rs_8w)
+        try:
+            _rs_common = close.index.intersection(spy_close.index)
+            _rs_aligned_stock = close.loc[_rs_common]
+            _rs_aligned_spy   = spy_close.loc[_rs_common]
+            if len(_rs_common) >= 60:
+                _rs_now = float(_rs_aligned_stock.iloc[-1])  / float(_rs_aligned_spy.iloc[-1])
+                _rs_4w  = float(_rs_aligned_stock.iloc[-21]) / float(_rs_aligned_spy.iloc[-21])
+                _rs_8w  = float(_rs_aligned_stock.iloc[-42]) / float(_rs_aligned_spy.iloc[-42])
+                result.rs_trending = (_rs_now > _rs_4w > _rs_8w)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
             if result.rs_trending:
                 _log.debug("[screen] %s RS trending up — accumulation building", symbol)
         # Weekly RS confirmation: check if RS line also at 52w high on weekly bars

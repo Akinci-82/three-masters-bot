@@ -147,3 +147,47 @@ MARKET_CLOSE_ET        = (16, 0)
 LOG_LEVEL   = "INFO"
 LOG_MAX_MB  = 20
 LOG_BACKUPS = 5
+
+
+def _validate_config() -> None:
+    """Assert that all critical config values are sane. Call at bot startup."""
+    errors: list[str] = []
+
+    def _chk(cond: bool, msg: str) -> None:
+        if not cond:
+            errors.append(msg)
+
+    # RISK sanity
+    r = RISK
+    _chk(0 < r["risk_per_trade_pct"] <= 0.03,
+         f"risk_per_trade_pct={r['risk_per_trade_pct']} must be in (0, 0.03]")
+    _chk(r["max_risk_per_trade_pct"] >= r["risk_per_trade_pct"],
+         "max_risk_per_trade_pct must be >= risk_per_trade_pct")
+    _chk(0 < r["max_daily_loss_pct"] <= 0.10,
+         f"max_daily_loss_pct={r['max_daily_loss_pct']} must be in (0, 0.10]")
+    _chk(r["max_drawdown_pct"] > r["max_daily_loss_pct"],
+         "max_drawdown_pct must be > max_daily_loss_pct")
+    _chk(r["max_portfolio_heat_pct"] > r["risk_per_trade_pct"],
+         "max_portfolio_heat_pct must be > risk_per_trade_pct")
+    _chk(isinstance(r["max_positions"], int) and 1 <= r["max_positions"] <= 20,
+         f"max_positions={r['max_positions']} must be int in [1, 20]")
+    _chk(isinstance(r.get("stop_distance_tiers", []), list) and r["stop_distance_tiers"],
+         "stop_distance_tiers must be a non-empty list")
+
+    # MONITOR sanity
+    m = MONITOR
+    _chk(1 <= m["interval_minutes"] <= 60,
+         f"interval_minutes={m['interval_minutes']} must be in [1, 60]")
+    _chk(0 < m["partial_exit_trigger"] < 1.0,
+         f"partial_exit_trigger={m['partial_exit_trigger']} must be in (0, 1)")
+    _chk(0 < m["trailing_stop_pct"] < 1.0,
+         f"trailing_stop_pct={m['trailing_stop_pct']} must be in (0, 1)")
+    _chk(0 < m["breakeven_trigger"] < m["partial_exit_trigger"],
+         "breakeven_trigger must be > 0 and < partial_exit_trigger")
+
+    # API key presence
+    _chk(bool(ALPACA_API_KEY), "ALPACA_API_KEY is not set")
+    _chk(bool(ALPACA_SECRET_KEY), "ALPACA_SECRET_KEY is not set")
+
+    if errors:
+        raise ValueError("Config validation failed:\n" + "\n".join(f"  • {e}" for e in errors))

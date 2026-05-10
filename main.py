@@ -801,12 +801,15 @@ def _send_weekly_report(portfolio_value: float) -> None:
 
 def _check_market_regime() -> tuple[str, float, float, float]:
     """
-    Determine market regime from SPY vs its 200-day MA.
-    Returns (regime, spy_price, ma200, pct_diff).
+    Determine market regime from SPY vs its 200-day MA, with 2-scan hysteresis.
+    Returns (confirmed_regime, spy_price, ma200, pct_diff).
       'bull'    — SPY above MA200 or within 3% below  → full sizing
       'neutral' — SPY 3-8% below MA200                → 75% sizing
       'bear'    — SPY >8% below MA200                 → no new positions
-    On fetch failure returns 'bull' so the bot never blocks itself on error.
+
+    Hysteresis: a regime flip requires the same raw signal on 2 consecutive scans.
+    This prevents bull→neutral→bull whipsaw around the MA200 boundary.
+    On fetch failure returns the last confirmed regime (or 'bull' if unknown).
     """
     try:
         df    = yf.Ticker("SPY").history(period="1y", interval="1d", auto_adjust=True)
@@ -815,17 +818,56 @@ def _check_market_regime() -> tuple[str, float, float, float]:
         price = float(close.iloc[-1])
         pct   = (price - ma200) / ma200
         if pct > -0.03:
-            regime = "bull"
+            raw_regime = "bull"
         elif pct > -0.08:
-            regime = "neutral"
+            raw_regime = "neutral"
         else:
-            regime = "bear"
-        _log.info("[regime] SPY $%.2f | MA200 $%.2f | %+.1f%% → %s",
-                  price, ma200, pct * 100, regime.upper())
-        return regime, price, ma200, pct
+            raw_regime = "bear"
+        _log.info("[regime] SPY $%.2f | MA200 $%.2f | %+.1f%% → raw=%s",
+                  price, ma200, pct * 100, raw_regime.upper())
+
+        # ── Hysteresis: require 2 consecutive scans to confirm a flip ────────
+        from risk_manager import _load as _r_load, _save as _r_save
+        rs = _r_load()
+        confirmed = rs.get("confirmed_regime", raw_regime)
+        pending   = rs.get("pending_regime", "")
+        count     = rs.get("pending_regime_count", 0)
+
+        if raw_regime == confirmed:
+            # Back in line with confirmed — clear pending
+            rs["pending_regime"] = ""
+            rs["pending_regime_count"] = 0
+        elif raw_regime == pending:
+            # Same signal as last scan — increment counter
+            count += 1
+            rs["pending_regime_count"] = count
+            if count >= 2:
+                _log.info("[regime] Hysteresis confirmed: %s → %s (count=%d)",
+                          confirmed.upper(), raw_regime.upper(), count)
+                rs["confirmed_regime"]      = raw_regime
+                rs["pending_regime"]        = ""
+                rs["pending_regime_count"]  = 0
+                confirmed = raw_regime
+            else:
+                _log.info("[regime] Hysteresis pending: %s → %s (count=%d/2)",
+                          confirmed.upper(), raw_regime.upper(), count)
+        else:
+            # New different signal — start fresh pending
+            rs["pending_regime"]       = raw_regime
+            rs["pending_regime_count"] = 1
+            _log.info("[regime] Hysteresis new pending: %s → %s (1/2)",
+                      confirmed.upper(), raw_regime.upper())
+
+        _r_save(rs)
+        return confirmed, price, ma200, pct
     except Exception as e:
-        _log.warning("[regime] Check failed (%s) — defaulting to BULL", e)
-        return "bull", 0.0, 0.0, 0.0
+        _log.warning("[regime] Check failed (%s) — using last confirmed or BULL", e)
+        try:
+            from risk_manager import _load as _r_load
+            fallback = _r_load().get("confirmed_regime", "bull")
+            return fallback, 0.0, 0.0, 0.0
+        except Exception:
+            return "bull", 0.0, 0.0, 0.0
 
 
 def _fetch_vix() -> float:
@@ -980,7 +1022,7 @@ def _fetch_vix_slope() -> float:
 def _consecutive_win_factor(wins: int) -> float:
     """Tudor Jones: press winners — increase size modestly after consecutive wins."""
     if wins >= 3:
-        return 1.25   # 3+ wins → 125% of base risk
+        return 1.15   # 3+ wins → 115% of base risk
     if wins >= 2:
         return 1.10   # 2 wins → 110%
     return 1.00
@@ -2797,6 +2839,14 @@ def _startup_healthcheck() -> bool:
     """
     failures: list[str] = []
     warnings_hc: list[str] = []
+
+    # 0. Config sanity — catch misconfigured values before anything else
+    try:
+        from config import _validate_config
+        _validate_config()
+        _log.info("[startup] ✓ Config validation passed")
+    except ValueError as _e_cfg:
+        failures.append(str(_e_cfg))
 
     # 1. Required environment variables
     import os as _os_hc

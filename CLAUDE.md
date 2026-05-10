@@ -158,6 +158,34 @@ tail -20 logs/trade_journal.jsonl | python3 -m json.tool
 
 ## Ändringshistorik (senaste patches)
 
+### patch-21 — Säkerhet, trådkoncurrens och strategi-finjustering (2026-05-10)
+
+**risk_manager.py**
+- `_RISK_LOCK`: uppgraderat från `threading.Lock()` → `threading.RLock()` (tillåter återinträde från samma tråd i kapslade anrop)
+- `check_can_trade`, `register_trade`, `close_trade`, `daily_reset`, `sync_positions`, `_halt`: alla omslutas nu av ett yttre `with _RISK_LOCK:` — atomisk läs-modifiera-spara, eliminerar race mellan scan- och monitor-trådar
+- Trade journal: varje `json.loads()`-anrop i `_kelly_factor()` insvept i individuellt try-except — en korrupt rad dödar inte hela Kelly-beräkningen
+
+**position_sync.py**
+- Empty-state guard: om Alpaca returnerar 0 positioner + 0 ordrar men `risk_state` innehåller öppna positioner → `SyncError` kastas direkt (istället för att tyst ghost-rensa all intern state vid API-glitch)
+
+**telegram_commands.py**
+- `/scan`-kommando: kontrollerar `_SCAN_LOCK.acquire(blocking=False)` innan tråd skapas — användaren får omedelbar feedback "scan pågår redan" om en scan redan körs
+- `_tg_escape()`: ny hjälpfunktion som escapar MarkdownV1-specialtecken (`*`, `_`, `` ` ``) i symbolnamn och fritext — förhindrar att t.ex. `BRK_B` bryter meddelandeformatering
+- `_tg_escape()` applicerad på symboler i `/orders`, `/positions` och `/cancel`-svar
+
+**main.py**
+- `_check_market_regime()`: 2-scan hysteresis — regimskifte (bull↔neutral↔bear) kräver nu samma råsignal på 2 på varandra följande scanningar. Bekräftad regim sparas i `risk_state.json` (`confirmed_regime`, `pending_regime`, `pending_regime_count`). Förhindrar bull→neutral→bull-whipsaw runt MA200-gränsen. Vid API-fel returneras senast bekräftad regim istället för alltid "bull"
+- `_consecutive_win_factor()`: max-tak sänkt 1.25 → 1.15 (mer konservativt storlekspressande vid vinstsvit — undviker överdrivet risktagande efter 3+ vinster)
+- `_startup_healthcheck()`: anropar `config._validate_config()` som steg 0 — fångar felkonfiguration innan API-anslutningar testas
+
+**config.py**
+- `_validate_config()`: ny funktion med assertions för kritiska RISK/MONITOR-värden (range-kontroller för `risk_per_trade_pct`, `max_daily_loss_pct`, `max_drawdown_pct`, `max_portfolio_heat_pct`, `max_positions`, `interval_minutes`, `partial_exit_trigger`, `trailing_stop_pct`, `breakeven_trigger` samt närvaro av Alpaca API-nycklar)
+
+**screener.py**
+- RS trending-beräkning (~rad 692–702): `close.index.intersection(spy_close.index)` används nu för att synka datum-index innan RS-ratio beräknas — förhindrar att jämföra aktie dag N med SPY dag M vid driftstopp eller dataleveransfördröjningar
+
+---
+
 ### patch-20 — Strategi-korrekthet, säkerhet och prestanda (2026-05-10)
 
 **main.py**

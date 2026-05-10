@@ -26,7 +26,7 @@ RISK_FILE = LOG_DIR / "risk_state.json"
 
 # Lock guards all reads + writes of risk_state.json to prevent
 # concurrent corruption between the daily scan thread and the position monitor thread.
-_RISK_LOCK = threading.Lock()
+_RISK_LOCK = threading.RLock()
 
 
 def _load() -> dict:
@@ -71,7 +71,15 @@ def _kelly_factor() -> float:
         if not jpath.exists():
             base_kelly = 1.0
         else:
-            trades = [_j.loads(ln) for ln in jpath.read_text().splitlines() if ln.strip()]
+            _lines = jpath.read_text().splitlines()
+            trades = []
+            for _ln in _lines:
+                if not _ln.strip():
+                    continue
+                try:
+                    trades.append(_j.loads(_ln))
+                except Exception:
+                    pass
             if len(trades) < 10:
                 base_kelly = 1.0
             else:
@@ -195,88 +203,92 @@ def check_can_trade(portfolio_value: float, new_risk_pct: float) -> tuple[bool, 
     Verify all risk limits before placing a new trade.
     Returns (can_trade, reason).
     """
-    state = _load()
+    with _RISK_LOCK:
+        state = _load()
 
-    # Reset daily state on new trading day
-    if state.get("date") != str(date.today()):
-        state["date"] = str(date.today())
-        state["daily_pnl_pct"] = 0.0
-        state["trading_halted"] = False
-        state["halt_reason"] = ""
-        _save(state)
+        # Reset daily state on new trading day
+        if state.get("date") != str(date.today()):
+            state["date"] = str(date.today())
+            state["daily_pnl_pct"] = 0.0
+            state["trading_halted"] = False
+            state["halt_reason"] = ""
+            _save(state)
 
-    if state.get("trading_halted"):
-        return False, f"Halted: {state.get('halt_reason')}"
+        if state.get("trading_halted"):
+            return False, f"Halted: {state.get('halt_reason')}"
 
-    # Daily loss circuit breaker
-    if state["daily_pnl_pct"] <= -RISK["max_daily_loss_pct"]:
-        msg = f"Daily loss {state['daily_pnl_pct']:.1%} >= -{RISK['max_daily_loss_pct']:.0%}"
-        _halt(msg)
-        return False, msg
+        # Daily loss circuit breaker
+        if state["daily_pnl_pct"] <= -RISK["max_daily_loss_pct"]:
+            msg = f"Daily loss {state['daily_pnl_pct']:.1%} >= -{RISK['max_daily_loss_pct']:.0%}"
+            _halt(msg)
+            return False, msg
 
-    # Drawdown guard
-    ath = state.get("portfolio_ath", portfolio_value)
-    if ath < portfolio_value:
-        state["portfolio_ath"] = portfolio_value
-        _save(state)
-        ath = portfolio_value
-    drawdown = (ath - portfolio_value) / ath if ath > 0 else 0
-    # Soft pause: slow down entries before hitting the hard halt (8% drawdown)
-    soft_dd_pct = RISK.get("soft_drawdown_pause_pct", 0.08)
-    if soft_dd_pct <= drawdown < RISK["max_drawdown_pct"]:
-        return False, (f"Soft drawdown pause: {drawdown:.1%} >= {soft_dd_pct:.0%} — "
-                       "no new entries until portfolio recovers")
-    if drawdown >= RISK["max_drawdown_pct"]:
-        msg = f"Drawdown {drawdown:.1%} >= {RISK['max_drawdown_pct']:.0%}"
-        _halt(msg)
-        return False, msg
+        # Drawdown guard
+        ath = state.get("portfolio_ath", portfolio_value)
+        if ath < portfolio_value:
+            state["portfolio_ath"] = portfolio_value
+            _save(state)
+            ath = portfolio_value
+        drawdown = (ath - portfolio_value) / ath if ath > 0 else 0
+        # Soft pause: slow down entries before hitting the hard halt (8% drawdown)
+        soft_dd_pct = RISK.get("soft_drawdown_pause_pct", 0.08)
+        if soft_dd_pct <= drawdown < RISK["max_drawdown_pct"]:
+            return False, (f"Soft drawdown pause: {drawdown:.1%} >= {soft_dd_pct:.0%} — "
+                           "no new entries until portfolio recovers")
+        if drawdown >= RISK["max_drawdown_pct"]:
+            msg = f"Drawdown {drawdown:.1%} >= {RISK['max_drawdown_pct']:.0%}"
+            _halt(msg)
+            return False, msg
 
-    # Portfolio heat: total open risk across all positions
-    open_risk = state.get("open_risk_pct", 0.0)
-    max_heat  = RISK.get("max_portfolio_heat_pct", 0.08)
-    if open_risk + new_risk_pct > max_heat:
-        return False, f"Portfolio heat {open_risk + new_risk_pct:.1%} exceeds {max_heat:.0%}"
+        # Portfolio heat: total open risk across all positions
+        open_risk = state.get("open_risk_pct", 0.0)
+        max_heat  = RISK.get("max_portfolio_heat_pct", 0.08)
+        if open_risk + new_risk_pct > max_heat:
+            return False, f"Portfolio heat {open_risk + new_risk_pct:.1%} exceeds {max_heat:.0%}"
 
-    return True, "OK"
+        return True, "OK"
 
 
 def _halt(reason: str):
-    state = _load()
-    state["trading_halted"] = True
-    state["halt_reason"] = reason
-    _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        state["trading_halted"] = True
+        state["halt_reason"] = reason
+        _save(state)
     _log.warning("[risk] TRADING HALTED: %s", reason)
 
 
 def register_trade(symbol: str, risk_pct: float):
     """Call when a position is opened."""
-    state = _load()
-    state.setdefault("positions_risk", {})[symbol] = risk_pct
-    state["open_risk_pct"] = sum(state["positions_risk"].values())
-    _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        state.setdefault("positions_risk", {})[symbol] = risk_pct
+        state["open_risk_pct"] = sum(state["positions_risk"].values())
+        _save(state)
     _log.info("[risk] %s opened — open_risk=%.1f%%", symbol, state["open_risk_pct"] * 100)
 
 
 def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
                 start_value: float | None = None):
     """Call when a position is closed."""
-    state = _load()
-    state.get("positions_risk", {}).pop(symbol, None)
-    state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
+    with _RISK_LOCK:
+        state = _load()
+        state.get("positions_risk", {}).pop(symbol, None)
+        state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
 
-    # Use day_start_equity stored at daily_reset() if caller doesn't know it
-    start = start_value or state.get("day_start_equity", portfolio_value)
-    daily_pnl = (portfolio_value - start) / start if start else 0
-    state["daily_pnl_pct"] = daily_pnl
+        # Use day_start_equity stored at daily_reset() if caller doesn't know it
+        start = start_value or state.get("day_start_equity", portfolio_value)
+        daily_pnl = (portfolio_value - start) / start if start else 0
+        state["daily_pnl_pct"] = daily_pnl
 
-    if pnl_pct < 0:
-        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
-        state["consecutive_wins"]   = 0
-    else:
-        state["consecutive_losses"] = 0
-        state["consecutive_wins"]   = state.get("consecutive_wins", 0) + 1
+        if pnl_pct < 0:
+            state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+            state["consecutive_wins"]   = 0
+        else:
+            state["consecutive_losses"] = 0
+            state["consecutive_wins"]   = state.get("consecutive_wins", 0) + 1
 
-    _save(state)
+        _save(state)
     _log.info("[risk] %s closed | pnl=%.1f%% | heat now=%.1f%% | day_pnl=%.1f%%",
               symbol, pnl_pct * 100, state["open_risk_pct"] * 100, daily_pnl * 100)
 
@@ -347,29 +359,31 @@ def get_state() -> dict:
 
 def daily_reset(portfolio_value: float = 0.0):
     """Call at start of each trading day to reset daily counters."""
-    state = _load()
-    state["date"] = str(date.today())
-    state["daily_pnl_pct"] = 0.0
-    state["trading_halted"] = False
-    state["halt_reason"] = ""
-    if portfolio_value > 0:
-        state["day_start_equity"] = portfolio_value   # used by close_trade for daily P&L
-    _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        state["date"] = str(date.today())
+        state["daily_pnl_pct"] = 0.0
+        state["trading_halted"] = False
+        state["halt_reason"] = ""
+        if portfolio_value > 0:
+            state["day_start_equity"] = portfolio_value   # used by close_trade for daily P&L
+        _save(state)
     _log.info("[risk] Daily reset complete")
 
 def sync_positions(held_symbols: set):
     """Sync positions_risk with actual held symbols — removes stale entries."""
-    state = _load()
-    before = dict(state.get("positions_risk", {}))
-    state["positions_risk"] = {
-        sym: risk for sym, risk in before.items()
-        if sym in held_symbols
-    }
-    state["open_risk_pct"] = sum(state["positions_risk"].values())
-    removed = set(before) - set(state["positions_risk"])
-    if removed:
-        _log.info("[risk] Removed stale risk entries: %s", removed)
-    _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        before = dict(state.get("positions_risk", {}))
+        state["positions_risk"] = {
+            sym: risk for sym, risk in before.items()
+            if sym in held_symbols
+        }
+        state["open_risk_pct"] = sum(state["positions_risk"].values())
+        removed = set(before) - set(state["positions_risk"])
+        if removed:
+            _log.info("[risk] Removed stale risk entries: %s", removed)
+        _save(state)
 
 
 def record_pivot_failure(symbol: str):

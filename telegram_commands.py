@@ -30,6 +30,13 @@ def _token() -> str:
 def _chat_id() -> str:
     return os.getenv("TELEGRAM_CHAT_ID", "")
 
+def _tg_escape(text: str) -> str:
+    """Escape MarkdownV1 special chars in free-text fields (symbols, names)."""
+    for ch in ("*", "_", "`"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _send(text: str) -> None:
     try:
         requests.post(
@@ -84,7 +91,7 @@ def _cmd_orders() -> str:
             return "No pending buy-stop orders."
         lines = [f"⏳ *Pending buy-stops ({len(orders)}):*"]
         for o in orders:
-            lines.append(f"  *{o['symbol']}* {int(o['qty'])}sh @ ${o['stop_price']:.2f}")
+            lines.append(f"  *{_tg_escape(o['symbol'])}* {int(o['qty'])}sh @ ${o['stop_price']:.2f}")
         return "\n".join(lines)
     except Exception as e:
         return f"Error fetching orders: {e}"
@@ -98,7 +105,7 @@ def _cmd_positions() -> str:
             return "No open positions."
         lines = [f"📈 *Open positions ({len(positions)}):*"]
         for p in positions:
-            sym      = p["symbol"]
+            sym      = _tg_escape(p["symbol"])
             qty      = int(float(p["qty"]))
             avg      = float(p["avg_entry_price"])
             cur      = float(p["current_price"])
@@ -125,7 +132,7 @@ def _cmd_cancel(symbol: str) -> str:
         state.get("positions_risk", {}).pop(sym, None)
         state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
         _save(state)
-        return f"✅ Cancelled {n} order(s) for *{sym}* and removed from risk state."
+        return f"✅ Cancelled {n} order(s) for *{_tg_escape(sym)}* and removed from risk state."
     except Exception as e:
         return f"Error cancelling {symbol}: {e}"
 
@@ -170,15 +177,22 @@ def _handle_update(update: dict) -> None:
         else:
             _send(_cmd_cancel(arg))
     elif cmd == "/scan":
-        _send("\U0001f50d Running manual scan\u2026 (2\u20135 min)")
-        import threading as _thr
-        def _bg_scan(_send_fn=_send):
-            try:
-                import main as _main
-                _main.run_daily()
-            except Exception as _e:
-                _send_fn(f"\u274c Scan error: {_e}")
-        _thr.Thread(target=_bg_scan, daemon=True, name="tg-manual-scan").start()
+        try:
+            import main as _main_mod
+            if not _main_mod._SCAN_LOCK.acquire(blocking=False):
+                _send("\u23f3 A scan is already running \u2014 results will come when it finishes.")
+            else:
+                _main_mod._SCAN_LOCK.release()
+                _send("\ud83d\udd0d Running manual scan\u2026 (2\u20135 min)")
+                import threading as _thr
+                def _bg_scan(_send_fn=_send, _m=_main_mod):
+                    try:
+                        _m.run_daily()
+                    except Exception as _e:
+                        _send_fn(f"\u274c Scan error: {_e}")
+                _thr.Thread(target=_bg_scan, daemon=True, name="tg-manual-scan").start()
+        except Exception as _scan_ex:
+            _send(f"\u274c Could not start scan: {_scan_ex}")
     elif cmd == "/help":
         _send(_cmd_help())
     else:

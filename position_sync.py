@@ -141,6 +141,16 @@ def sync_all() -> dict:
     buy_syms   = {o["symbol"] for o in orders if o["side"] == "buy"}
     alpaca_syms = held_syms | buy_syms
 
+    # Guard: Alpaca returning 0 positions + 0 orders while risk_state shows open
+    # positions is almost certainly an API glitch — abort rather than ghost-wipe everything.
+    if not held_syms and not buy_syms:
+        _risk_check = _load_risk()
+        if _risk_check.get("positions_risk"):
+            raise SyncError(
+                f"Alpaca returned 0 positions + 0 orders but risk_state tracks "
+                f"{list(_risk_check['positions_risk'].keys())} — likely API glitch, aborting"
+            )
+
     changes: dict = {
         "ghost_orders_removed":    [],
         "ghost_positions_removed": [],
