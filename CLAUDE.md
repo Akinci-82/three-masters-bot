@@ -158,6 +158,34 @@ tail -20 logs/trade_journal.jsonl | python3 -m json.tool
 
 ## Ändringshistorik (senaste patches)
 
+### patch-19 — Robusthet och dataintegritet (2026-05-10)
+
+**main.py**
+- `_tg()`: delar upp meddelanden >4000 tecken rekursivt (Telegram 4096-gräns)
+- `_gtc_order_age_bdays()` + GTC zombie-rensning i `_smart_order_management()`: avbryter buy-stop ordrar äldre än 3 handelsdagar
+- `_archive_old_jsonl()`: flyttad till slutet av `_run_daily_impl()` (undviker race med position monitor under aktiv marknad)
+- Skickar `tick_fn=_heartbeat` till `batch_analyze()` — heartbeat var 5:e VCP-kandidat
+
+**vcp_analyzer.py**
+- `batch_analyze()`: `tick_fn` callback-parameter — anropas var 5:e kandidat för att hålla watchdog-heartbeat vid liv under långa API-batchar
+- `_VCP_CACHE_LOCK`: threading.Lock() runt all cache-I/O (atomisk skrivning via tempfil)
+- `anthropic.Anthropic(timeout=20.0)` — förhindrar att hängande Claude-anrop blockerar scan i minuter
+- `_call_haiku/sonnet/opus()`: separerar `anthropic.APIError` (nätverksfel → sentinel `{"_api_error": True}`) från JSON-parsningsfel (→ VCP avvisas)
+- `analyze()`: `confidence` klämmt till [0,1], `quality` till [1,5]; validerar `breakout > stop_loss > 0`
+
+**risk_manager.py**
+- `_RISK_LOCK = threading.Lock()`: skyddar risk_state.json mot race condition mellan scan-tråd och monitor-tråd
+- `_save()`: atomisk skrivning via tempfil + `Path.replace()` (POSIX-atomisk)
+
+**position_monitor.py**
+- `_save_state()`: atomisk skrivning via `os.replace()`
+- `_sync_fail_count`: modul-level räknare; Telegram-larm vid 2+ konsekutiva sync-misslyckanden, nollställs vid framgång
+
+**Alla 4 filer (89 ställen)**
+- Tysta `except: pass` → `_log.debug("[%s] suppressed", __name__, exc_info=True)` — buggen `%%s` fixad
+
+---
+
 ### patch-18 — Kodkvalitet och optimering (2026-05-10)
 
 **requirements.txt**

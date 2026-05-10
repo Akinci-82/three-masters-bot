@@ -72,6 +72,13 @@ _log = logging.getLogger("three_masters")
 def _tg(msg: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
+    # Telegram silently truncates messages >4096 chars — split at 4000 to stay safe
+    if len(msg) > 4000:
+        parts = []
+        while msg:
+            parts.append(msg[:4000])
+            msg = msg[4000:]
+        return all(_tg(part) for part in parts)
     try:
         import requests
         r = requests.post(
@@ -140,7 +147,7 @@ def _load_equity_baseline() -> dict | None:
         if _BASELINE_FILE.exists():
             return json.loads(_BASELINE_FILE.read_text())
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return None
 
 
@@ -239,7 +246,7 @@ def _send_morning_briefing() -> None:
                             _log.info("[briefing] PRE-MARKET GAP: %s $%.2f >> stop $%.2f — order cancelled",
                                       sym, pre, stop_p)
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
             except Exception as e:
                 _log.debug("[briefing] Pre-market price check failed: %s", e)
 
@@ -275,12 +282,12 @@ def _send_morning_briefing() -> None:
                             if _ratio < 0.80:
                                 _vol_warns.append(f"  ⚠️ *{_sym_bv}* weak volume: {_ratio:.1f}× avg — possible distribution")
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
                 if _vol_warns:
                     lines.append("\n*Volume alerts:*")
                     lines.extend(_vol_warns)
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Sector rotation alert — sectors crossing into leadership ──────────────
         try:
             _spy_h  = yf.Ticker("SPY").history(period="60d", interval="1d", auto_adjust=True)["Close"]
@@ -298,12 +305,12 @@ def _send_morning_briefing() -> None:
                         if _rel_prev < -0.01 and _rel_now > 0.005:
                             _sr_alerts.append(f"  🔄 *{_sname}* ({_etf}) entering leadership: {_rel_now*100:+.1f}% vs SPY")
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
             if _sr_alerts:
                 lines.append("\n*Sector rotation:*")
                 lines.extend(_sr_alerts)
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Pre-open gap alerts for held positions ─────────────────────────────
         if positions:
             try:
@@ -321,12 +328,12 @@ def _send_morning_briefing() -> None:
                                 _pre_alerts.append(
                                     f"  {_dir} *{_pg_sym}* pre-market ${_pre_p:.2f} ({_gap*100:+.1f}% vs prev close)")
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
                 if _pre_alerts:
                     lines.append("\n*Pre-open gaps (≥3%):*")
                     lines.extend(_pre_alerts)
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── PM12: Pre-market gap + volume screen for last night's scan candidates ──
         # Stocks screened last night that weren't ordered but are now moving pre-market.
         # Also checks premarket volume vs 30-day average to flag genuine breakouts
@@ -370,12 +377,12 @@ def _send_morning_briefing() -> None:
                                         elif _pm_vol_ratio >= 1.0:
                                             _vol_tag = f" vol {_pm_vol_ratio:.1f}×avg"
                                 except Exception:
-                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                                 _pm_alerts.append(
                                     f"  {'🔥' if _g>=0.03 else '📈'} *{_pm_sym}* "
                                     f"+{_g*100:.1f}% pre-market ${_pre_pm:.2f}{_vol_tag}")
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
                 if _pm_alerts:
                     lines.append("\n*Pre-market breakout candidates:*")
                     lines.extend(_pm_alerts)
@@ -489,7 +496,7 @@ def _opening_range_check() -> None:
                             _log.info("[or_check] %s price $%.2f below VWAP $%.2f",
                                       sym, cur_price, _vwap)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                 if cur_price < stop_p * 0.998:
                     cancel_all_orders(sym)
                     rs = _lrs()
@@ -588,7 +595,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                 errors_total += len(r.get("errors", []))
                 days_scanned += 1
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Read all trade journal entries (full history, not just this week) ──
         total_trades = wins = losses = 0
         win_r_sum = loss_r_sum = 0.0
@@ -611,7 +618,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                            else "6.0-7.0" if cs_val >= 6.0 else "5.0-6.0")
                     score_buckets[bkt].append(r)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
         win_rate   = wins / total_trades if total_trades else 0.0
         avg_win_r  = win_r_sum / wins if wins else 0.0
         avg_loss_r = loss_r_sum / losses if losses else 0.0
@@ -656,7 +663,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     if _wkts and date.fromisoformat(_wkts[:10]) >= _week_ago:
                         _wk_trades.append(_wkt)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
         if _wk_trades:
             lines.append(f"")
             _w_sorted = sorted(_wk_trades, key=lambda x: x.get("r_multiple", 0), reverse=True)
@@ -697,7 +704,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
             }
             (LOG_DIR / "feedback_state.json").write_text(json.dumps(_fb, indent=2))
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Signal attribution: which screener flags correlate with winners ─────
         try:
             _sa_path = LOG_DIR / "signal_accuracy.json"
@@ -719,7 +726,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     lines.append(f"\n*Signal accuracy (≥3 trades):*")
                     lines.extend(_sig_lines[:8])   # top 8 by total R
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         lines.append(f"")
         if ret_line:
             lines.append(ret_line)
@@ -733,7 +740,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     try:
                         _all_trades.append(json.loads(_atl))
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
             if _all_trades:
                 _best  = max(_all_trades, key=lambda t: t.get("r_multiple", 0))
                 _worst = min(_all_trades, key=lambda t: t.get("r_multiple", 0))
@@ -761,7 +768,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                         if 0 < _hd < 120:
                             _hold_days.append(_hd)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
             if _hold_days:
                 _avg_hold = sum(_hold_days) / len(_hold_days)
                 lines.append(f"  Avg hold: {_avg_hold:.0f} trading days")
@@ -782,7 +789,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                 lines.append(f"  {_bt_n} trades  WR={_bt_wr:.0%}  "
                               f"E={_bt_exp:+.2f}R  CAGR={_bt_cagr:.1f}%")
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         _tg("\n".join(lines))
         _log.info("[weekly] Weekly report sent")
     except Exception as e:
@@ -828,7 +835,7 @@ def _fetch_vix() -> float:
         if not vix.empty:
             return float(vix["Close"].iloc[-1])
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 20.0
 
 
@@ -966,7 +973,7 @@ def _fetch_vix_slope() -> float:
         if len(hist) >= 6:
             return float(hist["Close"].iloc[-1] - hist["Close"].iloc[-6])
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 0.0
 
 
@@ -991,7 +998,7 @@ def _fetch_10y_yield_slope() -> float:
             # ^TNX is in %, e.g. 4.50 means 4.50% — convert change to bps
             return float((hist["Close"].iloc[-1] - hist["Close"].iloc[-21]) * 100)
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 0.0
 
 
@@ -1021,7 +1028,7 @@ def _dynamic_min_composite() -> float:
                       bkt_lo["avg_r"], bkt_lo["count"])
             return 6.0
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 5.0
 
 
@@ -1039,7 +1046,7 @@ def _fetch_pcr() -> float:
             except Exception:
                 continue
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 0.7
 
 
@@ -1225,7 +1232,7 @@ def _qqq_size_factor() -> float:
                 _log.info("[tudor] QQQ below MA50 — growth regime weak, sizing capped 75%%")
                 return 0.75
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 1.0
 
 
@@ -1246,7 +1253,7 @@ def _fetch_credit_spread_factor() -> float:
                           abs(_chg5d) * 100)
                 return 0.80
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 1.0
 
 
@@ -1266,7 +1273,7 @@ def _extended_market_factor() -> float:
                           _ext_pct * 100)
                 return 0.7
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 1.0
 
 
@@ -1283,7 +1290,7 @@ def _fetch_dxy_factor() -> float:
                           _dxy_ret * 100)
                 return 0.85
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 1.0
 
 
@@ -1406,7 +1413,7 @@ def _fetch_nh_nl_ratio() -> float:
             if _net < -50:   return 0.5   # weakening
             return 1.0
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return 1.0   # neutral fallback when data unavailable
 
 
@@ -1707,10 +1714,25 @@ def _is_correlated(candidate: str, held: set, threshold: float = 0.80) -> bool:
         return False
 
 
+def _gtc_order_age_bdays(created_at_str: str) -> int:
+    """Return business days elapsed since a GTC order was created."""
+    if not created_at_str:
+        return 0
+    try:
+        from pandas.tseries.offsets import BDay
+        import pandas as _pd
+        created = _pd.Timestamp(created_at_str).tz_localize(None)
+        today   = _pd.Timestamp.today().normalize()
+        delta   = int((today - created) / BDay(1))
+        return max(0, delta)
+    except Exception:
+        return 0
+
+
 def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
     """
     Compare existing Alpaca buy-stop orders against new VCP candidates.
-    Cancels stale or price-drifted orders; keeps valid ones.
+    Cancels stale, price-drifted, or zombie orders; keeps valid ones.
     Returns set of symbols whose existing order is retained (skip re-placing).
     """
     from broker import get_open_orders, cancel_all_orders as _cancel_sym
@@ -1726,6 +1748,14 @@ def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
             _cancel_sym(sym)
             _log.info("[main] Cancelled buy-stop for %s — position already filled", sym)
             continue
+
+        # GTC zombie: cancel unfilled orders older than 3 trading days
+        age_bdays = _gtc_order_age_bdays(order.get("created_at", ""))
+        if age_bdays > 3:
+            _cancel_sym(sym)
+            _log.info("[main] Cancelled GTC zombie: %s (age=%d trading days)", sym, age_bdays)
+            continue
+
         if sym not in new_map:
             _cancel_sym(sym)
             _log.info("[main] Cancelled stale order: %s (no longer a VCP candidate)", sym)
@@ -1800,7 +1830,6 @@ def _archive_old_jsonl(max_age_days: int = 180):
 def _run_daily_impl():
     """Actual pipeline — always called under _SCAN_LOCK."""
     _heartbeat()
-    _archive_old_jsonl()
 
     today = str(date.today())
     _log.info("=" * 70)
@@ -1880,6 +1909,11 @@ def _run_daily_impl():
     # ── Weekly report on Fridays ──────────────────────────────────────────────
     if datetime.now().weekday() == 4:   # Friday
         _send_weekly_report(portfolio_value)
+
+    # ── JSONL archiving: run after scan when market is closed and monitor is idle ─
+    # Moved here from start-of-run to avoid a race with position_monitor appending
+    # to trade_journal.jsonl during an active market session.
+    _archive_old_jsonl()
 
 
 def _run_scan(report: dict, today: str, portfolio_value: float,
@@ -1962,7 +1996,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         from vcp_analyzer import batch_analyze
         top_candidates = sorted(trend_passed, key=lambda r: -_simons_score(r))[:40]
         trend_map      = {r.symbol: r for r in top_candidates}
-        vcp_results = batch_analyze(top_candidates, max_symbols=40)
+        vcp_results = batch_analyze(top_candidates, max_symbols=40, tick_fn=_heartbeat)
         vcp_passed  = [r for r in vcp_results if r.passed]
         report["vcp_passed"] = [r.symbol for r in vcp_passed]
         _log.info("[minervini] %d/%d have confirmed VCP",
@@ -2165,7 +2199,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 _log.warning("[tudor] VIX SPIKE: %.1f → %.1f (+%.0f%%) — sudden market distress",
                              _vix_prev, _current_vix, _vix_chg * 100)
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
     sector_momentum, sector_stage2 = _sector_momentum_scores()
     _power_trend      = _fetch_power_trend()
@@ -2186,7 +2220,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 if not _h.empty:
                     _etf_closes[_etf] = _h["Close"]
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         for _tr in vcp_passed:
             _sec = get_sector(_tr.symbol)
             _etf = _SECTOR_ETF_MAP.get(_sec)
@@ -2200,9 +2234,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                         _ep = float(_etf_c.iloc[-1] / _etf_c.iloc[-_n] - 1)
                         _tr.rs_vs_sector = round(_sp - _ep, 4)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     _log.info("[tudor] 10Y yield slope=%.0fbps (%s)",
               _rate_slope_bps,
               "rising-hard(-1.0)" if _rate_slope_bps > 50 else
@@ -2352,7 +2386,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                           _atr_pct * 100, max_new_pos, max(1, max_new_pos // 2))
                 max_new_pos = max(1, max_new_pos // 2)
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     _reject_reasons: dict[str, str] = {}
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
@@ -2446,7 +2480,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                     _log.info("[main] %s gap-up breakout (open $%.2f > prior high $%.2f) — size +10%%",
                               vcp.symbol, _gap_open, _gap_prev_h)
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         risk_pct  = (_adaptive_risk_pct(composite, base_risk, _current_vix)
                      * regime_size_factor * loss_factor * win_factor
                      * _atr_f * _sym_beta_f * _extended_factor * _qqq_factor
@@ -2493,7 +2527,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                               vcp.symbol, sizing["notional"], _adv)
                     continue
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         if vcp.current_price >= vcp.breakout_level * 1.005:
             _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — skip",
                       vcp.symbol, vcp.current_price, vcp.breakout_level)
@@ -2556,7 +2590,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             # Store active signal names in order_rec so position_monitor can close the loop
             order_rec["active_signals"] = _active
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         vol_tag = " 🔥" if vcp.breakout_volume else ""
         _log.info(
             "[main] ✅ %s | %d sh | buy-stop=$%.2f | SL=$%.2f | TP=$%.2f | "
@@ -2843,7 +2877,7 @@ def _startup_healthcheck() -> bool:
                 f"{len(failures)} critical issue(s):\n"
                 + "\n".join(f"• {f}" for f in failures))
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         return False
 
     _log.info("[startup] ✅ All health checks passed — bot ready")

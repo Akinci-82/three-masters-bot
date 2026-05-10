@@ -58,7 +58,7 @@ def _load_universe_cache() -> list[str] | None:
                           len(data["symbols"]), age)
                 return data["symbols"]
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return None
 
 
@@ -276,7 +276,7 @@ def _days_to_exdividend(ticker) -> int | None:
             delta   = (ex_date - date.today()).days
             return delta if delta >= 0 else None
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return None
 
 
@@ -709,7 +709,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     if result.rs_weekly_confirmed:
                         _log.info("[screen] %s RS weekly CONFIRMED — daily+weekly at 52w high", symbol)
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         # 3-weeks tight: price H-L range <=1.5% across 3 consecutive weeks
         # Minervini's strongest compression signal — coiled spring before explosive move
         _three_wt = False
@@ -724,7 +724,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                             _three_wt = True
                             break
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.three_weeks_tight = _three_wt
         if _three_wt:
             _log.info("[screen] %s 3-WEEKS TIGHT — elite Minervini compression", symbol)
@@ -737,7 +737,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             if len(_obv) >= 50:
                 _obv_nh = float(_obv.iloc[-1]) >= float(_obv.tail(252).max()) * 0.99
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.obv_new_high = _obv_nh
 
         # Base count: number of prior consolidation bases in last 18 months
@@ -758,7 +758,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     elif _pf < _pk_b * 0.85:
                         _in_b = True
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.base_count = min(_bcnt, 5)
         if _bcnt >= 3:
             _log.debug("[screen] %s base count=%d — late stage penalty applied", symbol, _bcnt)
@@ -771,7 +771,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             _peak_idx = int(_cl252.values.argmax())
             _base_age = len(_cl252) - 1 - _peak_idx
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.base_age_days = _base_age
         if _base_age > 120:
             _log.debug("[screen] %s base age=%dd — old base, momentum penalty", symbol, _base_age)
@@ -790,7 +790,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 elif _s1 > 0 and (_s2 < _s1 or _s3 < _s2):
                     _vq = 0.5
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.vol_contraction_quality = _vq
 
         # RVOL 5-day: uses df already fetched — no extra API call
@@ -801,7 +801,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             if _rv_base > 0:
                 _rvol_5d = round(_rv_recent / _rv_base, 2)
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.rvol_5d = _rvol_5d
 
         # Near ATH + weekly Stage 2 + weekly breakout alignment: single 3-year weekly fetch
@@ -825,7 +825,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     _wk5h = float(_wk3y["High"].iloc[-6:-1].max())
                     _wk_bo = float(_wk3y["High"].iloc[-1]) >= _wk5h
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.near_ath               = _near_ath
         result.weekly_stage2          = _wk_s2
         result.weekly_breakout_aligned = _wk_bo
@@ -847,7 +847,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     _neg = int(_gr.str.contains("sell|underperform|underweight|downgrade").sum())
                     _analyst_up = _pos > _neg and _pos >= 1
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.analyst_upgrades = _analyst_up
 
         # Institutional accumulation: ≥3 holders with recent (≤90 day) 13F filings
@@ -859,7 +859,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 _ih_dt = pd.to_datetime(_ih["Date Reported"], utc=True, errors="coerce")
                 _inst_inc = int((_ih_dt >= _cutoff_ih).sum()) >= 3
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.inst_ownership_increasing = _inst_inc
 
         # EPS revision momentum: analyst consensus raised for upcoming quarter/year
@@ -871,7 +871,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 _down30 = int(_rev_df.get("downLast30days", pd.Series([0])).sum())
                 _eps_rev_up = _up30 > _down30 and _up30 >= 2
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.eps_revision_up = _eps_rev_up
 
         # Pocket pivot: today's up-day volume exceeds the highest down-day volume
@@ -890,7 +890,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 if _down_vols and _today_up and _today_vol > max(_down_vols):
                     _pp = True
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.pocket_pivot = _pp
 
         # Earnings acceleration: EPS growth rate increasing Q-over-Q = core Minervini SEPA criterion
@@ -910,7 +910,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     _eps_accel = (_growths[-1] > _growths[-2] > _growths[-3]
                                   and _growths[-1] > 0 and _growths[-2] > 0)
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.eps_accelerating = _eps_accel
 
         # 13-week accumulation score: O'Neil up/down volume weeks ratio
@@ -926,7 +926,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 )
                 _accum_strong = _up_weeks >= 8
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.accum_weeks_strong = _accum_strong
 
         # Insider buying: recent C-suite/director purchase = strongest alignment signal
@@ -948,7 +948,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                         _insider_buy = True
                         break
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.insider_buying = _insider_buy
 
         # Industry group momentum rank: stock's sector ETF in top-4 by 6-month return
@@ -972,7 +972,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     _ranked_il = sorted(_rets, key=lambda x: -_rets[x])
                     _ind_leader = _etf_sym in _ranked_il[:4]
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.industry_leader = _ind_leader
 
         # Revenue acceleration: quarterly revenue growth rate increasing Q-over-Q
@@ -995,7 +995,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                             and _rev_gs[-1] > 0 and _rev_gs[-2] > 0
                         )
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.rev_accelerating = _rev_accel
 
         # 3-Weeks Tight: three consecutive weekly closes within 1.5% — O'Neil consolidation signal
@@ -1011,7 +1011,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 if _wc_min > 0:
                     _twt = (_wc_max - _wc_min) / _wc_min <= 0.015
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.three_weeks_tight = _twt
 
         # Short interest monthly change: rapid build = bearish, rapid cover = squeeze fuel
@@ -1027,7 +1027,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 elif _si_chg >= 0.25:
                     _si_pts = -0.25  # shorts building = someone knows something
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.short_mo_pts = _si_pts
 
         # Analyst consensus price target: >25% above current price = institutional expected upside
@@ -1039,7 +1039,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             if _pt_mean > 0 and _pt_cur > 0:
                 _apt = _pt_mean / _pt_cur >= 1.25
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.analyst_pt_upside = _apt
 
         if _near_ath:
@@ -1089,7 +1089,7 @@ def get_sector(symbol: str) -> str:
             if _SECTOR_CACHE_FILE.exists():
                 _sector_mem = _json.loads(_SECTOR_CACHE_FILE.read_text())
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
     if symbol in _sector_mem:
         return _sector_mem[symbol]
     try:
@@ -1102,7 +1102,7 @@ def get_sector(symbol: str) -> str:
         _SECTOR_CACHE_FILE.parent.mkdir(exist_ok=True)
         _SECTOR_CACHE_FILE.write_text(_json.dumps(_sector_mem, indent=2))
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     _log.debug("[screen] %s sector: %s", symbol, sector)
     return sector
 
@@ -1128,7 +1128,7 @@ def _bulk_download_daily(symbols: list[str], chunk_size: int = 150) -> dict[str,
                         if not sym_df.empty:
                             result[sym] = sym_df
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
             elif chunk:
                 result[chunk[0]] = raw
         except Exception as e:

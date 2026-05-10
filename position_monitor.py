@@ -27,6 +27,8 @@ _MARKET_CLOSE = dt_time(16, 0)
 
 _STATE_FILE = os.path.join(os.path.dirname(__file__), "logs", "monitor_state.json")
 
+_sync_fail_count = 0  # consecutive sync failures — Telegram alert fires at 2+
+
 
 def _alpaca_headers() -> dict:
     from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
@@ -56,15 +58,17 @@ def _load_state() -> dict:
             with open(_STATE_FILE) as f:
                 return json.load(f)
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     return {}
 
 
 def _save_state(state: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
-        with open(_STATE_FILE, "w") as f:
+        _tmp = _STATE_FILE + ".tmp"
+        with open(_tmp, "w") as f:
             json.dump(state, f, indent=2)
+        os.replace(_tmp, _STATE_FILE)  # atomic on POSIX
     except Exception as e:
         _log.warning("[monitor] state save error: %s", e)
 
@@ -377,7 +381,7 @@ def _get_cached_regime() -> str:
             _cached_regime_pm = ("bull" if _pct > 0.02
                                   else ("bear" if _pct < -0.02 else "neutral"))
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     _regime_ts_pm = _time_r.time()
     return _cached_regime_pm
 
@@ -409,7 +413,7 @@ def _lookup_position_metadata(symbol: str) -> dict:
                         "active_signals":    list(order.get("active_signals", [])),
                     }
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
     return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0,
             "measured_move_pct": 0.0, "buy_stop": 0.0, "active_signals": []}
 
@@ -486,24 +490,30 @@ def check_positions() -> None:
 
     # Sync MUST succeed — never manage positions with unverified state.
     # SyncError means Alpaca is unreachable: skip this cycle entirely.
+    global _sync_fail_count
     from position_sync import sync_all, SyncError
     try:
         sync_all()
+        _sync_fail_count = 0   # reset on success
     except SyncError as e:
-        _log.error("[monitor] SYNC FAILED — skipping cycle: %s", e)
-        try:
-            import requests, os
-            token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-            chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-            if token and chat_id:
-                requests.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "parse_mode": "Markdown",
-                          "text": f"🚨 *Three Masters — Monitor sync FAILED*\n`{e}`\nCycle skipped — positions NOT managed this tick."},
-                    timeout=8,
-                )
-        except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _sync_fail_count += 1
+        _log.error("[monitor] SYNC FAILED (consecutive=%d) — skipping cycle: %s",
+                   _sync_fail_count, e)
+        # Alert on 2nd consecutive failure (not every tick — avoids spam)
+        if _sync_fail_count >= 2:
+            try:
+                token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+                chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+                if token and chat_id:
+                    requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "parse_mode": "Markdown",
+                              "text": (f"🚨 *Three Masters — Monitor sync FAILED ×{_sync_fail_count}*\n"
+                                       f"`{e}`\nPositions NOT managed for {_sync_fail_count} cycles.")},
+                        timeout=8,
+                    )
+            except Exception:
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         return   # skip entire monitoring cycle — do NOT touch orders
 
     try:
@@ -523,7 +533,7 @@ def check_positions() -> None:
                     timeout=8,
                 )
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
         return
     if not positions:
         return
@@ -549,7 +559,7 @@ def check_positions() -> None:
             _log.info("[monitor] SOFT-DD MODE active (day_pnl=%.1f%%) — trail=5%% breakeven=5%%",
                       _daily_pnl * 100)
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     state = _load_state()
     changed = False
 
@@ -615,7 +625,7 @@ def check_positions() -> None:
                                 timeout=8,
                             )
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
         # On first encounter: check intraday breakout volume confirmation.
         # Minervini rule: breakout on < 1.0× avg volume = false breakout, exit fast.
         if not sym.get("_vol_checked"):
@@ -647,7 +657,7 @@ def check_positions() -> None:
                                           )},
                                     timeout=8)
                         except Exception:
-                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
             except Exception as _ve:
                 _log.debug("[monitor] vol check %s: %s", symbol, _ve)
 
@@ -724,7 +734,7 @@ def check_positions() -> None:
                                           sym["stop_loss"], _new_sl)
                                 sym["stop_loss"] = _new_sl
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
             changed = True
 
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
@@ -786,7 +796,7 @@ def check_positions() -> None:
                                       )},
                                 timeout=8)
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
             except Exception as _sve:
                 _log.debug("[monitor] stop_revalidation %s: %s", symbol, _sve)
 
@@ -831,7 +841,7 @@ def check_positions() -> None:
                                       )},
                                 timeout=8)
                     except Exception:
-                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
         # Quality-adjusted exits: elite setups get more room to run
         composite      = sym.get("composite_score", 0.0)
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
@@ -900,7 +910,7 @@ def check_positions() -> None:
                                                                 f"Stop moved to breakeven ${avg_cost:.2f}")},
                                                  timeout=8)
                                 except Exception:
-                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                         elif pnl_pct < 0.01 and _days_earn <= 3 and _remaining > 0:
                             # Flat/losing with report in 3 days → exit now
                             _cancel_stop_orders(symbol)
@@ -921,7 +931,7 @@ def check_positions() -> None:
                                                                 f"Exiting before earnings risk")},
                                                  timeout=8)
                                 except Exception:
-                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
             except Exception as _e:
                 _log.debug("[monitor] earnings check %s: %s", symbol, _e)
 
@@ -971,7 +981,7 @@ def check_positions() -> None:
                                                       )},
                                                 timeout=8)
                                     except Exception:
-                                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                        _log.debug("[%s] suppressed", __name__, exc_info=True)
                 except Exception as _ive:
                     _log.debug("[monitor] iv_crush %s: %s", symbol, _ive)
 
@@ -1033,7 +1043,7 @@ def check_positions() -> None:
                     from risk_manager import record_pivot_failure as _rpf
                     _rpf(symbol)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                 changed = True
                 try:
                     import requests as _rz, os as _oz
@@ -1047,7 +1057,7 @@ def check_positions() -> None:
                                                 f"Day {_trading_days_held(_ed_z)} — cutting loss")},
                                  timeout=8)
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Weak vol override: tighten stop to -3% if weak breakout and price drops ───
         if (sym.get("weak_vol_breakout")
                 and not sym.get("weak_vol_stop_set")
@@ -1175,7 +1185,7 @@ def check_positions() -> None:
                                        f"holding full position to week 8")},
                         timeout=8)
             except Exception:
-                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
         initial_qty = sym.get("initial_qty", qty)
         # Superperformance skip: composite ≥8 setups (elite VCPs) need more room before first partial
@@ -1265,7 +1275,7 @@ def check_positions() -> None:
                                                    f"(+{pnl_pct*100:.1f}%, day {_pyr_days})")},
                                     timeout=8)
                         except Exception:
-                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Step C: Move stop to breakeven at +8% (if no partial yet) ───────────
         elif pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
             breakeven = round(avg_cost, 2)
@@ -1412,7 +1422,7 @@ def check_positions() -> None:
                                                            f"Sold 50% — Minervini blow-off top")},
                                             timeout=8)
                                 except Exception:
-                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                 except Exception as _vce:
                     _log.debug("[monitor] volume climax %s: %s", symbol, _vce)
 
@@ -1488,7 +1498,7 @@ def check_positions() -> None:
                                                   )},
                                             timeout=8)
                                 except Exception:
-                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                 except Exception as _pde:
                     _log.debug("[monitor] pead_check %s: %s", symbol, _pde)
 
@@ -1551,7 +1561,7 @@ def check_positions() -> None:
                                               )},
                                         timeout=8)
                             except Exception:
-                                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                                _log.debug("[%s] suppressed", __name__, exc_info=True)
             except Exception as _rsd_e:
                 _log.debug("[monitor] rs_divergence %s: %s", symbol, _rsd_e)
 
@@ -1595,7 +1605,7 @@ def check_positions() -> None:
                                                    + f"P&L {pnl_pct*100:+.1f}% - locking gains")},
                                     timeout=8)
                         except Exception:
-                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
                 elif _rem_hm > 0:
                     _cancel_stop_orders(symbol)
                     if _place_market_sell(symbol, _rem_hm):
@@ -1616,7 +1626,7 @@ def check_positions() -> None:
                                                    + "60-day absolute cap reached")},
                                     timeout=8)
                         except Exception:
-                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
     # -- Stale position review (>30 trading days, no major exit milestone) --------
     for _sym_st, _sym_std in state.items():
         if _sym_st not in {p["symbol"] for p in positions}:
@@ -1650,7 +1660,7 @@ def check_positions() -> None:
                     timeout=5)
                 changed = True
         except Exception:
-            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
     # Clean up state for positions that are now closed — call close_trade()
     # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.
     open_syms = {p["symbol"] for p in positions}
@@ -1702,7 +1712,7 @@ def check_positions() -> None:
                                     _sa2[_sig2].get("total_r", 0.0) + _r_val, 3)
                         open(_sa_path, "w").write(_jsa2.dumps(_sa2, indent=2))
                 except Exception:
-                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+                    _log.debug("[%s] suppressed", __name__, exc_info=True)
                 # Re-entry cooldown: shorter if pyramid was added (shakeout of add-on
                 # shares ≠ full base failure), normal 5 days otherwise
                 if pnl_pct < 0:

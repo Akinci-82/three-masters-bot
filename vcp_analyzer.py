@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from pathlib import Path
 import anthropic
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 from config import VCP, CLAUDE_MODEL, CLAUDE_MODEL_DEEP, CLAUDE_MODEL_ULTRA, ANTHROPIC_API_KEY, CHART_DIR, LOG_DIR
 
@@ -40,25 +42,33 @@ _OPUS_MODEL   = CLAUDE_MODEL_ULTRA  # opus-4-7
 _TOKEN_LOG  = LOG_DIR / "token_usage.jsonl"
 _VCP_CACHE  = LOG_DIR / "vcp_cache.json"
 
+_VCP_CACHE_LOCK = threading.Lock()
+
 
 def _load_vcp_cache() -> dict:
-    try:
-        if _VCP_CACHE.exists():
-            raw = json.loads(_VCP_CACHE.read_text())
-            from datetime import timedelta
-            cutoff = str(date.today() - timedelta(days=1))
-            return {k: v for k, v in raw.items() if v.get("date", "") >= cutoff}
-    except Exception:
-        pass
+    with _VCP_CACHE_LOCK:
+        try:
+            if _VCP_CACHE.exists():
+                raw = json.loads(_VCP_CACHE.read_text())
+                from datetime import timedelta
+                cutoff = str(date.today() - timedelta(days=1))
+                return {k: v for k, v in raw.items() if v.get("date", "") >= cutoff}
+        except json.JSONDecodeError as e:
+            _log.warning("[vcp] cache corrupted, discarding: %s", e)
+        except Exception as e:
+            _log.warning("[vcp] cache read error: %s", e)
     return {}
 
 
 def _save_vcp_cache(cache: dict) -> None:
-    try:
-        _VCP_CACHE.parent.mkdir(exist_ok=True)
-        _VCP_CACHE.write_text(json.dumps(cache, indent=2))
-    except Exception:
-        pass
+    with _VCP_CACHE_LOCK:
+        try:
+            _VCP_CACHE.parent.mkdir(exist_ok=True)
+            _tmp = _VCP_CACHE.with_suffix(".json.tmp")
+            _tmp.write_text(json.dumps(cache, indent=2))
+            _tmp.replace(_VCP_CACHE)
+        except Exception as e:
+            _log.warning("[vcp] cache save error: %s", e)
 
 
 def _serialize_result(r) -> dict:
@@ -104,7 +114,7 @@ def _deserialize_result(d: dict):
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=20.0)
     return _client
 
 
@@ -397,9 +407,15 @@ def _call_haiku(symbol: str, prompt: str) -> dict:
         if raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
+    except anthropic.APIError as e:
+        _log.warning("[vcp] %s Haiku API error (not a VCP rejection): %s", symbol, e)
+        return {"_api_error": True, "vcp_score": 0, "is_vcp": None, "reason": f"api_error:{e}"}
+    except (json.JSONDecodeError, ValueError) as e:
+        _log.warning("[vcp] %s Haiku parse error: %s", symbol, e)
+        return {"vcp_score": 0, "is_vcp": False, "reason": f"parse_error:{e}"}
     except Exception as e:
-        _log.debug("[vcp] %s Haiku error: %s", symbol, e)
-        return {"vcp_score": 0, "is_vcp": False, "reason": str(e)}
+        _log.warning("[vcp] %s Haiku unexpected error: %s", symbol, e)
+        return {"_api_error": True, "vcp_score": 0, "is_vcp": None, "reason": str(e)}
 
 
 # ── Tier 2: Sonnet full analysis ──────────────────────────────────────────────
@@ -548,9 +564,15 @@ def _call_sonnet(symbol: str, prompt: str) -> dict:
         if raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
-    except Exception as e:
-        _log.warning("[vcp] %s Sonnet error: %s", symbol, e)
+    except anthropic.APIError as e:
+        _log.warning("[vcp] %s Sonnet API error: %s", symbol, e)
+        return {"_api_error": True}
+    except (json.JSONDecodeError, ValueError) as e:
+        _log.warning("[vcp] %s Sonnet parse error: %s", symbol, e)
         return {}
+    except Exception as e:
+        _log.warning("[vcp] %s Sonnet unexpected error: %s", symbol, e)
+        return {"_api_error": True}
 
 
 # ── Tier 3: Opus final validation for elite setups ────────────────────────────
@@ -634,9 +656,15 @@ def _call_opus(symbol: str, prompt: str) -> dict:
         if raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
-    except Exception as e:
-        _log.warning("[vcp] %s Opus error: %s", symbol, e)
+    except anthropic.APIError as e:
+        _log.warning("[vcp] %s Opus API error: %s", symbol, e)
+        return {"_api_error": True}
+    except (json.JSONDecodeError, ValueError) as e:
+        _log.warning("[vcp] %s Opus parse error: %s", symbol, e)
         return {}
+    except Exception as e:
+        _log.warning("[vcp] %s Opus unexpected error: %s", symbol, e)
+        return {"_api_error": True}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -644,8 +672,7 @@ def _call_opus(symbol: str, prompt: str) -> dict:
 def _get_recent_news(symbol: str, n: int = 5) -> str:
     """Return up to n recent news headlines via yfinance for catalyst check."""
     try:
-        import yfinance as _yf
-        t = _yf.Ticker(symbol)
+        t = yf.Ticker(symbol)
         news = t.news or []
         headlines = []
         for item in news[:n]:
@@ -697,8 +724,15 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     # ── Tier 1: Haiku pre-screen ─────────────────────────────────────────────
     h_prompt = _build_haiku_prompt(symbol, df, quant, last_candle)
     h_data   = _call_haiku(symbol, h_prompt)
-    h_score  = int(h_data.get("vcp_score", 0))
-    h_is_vcp = bool(h_data.get("is_vcp", False))
+
+    # API errors are NOT VCP rejections — skip Haiku gate and fall through to Sonnet
+    if h_data.get("_api_error"):
+        _log.warning("[vcp] %s Haiku API error — falling through to Sonnet", symbol)
+        h_is_vcp = True
+        h_score  = 5
+    else:
+        h_score  = int(h_data.get("vcp_score", 0))
+        h_is_vcp = bool(h_data.get("is_vcp", False))
 
     _log.info("[vcp] %s Haiku score=%d is_vcp=%s | %s",
               symbol, h_score, h_is_vcp, h_data.get("reason", "")[:80])
@@ -722,19 +756,37 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     s_prompt = _build_sonnet_prompt(symbol, df, quant, last_candle, fundamentals)
     s_data   = _call_sonnet(symbol, s_prompt)
 
+    if s_data.get("_api_error"):
+        return VCPResult(symbol=symbol, passed=False, current_price=price,
+                         fail_reason="sonnet_api_error", last_candle=last_candle,
+                         tier_used="sonnet_error")
     if not s_data:
         return VCPResult(symbol=symbol, passed=False, current_price=price,
-                         fail_reason="sonnet_error", last_candle=last_candle,
+                         fail_reason="sonnet_parse_error", last_candle=last_candle,
                          tier_used="sonnet_error")
 
     confirmed   = bool(s_data.get("vcp_confirmed", False))
-    confidence  = float(s_data.get("confidence", 0))
+    # Clamp values to valid ranges — Claude may return out-of-range numbers
+    confidence  = max(0.0, min(1.0, float(s_data.get("confidence", 0) or 0)))
     breakout    = float(s_data.get("breakout_level") or s_data.get("pivot_high") or breakout_lvl)
     stop_loss   = float(s_data.get("stop_loss") or s_data.get("pivot_low") or stop_cand)
     depth       = quant.get("pattern_depth_pct", 0)
     contractions = int(s_data.get("contractions_identified") or quant.get("contractions", 0))
     tight_pct   = float(s_data.get("tight_area_pct") or quant.get("tight_rng_pct", 0))
-    quality     = int(s_data.get("quality_score", 0))
+    quality     = max(1, min(5, int(s_data.get("quality_score", 0) or 0)))
+
+    # Validate breakout and stop: must be positive and correctly ordered
+    if breakout <= 0 or stop_loss <= 0:
+        _log.warning("[vcp] %s invalid levels from Sonnet: breakout=%.2f SL=%.2f — "
+                     "falling back to quant levels", symbol, breakout, stop_loss)
+        breakout  = breakout_lvl if breakout <= 0 else breakout
+        stop_loss = stop_cand    if stop_loss <= 0 else stop_loss
+    if breakout <= stop_loss:
+        _log.warning("[vcp] %s inverted R/R from Sonnet: breakout=%.2f <= SL=%.2f — rejecting",
+                     symbol, breakout, stop_loss)
+        return VCPResult(symbol=symbol, passed=False, current_price=price,
+                         fail_reason="sonnet_inverted_rr", last_candle=last_candle,
+                         tier_used="sonnet_error")
     # Multi-handle bonus: 3+ handles = highest-conviction base, cap quality at 5
     _n_hdl = quant.get("n_handles", 1)
     if _n_hdl >= 3:
@@ -793,11 +845,11 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
                     quality_score=int(o_data.get("quality_score", quality)),
                     tier_used="opus",
                 )
-            # Refine levels with Opus precision
+            # Refine levels with Opus precision (clamp to valid ranges)
             breakout   = float(o_data.get("breakout_level") or breakout)
             stop_loss  = float(o_data.get("stop_loss") or stop_loss)
-            confidence = float(o_data.get("confidence", confidence))
-            quality    = int(o_data.get("quality_score", quality))
+            confidence = max(0.0, min(1.0, float(o_data.get("confidence", confidence) or confidence)))
+            quality    = max(1, min(5, int(o_data.get("quality_score", quality) or quality)))
             tier_label = "opus"
             s_data = o_data   # use Opus notes for logging
             # "watch" = borderline setup — allow through but cap confidence at 0.70
@@ -843,8 +895,13 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     return result
 
 
-def batch_analyze(trend_passed: list, max_symbols: int = 50) -> list[VCPResult]:
-    """Analyze TrendResult objects for VCP. Tier 0→1→2→3 per stock."""
+def batch_analyze(trend_passed: list, max_symbols: int = 50,
+                  tick_fn=None) -> list[VCPResult]:
+    """Analyze TrendResult objects for VCP. Tier 0→1→2→3 per stock.
+
+    tick_fn: optional callable invoked every 5 candidates — used by main.py
+    to write a watchdog heartbeat during long Claude API batches.
+    """
     import time
     results    = []
     candidates = [r for r in trend_passed if r.passed and r.df is not None][:max_symbols]
@@ -860,6 +917,11 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50) -> list[VCPResult]:
         result.rs_rating       = getattr(trend, "rs_rating", 0.0)
         result.rs_line_at_high = getattr(trend, "rs_line_at_high", False)
         results.append(result)
+        if tick_fn and i % 5 == 0:
+            try:
+                tick_fn()
+            except Exception:
+                pass
         time.sleep(0.3)
 
     passed    = [r for r in results if r.passed]

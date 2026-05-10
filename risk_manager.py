@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import date, datetime
 from pathlib import Path
 
@@ -23,28 +24,36 @@ from config import RISK, LOG_DIR
 _log = logging.getLogger(__name__)
 RISK_FILE = LOG_DIR / "risk_state.json"
 
+# Lock guards all reads + writes of risk_state.json to prevent
+# concurrent corruption between the daily scan thread and the position monitor thread.
+_RISK_LOCK = threading.Lock()
+
 
 def _load() -> dict:
-    try:
-        with open(RISK_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {
-            "date": str(date.today()),
-            "daily_pnl_pct": 0.0,
-            "portfolio_ath": 0.0,
-            "open_risk_pct": 0.0,
-            "consecutive_losses": 0,
-            "trading_halted": False,
-            "halt_reason": "",
-            "positions_risk": {},   # symbol → risk_pct
-        }
+    with _RISK_LOCK:
+        try:
+            with open(RISK_FILE) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {
+                "date": str(date.today()),
+                "daily_pnl_pct": 0.0,
+                "portfolio_ath": 0.0,
+                "open_risk_pct": 0.0,
+                "consecutive_losses": 0,
+                "trading_halted": False,
+                "halt_reason": "",
+                "positions_risk": {},   # symbol → risk_pct
+            }
 
 
 def _save(data: dict):
     RISK_FILE.parent.mkdir(exist_ok=True)
-    with open(RISK_FILE, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+    _tmp = RISK_FILE.with_suffix(".json.tmp")
+    with _RISK_LOCK:
+        with open(_tmp, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        _tmp.replace(RISK_FILE)  # atomic on POSIX — prevents half-written state on crash
 
 
 def _kelly_factor() -> float:
@@ -167,7 +176,7 @@ def position_size(portfolio_value: float, entry_price: float,
                               measured_move, _atr_cap, _atr_pct * 100)
                     measured_move = _atr_cap
     except Exception:
-        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
     rr_ratio = measured_move / risk_per_share
 
     return {
