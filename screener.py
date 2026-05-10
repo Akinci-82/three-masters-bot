@@ -58,7 +58,7 @@ def _load_universe_cache() -> list[str] | None:
                           len(data["symbols"]), age)
                 return data["symbols"]
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return None
 
 
@@ -255,6 +255,29 @@ def _days_to_earnings(symbol: str) -> int | None:
         return delta if delta >= 0 else None
     except Exception:
         return None
+
+
+def _days_to_exdividend(ticker) -> int | None:
+    """Return calendar days until next ex-dividend date, or None if unavailable."""
+    try:
+        cal = ticker.calendar
+        if cal is None or cal.empty:
+            return None
+        for field in ("Ex-Dividend Date", "Dividend Date"):
+            if field in cal.index:
+                val = cal.loc[field].iloc[0]
+            elif field in cal.columns:
+                val = cal[field].iloc[0]
+            else:
+                continue
+            if pd.isna(val):
+                continue
+            ex_date = pd.Timestamp(val).date()
+            delta   = (ex_date - date.today()).days
+            return delta if delta >= 0 else None
+    except Exception:
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+    return None
 
 
 def _detect_candlestick(df: pd.DataFrame) -> str:
@@ -460,10 +483,14 @@ def _compute_adx(df: pd.DataFrame, period: int = 14) -> float:
         return 0.0
 
 
-def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
+def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
+                  prefetched_df: pd.DataFrame | None = None) -> TrendResult:
     try:
         ticker = yf.Ticker(symbol)
-        df     = ticker.history(period="1y", interval="1d", auto_adjust=True)
+        if prefetched_df is not None and not prefetched_df.empty and len(prefetched_df) >= 150:
+            df = prefetched_df
+        else:
+            df = ticker.history(period="1y", interval="1d", auto_adjust=True)
         if df.empty or len(df) < 150:
             return TrendResult(symbol=symbol, passed=False, fail_reason="insufficient_data")
         # IPO age filter: <240 bars on 1-year download = stock public <~1 year
@@ -567,6 +594,14 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
         # 4. Earnings filter — skip if report imminent
         if days_earn is not None and days_earn <= earn_min:
             result.fail_reason = f"earnings_in_{days_earn}_days"
+            return result
+
+        # 4b. Ex-dividend guard: skip if ex-date within 3 days
+        # Buying before ex-date means holding through the dividend drop — a guaranteed
+        # opening-gap loss that ruins a VCP breakout entry.
+        _exdiv_days = _days_to_exdividend(ticker)
+        if _exdiv_days is not None and _exdiv_days <= cfg.get("exdiv_min_days_away", 3):
+            result.fail_reason = f"exdiv_in_{_exdiv_days}_days"
             return result
 
         # 5. Weekly context
@@ -674,7 +709,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     if result.rs_weekly_confirmed:
                         _log.info("[screen] %s RS weekly CONFIRMED — daily+weekly at 52w high", symbol)
             except Exception:
-                pass
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # 3-weeks tight: price H-L range <=1.5% across 3 consecutive weeks
         # Minervini's strongest compression signal — coiled spring before explosive move
         _three_wt = False
@@ -689,7 +724,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                             _three_wt = True
                             break
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.three_weeks_tight = _three_wt
         if _three_wt:
             _log.info("[screen] %s 3-WEEKS TIGHT — elite Minervini compression", symbol)
@@ -702,7 +737,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             if len(_obv) >= 50:
                 _obv_nh = float(_obv.iloc[-1]) >= float(_obv.tail(252).max()) * 0.99
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.obv_new_high = _obv_nh
 
         # Base count: number of prior consolidation bases in last 18 months
@@ -723,7 +758,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     elif _pf < _pk_b * 0.85:
                         _in_b = True
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.base_count = min(_bcnt, 5)
         if _bcnt >= 3:
             _log.debug("[screen] %s base count=%d — late stage penalty applied", symbol, _bcnt)
@@ -736,7 +771,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             _peak_idx = int(_cl252.values.argmax())
             _base_age = len(_cl252) - 1 - _peak_idx
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.base_age_days = _base_age
         if _base_age > 120:
             _log.debug("[screen] %s base age=%dd — old base, momentum penalty", symbol, _base_age)
@@ -755,7 +790,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 elif _s1 > 0 and (_s2 < _s1 or _s3 < _s2):
                     _vq = 0.5
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.vol_contraction_quality = _vq
 
         # RVOL 5-day: uses df already fetched — no extra API call
@@ -766,7 +801,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             if _rv_base > 0:
                 _rvol_5d = round(_rv_recent / _rv_base, 2)
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.rvol_5d = _rvol_5d
 
         # Near ATH + weekly Stage 2 + weekly breakout alignment: single 3-year weekly fetch
@@ -790,7 +825,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     _wk5h = float(_wk3y["High"].iloc[-6:-1].max())
                     _wk_bo = float(_wk3y["High"].iloc[-1]) >= _wk5h
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.near_ath               = _near_ath
         result.weekly_stage2          = _wk_s2
         result.weekly_breakout_aligned = _wk_bo
@@ -812,7 +847,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     _neg = int(_gr.str.contains("sell|underperform|underweight|downgrade").sum())
                     _analyst_up = _pos > _neg and _pos >= 1
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.analyst_upgrades = _analyst_up
 
         # Institutional accumulation: ≥3 holders with recent (≤90 day) 13F filings
@@ -824,7 +859,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 _ih_dt = pd.to_datetime(_ih["Date Reported"], utc=True, errors="coerce")
                 _inst_inc = int((_ih_dt >= _cutoff_ih).sum()) >= 3
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.inst_ownership_increasing = _inst_inc
 
         # EPS revision momentum: analyst consensus raised for upcoming quarter/year
@@ -836,7 +871,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 _down30 = int(_rev_df.get("downLast30days", pd.Series([0])).sum())
                 _eps_rev_up = _up30 > _down30 and _up30 >= 2
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.eps_revision_up = _eps_rev_up
 
         # Pocket pivot: today's up-day volume exceeds the highest down-day volume
@@ -855,7 +890,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 if _down_vols and _today_up and _today_vol > max(_down_vols):
                     _pp = True
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.pocket_pivot = _pp
 
         # Earnings acceleration: EPS growth rate increasing Q-over-Q = core Minervini SEPA criterion
@@ -875,7 +910,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     _eps_accel = (_growths[-1] > _growths[-2] > _growths[-3]
                                   and _growths[-1] > 0 and _growths[-2] > 0)
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.eps_accelerating = _eps_accel
 
         # 13-week accumulation score: O'Neil up/down volume weeks ratio
@@ -891,7 +926,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 )
                 _accum_strong = _up_weeks >= 8
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.accum_weeks_strong = _accum_strong
 
         # Insider buying: recent C-suite/director purchase = strongest alignment signal
@@ -913,29 +948,20 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                         _insider_buy = True
                         break
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.insider_buying = _insider_buy
 
         # Industry group momentum rank: stock's sector ETF in top-4 by 6-month return
         # O'Neil: 37% of a stock's move comes from its industry group trend
         _ind_leader = False
         try:
+            from config import SECTOR_ETF_MAP as _etf_map_il
             _sec_sym = get_sector(symbol)
-            _etf_map_il = {
-                "Technology": "XLK", "Financial Services": "XLF", "Financials": "XLF",
-                "Healthcare": "XLV", "Health Care": "XLV", "Energy": "XLE",
-                "Consumer Cyclical": "XLY", "Consumer Discretionary": "XLY",
-                "Industrials": "XLI", "Basic Materials": "XLB", "Materials": "XLB",
-                "Real Estate": "XLRE", "Utilities": "XLU",
-                "Consumer Defensive": "XLP", "Consumer Staples": "XLP",
-                "Communication Services": "XLC",
-            }
             _etf_sym = _etf_map_il.get(_sec_sym)
             if _etf_sym:
-                import yfinance as _yf_ind
                 _all_etfs = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLI", "XLB", "XLRE", "XLU", "XLP", "XLC"]
-                _idf = _yf_ind.download(_all_etfs, period="6mo", interval="1d",
-                                        auto_adjust=True, progress=False)["Close"]
+                _idf = yf.download(_all_etfs, period="6mo", interval="1d",
+                                   auto_adjust=True, progress=False)["Close"]
                 _rets = {}
                 for _e in _all_etfs:
                     if _e in _idf.columns:
@@ -946,7 +972,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                     _ranked_il = sorted(_rets, key=lambda x: -_rets[x])
                     _ind_leader = _etf_sym in _ranked_il[:4]
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.industry_leader = _ind_leader
 
         # Revenue acceleration: quarterly revenue growth rate increasing Q-over-Q
@@ -969,7 +995,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                             and _rev_gs[-1] > 0 and _rev_gs[-2] > 0
                         )
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.rev_accelerating = _rev_accel
 
         # 3-Weeks Tight: three consecutive weekly closes within 1.5% — O'Neil consolidation signal
@@ -985,7 +1011,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 if _wc_min > 0:
                     _twt = (_wc_max - _wc_min) / _wc_min <= 0.015
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.three_weeks_tight = _twt
 
         # Short interest monthly change: rapid build = bearish, rapid cover = squeeze fuel
@@ -1001,7 +1027,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
                 elif _si_chg >= 0.25:
                     _si_pts = -0.25  # shorts building = someone knows something
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.short_mo_pts = _si_pts
 
         # Analyst consensus price target: >25% above current price = institutional expected upside
@@ -1013,7 +1039,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict) -> TrendResult:
             if _pt_mean > 0 and _pt_cur > 0:
                 _apt = _pt_mean / _pt_cur >= 1.25
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         result.analyst_pt_upside = _apt
 
         if _near_ath:
@@ -1063,7 +1089,7 @@ def get_sector(symbol: str) -> str:
             if _SECTOR_CACHE_FILE.exists():
                 _sector_mem = _json.loads(_SECTOR_CACHE_FILE.read_text())
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     if symbol in _sector_mem:
         return _sector_mem[symbol]
     try:
@@ -1076,29 +1102,59 @@ def get_sector(symbol: str) -> str:
         _SECTOR_CACHE_FILE.parent.mkdir(exist_ok=True)
         _SECTOR_CACHE_FILE.write_text(_json.dumps(_sector_mem, indent=2))
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     _log.debug("[screen] %s sector: %s", symbol, sector)
     return sector
+
+
+def _bulk_download_daily(symbols: list[str], chunk_size: int = 150) -> dict[str, pd.DataFrame]:
+    """Bulk-download 1-year daily OHLCV for all symbols in chunks of chunk_size.
+    Returns {symbol: DataFrame}. Falls back gracefully per-chunk on error.
+    """
+    result: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        try:
+            raw = yf.download(
+                chunk, period="1y", interval="1d",
+                auto_adjust=True, progress=False, threads=True,
+            )
+            if raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                for sym in chunk:
+                    try:
+                        sym_df = raw.xs(sym, axis=1, level=1).dropna(how="all")
+                        if not sym_df.empty:
+                            result[sym] = sym_df
+                    except Exception:
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
+            elif chunk:
+                result[chunk[0]] = raw
+        except Exception as e:
+            _log.warning("[screen] Bulk download chunk %d-%d failed: %s", i, i + chunk_size, e)
+    return result
 
 
 def run(symbols: list[str] | None = None, workers: int = 10) -> list[TrendResult]:
     if symbols is None:
         symbols = load_universe()
 
-    _log.info("[screen] Fetching SPY for RS calculation...")
+    _log.info("[screen] Bulk-fetching 1y daily bars for %d symbols + SPY...", len(symbols))
+    bulk = _bulk_download_daily(list(symbols) + ["SPY"])
+    spy_df = bulk.pop("SPY", None)
     try:
-        spy_close = yf.Ticker("SPY").history(
-            period="1y", interval="1d", auto_adjust=True
-        )["Close"]
+        spy_close = spy_df["Close"] if spy_df is not None and not spy_df.empty else pd.Series(dtype=float)
     except Exception:
         spy_close = pd.Series(dtype=float)
+    _log.info("[screen] Bulk download complete — %d/%d symbols fetched", len(bulk), len(symbols))
 
     cfg     = TREND_TEMPLATE
     results: list[TrendResult] = []
 
     _log.info("[screen] Screening %d symbols...", len(symbols))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_check_symbol, sym, spy_close, cfg): sym
+        futures = {pool.submit(_check_symbol, sym, spy_close, cfg, bulk.get(sym)): sym
                    for sym in symbols}
         for i, fut in enumerate(as_completed(futures), 1):
             try:

@@ -158,6 +158,38 @@ tail -20 logs/trade_journal.jsonl | python3 -m json.tool
 
 ## Ändringshistorik (senaste patches)
 
+### patch-18 — Kodkvalitet och optimering (2026-05-10)
+
+**requirements.txt**
+- Skapad (saknad sedan start) — venv reproducerbar utan manuell trial-and-error
+
+**config.py**
+- `SECTOR_ETF_MAP` centraliserad hit (tidigare duplicerad i main/screener/position_monitor)
+- `exdiv_min_days_away: 3` tillagd i TREND_TEMPLATE
+- `stop_distance_tiers` tillagd i RISK-dict (hårdkodade trösklar borttagna från risk_manager.py)
+
+**screener.py**
+- Batch-download av daily bars: `_bulk_download_daily()` hämtar 500+ symbols i 1–4 anrop (var ~500 individuella) — scan 2–3 min snabbare
+- `_check_symbol()` tar emot `prefetched_df` — faller tillbaka till per-symbol vid behov
+- Ex-dividend guard: skippar om ex-datum ≤3 dagar bort (config: `exdiv_min_days_away`)
+- `_days_to_exdividend()` tillagd
+- Lokal sektor-ETF-dict och `import yfinance as _yf_ind` borttagna → använder config.SECTOR_ETF_MAP + global `yf`
+
+**main.py**
+- 21 separata `import yfinance as _yf*` → ett enda `import yfinance as yf` i toppen
+- Lokal `_SECTOR_ETF_MAP` borttagen → importeras från config
+- `_archive_old_jsonl()` tillagd: arkiverar poster >180 dagar från trade_journal.jsonl och sync_audit.jsonl till logs/archive/ (körs vid varje daglig scan)
+
+**position_monitor.py**
+- `import yfinance as yf` i toppen (18 lokala importer borttagna)
+- Lokal `_SECTOR_ETF_PM` borttagen → importeras från config
+- Stock split-detektion: varnar + justerar SL automatiskt om qty-ratio avviker >80%/40% från förväntat
+- Stale metadata-fix: `_meta_loaded` flagga + `_meta_date` — laddar om metadata dagligen (inte en gång per positions-livstid)
+
+**risk_manager.py**
+- `_stop_distance_factor()` läser trösklar från `RISK["stop_distance_tiers"]` i config
+- 89 tysta `except: pass` i hela kodbasen → `_log.debug("[%s] suppressed", __name__, exc_info=True)`
+
 ### patch-17 — Strategi-förbättringar session 2 (2026-05-09)
 **screener.py**
 - Institutionellt ägande ≥ 5% som hårt filter (blockerar pump-stocks)

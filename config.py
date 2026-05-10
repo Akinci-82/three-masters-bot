@@ -49,6 +49,8 @@ TREND_TEMPLATE = {
     "weekly_context":          True,   # price above MA10w + MA40w on weekly chart
     # Earnings filter — never buy within N days of earnings
     "earnings_min_days_away":  7,      # skip if earnings within 7 calendar days
+    # Ex-dividend guard — never buy within N days of ex-dividend date
+    "exdiv_min_days_away":     3,      # price drops by dividend amount on ex-date
     # MA20 as additional filter
     "price_above_ma20":        True,   # price should be above short-term MA
 }
@@ -82,6 +84,14 @@ RISK = {
     "max_portfolio_heat_pct":  0.08,
     "soft_drawdown_pause_pct": 0.08,   # pause new entries (no halt) when dd >8%
     "position_scale_in":       False,
+    # Stop-distance sizing factors: wide stops = lower conviction = smaller size
+    # Keys are upper-bound stop-distance %; last entry is the "else" (very wide)
+    "stop_distance_tiers": [
+        (0.05, 1.00),   # ≤5% stop: ideal tight handle → full size
+        (0.07, 0.85),   # ≤7% stop: slightly wide
+        (0.10, 0.70),   # ≤10% stop: moderately wide
+        (1.00, 0.55),   # >10% stop: very wide — reduced conviction
+    ],
 }
 
 # ── Position Monitor — Intraday Exit Management ───────────────────────────────
@@ -102,6 +112,26 @@ MONITOR = {
     "time_stop_min_gain_pct":  0.02,  # only close if gain < 2% (not a winner)
     # Pre-market gap check: cancel buy-stop if stock gaps above stop
     "premarket_gap_pct":       0.02,  # cancel if stock >2% above stop price
+}
+
+# ── Sector ETF map (SPDR) — shared across screener, main, position_monitor ───
+SECTOR_ETF_MAP: dict[str, str] = {
+    "Technology":             "XLK",
+    "Financial Services":     "XLF",
+    "Financials":             "XLF",   # legacy alias
+    "Healthcare":             "XLV",
+    "Health Care":            "XLV",   # legacy alias
+    "Energy":                 "XLE",
+    "Consumer Cyclical":      "XLY",
+    "Consumer Discretionary": "XLY",   # legacy alias
+    "Industrials":            "XLI",
+    "Basic Materials":        "XLB",
+    "Materials":              "XLB",   # legacy alias
+    "Real Estate":            "XLRE",
+    "Utilities":              "XLU",
+    "Consumer Defensive":     "XLP",
+    "Consumer Staples":       "XLP",   # legacy alias
+    "Communication Services": "XLC",
 }
 
 # ── Universe ─────────────────────────────────────────────────────────────────

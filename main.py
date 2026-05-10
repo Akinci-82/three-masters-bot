@@ -27,6 +27,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import yfinance as yf
 
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
@@ -36,7 +37,7 @@ from config import (
     DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     LOG_LEVEL, LOG_MAX_MB, LOG_BACKUPS,
-    MONITOR,
+    MONITOR, SECTOR_ETF_MAP,
 )
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -139,7 +140,7 @@ def _load_equity_baseline() -> dict | None:
         if _BASELINE_FILE.exists():
             return json.loads(_BASELINE_FILE.read_text())
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return None
 
 
@@ -217,14 +218,13 @@ def _send_morning_briefing() -> None:
         gapped_out = []
         if buy_stops:
             try:
-                import yfinance as _yf
                 for o in list(buy_stops):
                     sym    = o["symbol"]
                     stop_p = float(o.get("stop_price", 0))
                     if stop_p <= 0:
                         continue
                     try:
-                        pre = _yf.Ticker(sym).fast_info.get("last_price", None)
+                        pre = yf.Ticker(sym).fast_info.get("last_price", None)
                         if pre and pre > stop_p * (1 + gap_threshold):
                             # Stock has gapped above stop — cancel to avoid chasing
                             from broker import cancel_all_orders
@@ -239,7 +239,7 @@ def _send_morning_briefing() -> None:
                             _log.info("[briefing] PRE-MARKET GAP: %s $%.2f >> stop $%.2f — order cancelled",
                                       sym, pre, stop_p)
                     except Exception:
-                        pass
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             except Exception as e:
                 _log.debug("[briefing] Pre-market price check failed: %s", e)
 
@@ -263,12 +263,11 @@ def _send_morning_briefing() -> None:
         # ── Breakout volume check for held positions ──────────────────────────
         if positions:
             try:
-                import yfinance as _yf_bv
                 _vol_warns = []
                 for _p in positions:
                     _sym_bv = _p["symbol"]
                     try:
-                        _dfbv   = _yf_bv.Ticker(_sym_bv).history(period="60d", interval="1d", auto_adjust=True)
+                        _dfbv   = yf.Ticker(_sym_bv).history(period="60d", interval="1d", auto_adjust=True)
                         if len(_dfbv) >= 25:
                             _v1     = float(_dfbv["Volume"].iloc[-1])
                             _avg50  = float(_dfbv["Volume"].tail(50).mean())
@@ -276,24 +275,22 @@ def _send_morning_briefing() -> None:
                             if _ratio < 0.80:
                                 _vol_warns.append(f"  ⚠️ *{_sym_bv}* weak volume: {_ratio:.1f}× avg — possible distribution")
                     except Exception:
-                        pass
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 if _vol_warns:
                     lines.append("\n*Volume alerts:*")
                     lines.extend(_vol_warns)
             except Exception:
-                pass
-
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Sector rotation alert — sectors crossing into leadership ──────────────
         try:
-            import yfinance as _yf_sr
-            _spy_h  = _yf_sr.Ticker("SPY").history(period="60d", interval="1d", auto_adjust=True)["Close"]
+            _spy_h  = yf.Ticker("SPY").history(period="60d", interval="1d", auto_adjust=True)["Close"]
             _sr_etfs = {"XLK":"Tech","XLV":"Health","XLF":"Finance","XLE":"Energy",
                         "XLI":"Industrl","XLC":"Comm","XLY":"Cyclical","XLP":"Defensive",
                         "XLU":"Utilities","XLB":"Materials","XLRE":"Real Estate"}
             _sr_alerts = []
             for _etf, _sname in _sr_etfs.items():
                 try:
-                    _h = _yf_sr.Ticker(_etf).history(period="60d", interval="1d", auto_adjust=True)["Close"]
+                    _h = yf.Ticker(_etf).history(period="60d", interval="1d", auto_adjust=True)["Close"]
                     _n = min(len(_h), len(_spy_h), 30)
                     if _n >= 25:
                         _rel_now  = float(_h.iloc[-1]/_h.iloc[-22] - _spy_h.iloc[-1]/_spy_h.iloc[-22])
@@ -301,22 +298,20 @@ def _send_morning_briefing() -> None:
                         if _rel_prev < -0.01 and _rel_now > 0.005:
                             _sr_alerts.append(f"  🔄 *{_sname}* ({_etf}) entering leadership: {_rel_now*100:+.1f}% vs SPY")
                 except Exception:
-                    pass
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             if _sr_alerts:
                 lines.append("\n*Sector rotation:*")
                 lines.extend(_sr_alerts)
         except Exception:
-            pass
-
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Pre-open gap alerts for held positions ─────────────────────────────
         if positions:
             try:
-                import yfinance as _yf_pg
                 _pre_alerts = []
                 for _pg_p in positions:
                     _pg_sym = _pg_p["symbol"]
                     try:
-                        _fi = _yf_pg.Ticker(_pg_sym).fast_info
+                        _fi = yf.Ticker(_pg_sym).fast_info
                         _pre_p  = getattr(_fi, "last_price", None) or getattr(_fi, "regularMarketPrice", None)
                         _prev_c = getattr(_fi, "previous_close", None) or getattr(_fi, "regularMarketPreviousClose", None)
                         if _pre_p and _prev_c and _prev_c > 0:
@@ -326,13 +321,12 @@ def _send_morning_briefing() -> None:
                                 _pre_alerts.append(
                                     f"  {_dir} *{_pg_sym}* pre-market ${_pre_p:.2f} ({_gap*100:+.1f}% vs prev close)")
                     except Exception:
-                        pass
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 if _pre_alerts:
                     lines.append("\n*Pre-open gaps (≥3%):*")
                     lines.extend(_pre_alerts)
             except Exception:
-                pass
-
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── PM12: Pre-market gap + volume screen for last night's scan candidates ──
         # Stocks screened last night that weren't ordered but are now moving pre-market.
         # Also checks premarket volume vs 30-day average to flag genuine breakouts
@@ -349,7 +343,7 @@ def _send_morning_briefing() -> None:
                 _pm_alerts = []
                 for _pm_sym in _scanned[:12]:   # cap at 12 to avoid rate-limit
                     try:
-                        _fi_pm    = _yf_pm.Ticker(_pm_sym).fast_info
+                        _fi_pm    = yf.Ticker(_pm_sym).fast_info
                         _pre_pm   = getattr(_fi_pm, "last_price", None)
                         _prev_pm  = getattr(_fi_pm, "previous_close", None)
                         if _pre_pm and _prev_pm and _prev_pm > 0:
@@ -358,7 +352,7 @@ def _send_morning_briefing() -> None:
                                 # Check premarket volume via 1m bars
                                 _vol_tag = ""
                                 try:
-                                    _pm_1m = _yf_pm.Ticker(_pm_sym).history(
+                                    _pm_1m = yf.Ticker(_pm_sym).history(
                                         period="1d", interval="1m",
                                         prepost=True, auto_adjust=True)
                                     _pm_only = _pm_1m[
@@ -366,7 +360,7 @@ def _send_morning_briefing() -> None:
                                         .time < __import__("datetime").time(9, 30)
                                     ] if not _pm_1m.empty else _pm_1m
                                     _pm_vol = float(_pm_only["Volume"].sum()) if not _pm_only.empty else 0
-                                    _avg30_df = _yf_pm.Ticker(_pm_sym).history(
+                                    _avg30_df = yf.Ticker(_pm_sym).history(
                                         period="30d", interval="1d", auto_adjust=True)
                                     _avg30 = float(_avg30_df["Volume"].tail(30).mean()) if len(_avg30_df) >= 5 else 0
                                     if _avg30 > 0:
@@ -376,12 +370,12 @@ def _send_morning_briefing() -> None:
                                         elif _pm_vol_ratio >= 1.0:
                                             _vol_tag = f" vol {_pm_vol_ratio:.1f}×avg"
                                 except Exception:
-                                    pass
+                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                                 _pm_alerts.append(
                                     f"  {'🔥' if _g>=0.03 else '📈'} *{_pm_sym}* "
                                     f"+{_g*100:.1f}% pre-market ${_pre_pm:.2f}{_vol_tag}")
                     except Exception:
-                        pass
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 if _pm_alerts:
                     lines.append("\n*Pre-market breakout candidates:*")
                     lines.extend(_pm_alerts)
@@ -495,8 +489,7 @@ def _opening_range_check() -> None:
                             _log.info("[or_check] %s price $%.2f below VWAP $%.2f",
                                       sym, cur_price, _vwap)
                 except Exception:
-                    pass
-
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 if cur_price < stop_p * 0.998:
                     cancel_all_orders(sym)
                     rs = _lrs()
@@ -595,8 +588,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                 errors_total += len(r.get("errors", []))
                 days_scanned += 1
             except Exception:
-                pass
-
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Read all trade journal entries (full history, not just this week) ──
         total_trades = wins = losses = 0
         win_r_sum = loss_r_sum = 0.0
@@ -619,8 +611,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                            else "6.0-7.0" if cs_val >= 6.0 else "5.0-6.0")
                     score_buckets[bkt].append(r)
                 except Exception:
-                    pass
-
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         win_rate   = wins / total_trades if total_trades else 0.0
         avg_win_r  = win_r_sum / wins if wins else 0.0
         avg_loss_r = loss_r_sum / losses if losses else 0.0
@@ -665,7 +656,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     if _wkts and date.fromisoformat(_wkts[:10]) >= _week_ago:
                         _wk_trades.append(_wkt)
                 except Exception:
-                    pass
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         if _wk_trades:
             lines.append(f"")
             _w_sorted = sorted(_wk_trades, key=lambda x: x.get("r_multiple", 0), reverse=True)
@@ -706,7 +697,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
             }
             (LOG_DIR / "feedback_state.json").write_text(json.dumps(_fb, indent=2))
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Signal attribution: which screener flags correlate with winners ─────
         try:
             _sa_path = LOG_DIR / "signal_accuracy.json"
@@ -728,8 +719,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     lines.append(f"\n*Signal accuracy (≥3 trades):*")
                     lines.extend(_sig_lines[:8])   # top 8 by total R
         except Exception:
-            pass
-
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         lines.append(f"")
         if ret_line:
             lines.append(ret_line)
@@ -743,7 +733,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                     try:
                         _all_trades.append(json.loads(_atl))
                     except Exception:
-                        pass
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             if _all_trades:
                 _best  = max(_all_trades, key=lambda t: t.get("r_multiple", 0))
                 _worst = min(_all_trades, key=lambda t: t.get("r_multiple", 0))
@@ -771,7 +761,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                         if 0 < _hd < 120:
                             _hold_days.append(_hd)
                 except Exception:
-                    pass
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             if _hold_days:
                 _avg_hold = sum(_hold_days) / len(_hold_days)
                 lines.append(f"  Avg hold: {_avg_hold:.0f} trading days")
@@ -792,8 +782,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                 lines.append(f"  {_bt_n} trades  WR={_bt_wr:.0%}  "
                               f"E={_bt_exp:+.2f}R  CAGR={_bt_cagr:.1f}%")
         except Exception:
-            pass
-
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         _tg("\n".join(lines))
         _log.info("[weekly] Weekly report sent")
     except Exception as e:
@@ -813,7 +802,6 @@ def _check_market_regime() -> tuple[str, float, float, float]:
     On fetch failure returns 'bull' so the bot never blocks itself on error.
     """
     try:
-        import yfinance as yf
         df    = yf.Ticker("SPY").history(period="1y", interval="1d", auto_adjust=True)
         close = df["Close"]
         ma200 = float(close.rolling(200).mean().iloc[-1])
@@ -836,12 +824,11 @@ def _check_market_regime() -> tuple[str, float, float, float]:
 def _fetch_vix() -> float:
     """Fetch latest VIX close. Returns 20.0 on failure (neutral assumption)."""
     try:
-        import yfinance as yf
         vix = yf.Ticker("^VIX").history(period="5d", interval="1d")
         if not vix.empty:
             return float(vix["Close"].iloc[-1])
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 20.0
 
 
@@ -895,8 +882,7 @@ def _fetch_power_trend() -> bool:
     Signals confirmed bull acceleration — adds +1.0 to Tudor Jones score.
     """
     try:
-        import yfinance as _yf
-        _df = _yf.Ticker("SPY").history(period="90d", interval="1d", auto_adjust=True)
+        _df = yf.Ticker("SPY").history(period="90d", interval="1d", auto_adjust=True)
         c = _df["Close"]
         ema21 = c.ewm(span=21, adjust=False).mean()
         ema50 = c.ewm(span=50, adjust=False).mean()
@@ -912,8 +898,7 @@ def _is_market_choppy() -> bool:
     When choppy: halve max_positions to preserve capital.
     """
     try:
-        import yfinance as _yf
-        _df = _yf.Ticker("SPY").history(period="30d", interval="1d", auto_adjust=True)
+        _df = yf.Ticker("SPY").history(period="30d", interval="1d", auto_adjust=True)
         if len(_df) < 15:
             return False
         h = _df["High"].values
@@ -977,12 +962,11 @@ def _fetch_vix_slope() -> float:
     Returns 0.0 on failure.
     """
     try:
-        import yfinance as _yf
-        hist = _yf.Ticker("^VIX").history(period="15d", interval="1d", auto_adjust=False)
+        hist = yf.Ticker("^VIX").history(period="15d", interval="1d", auto_adjust=False)
         if len(hist) >= 6:
             return float(hist["Close"].iloc[-1] - hist["Close"].iloc[-6])
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 0.0
 
 
@@ -1002,13 +986,12 @@ def _fetch_10y_yield_slope() -> float:
     Returns 0.0 on failure.
     """
     try:
-        import yfinance as _yf
-        hist = _yf.Ticker("^TNX").history(period="35d", interval="1d", auto_adjust=False)
+        hist = yf.Ticker("^TNX").history(period="35d", interval="1d", auto_adjust=False)
         if len(hist) >= 21:
             # ^TNX is in %, e.g. 4.50 means 4.50% — convert change to bps
             return float((hist["Close"].iloc[-1] - hist["Close"].iloc[-21]) * 100)
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 0.0
 
 
@@ -1038,7 +1021,7 @@ def _dynamic_min_composite() -> float:
                       bkt_lo["avg_r"], bkt_lo["count"])
             return 6.0
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 5.0
 
 
@@ -1048,16 +1031,15 @@ def _fetch_pcr() -> float:
     PCR > 1.0 = fear/contrarian buy (+0.5 Tudor pts); PCR < 0.6 = greed (-0.5 pts).
     """
     try:
-        import yfinance as _yf
         for tkr in ("^PCALL", "^CPC"):
             try:
-                h = _yf.Ticker(tkr).history(period="5d", interval="1d", auto_adjust=False)
+                h = yf.Ticker(tkr).history(period="5d", interval="1d", auto_adjust=False)
                 if not h.empty and not h["Close"].isna().all():
                     return float(h["Close"].dropna().iloc[-1])
             except Exception:
                 continue
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 0.7
 
 
@@ -1206,8 +1188,7 @@ def _market_follow_through_confirmed() -> bool:
     Returns True (allow entries) in all other cases including errors.
     """
     try:
-        import yfinance as _yf_ftd
-        _spy_ftd = _yf_ftd.Ticker("SPY").history(period="80d", interval="1d", auto_adjust=True)
+        _spy_ftd = yf.Ticker("SPY").history(period="80d", interval="1d", auto_adjust=True)
         if len(_spy_ftd) < 25:
             return True
         _cl_ftd  = _spy_ftd["Close"]
@@ -1236,8 +1217,7 @@ def _qqq_size_factor() -> float:
     VCPs are predominantly growth stocks; QQQ weakness = direct headwind.
     """
     try:
-        import yfinance as _yf_qq
-        _qqq = _yf_qq.Ticker("QQQ").history(
+        _qqq = yf.Ticker("QQQ").history(
             period="80d", interval="1d", auto_adjust=True)["Close"]
         if len(_qqq) >= 51:
             _ma50_qq = float(_qqq.tail(50).mean())
@@ -1245,7 +1225,7 @@ def _qqq_size_factor() -> float:
                 _log.info("[tudor] QQQ below MA50 — growth regime weak, sizing capped 75%%")
                 return 0.75
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 1.0
 
 
@@ -1255,9 +1235,8 @@ def _fetch_credit_spread_factor() -> float:
     signal risk-off before it shows in equities. Leading indicator vs VIX (coincident).
     """
     try:
-        import yfinance as _yf_cs
         import pandas as _pd_cs
-        _cs_df = _yf_cs.download(["HYG", "LQD"], period="15d", interval="1d",
+        _cs_df = yf.download(["HYG", "LQD"], period="15d", interval="1d",
                                    auto_adjust=True, progress=False)["Close"]
         if "HYG" in _cs_df.columns and "LQD" in _cs_df.columns and len(_cs_df) >= 6:
             _ratio   = _cs_df["HYG"] / _cs_df["LQD"]
@@ -1267,7 +1246,7 @@ def _fetch_credit_spread_factor() -> float:
                           abs(_chg5d) * 100)
                 return 0.80
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 1.0
 
 
@@ -1277,8 +1256,7 @@ def _extended_market_factor() -> float:
     Markets this extended mean mean-reversion risk is high; we cap new-position sizing.
     """
     try:
-        import yfinance as _yf_em
-        _spy_em = _yf_em.Ticker("SPY").history(
+        _spy_em = yf.Ticker("SPY").history(
             period="80d", interval="1d", auto_adjust=True)["Close"]
         if len(_spy_em) >= 51:
             _ma50_em = float(_spy_em.tail(50).mean())
@@ -1288,7 +1266,7 @@ def _extended_market_factor() -> float:
                           _ext_pct * 100)
                 return 0.7
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 1.0
 
 
@@ -1297,8 +1275,7 @@ def _fetch_dxy_factor() -> float:
     Uses UUP (Invesco Dollar Bullish ETF) as proxy. Returns 0.85 on strong dollar.
     """
     try:
-        import yfinance as _yf_dxy
-        _dxy = _yf_dxy.Ticker("UUP").history(period="30d", interval="1d", auto_adjust=True)["Close"]
+        _dxy = yf.Ticker("UUP").history(period="30d", interval="1d", auto_adjust=True)["Close"]
         if len(_dxy) >= 21:
             _dxy_ret = float(_dxy.iloc[-1] / _dxy.iloc[-21] - 1)
             if _dxy_ret > 0.02:
@@ -1306,7 +1283,7 @@ def _fetch_dxy_factor() -> float:
                           _dxy_ret * 100)
                 return 0.85
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 1.0
 
 
@@ -1317,13 +1294,13 @@ def _portfolio_beta_factor(positions: list) -> float:
     try:
         if not positions:
             return 1.0
-        import yfinance as _yf_beta, pandas as _pd_beta
+        import pandas as _pd_beta
         _syms = [p["symbol"] for p in positions]
         _total_val = sum(float(p.get("qty", 0)) * float(p.get("current_price", 0))
                          for p in positions)
         if _total_val <= 0:
             return 1.0
-        _df_b = _yf_beta.download(_syms + ["SPY"], period="60d", interval="1d",
+        _df_b = yf.download(_syms + ["SPY"], period="60d", interval="1d",
                                    auto_adjust=True, progress=False)["Close"]
         _spy_r = _df_b["SPY"].pct_change().dropna() if "SPY" in _df_b.columns else None
         if _spy_r is None or len(_spy_r) < 20:
@@ -1358,8 +1335,7 @@ def _beta_size_factor(symbol: str) -> float:
     Uses yfinance info; cached per symbol for the session.
     """
     try:
-        import yfinance as _yf_bt
-        _beta = _yf_bt.Ticker(symbol).info.get("beta")
+        _beta = yf.Ticker(symbol).info.get("beta")
         if _beta is None:
             return 1.0
         _beta = float(_beta)
@@ -1379,8 +1355,7 @@ def _atr_volatility_factor(symbol: str, entry_price: float) -> float:
     High ATR means wider natural swings; 1R per trade requires fewer shares.
     """
     try:
-        import yfinance as _yf_atr
-        _df = _yf_atr.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
+        _df = yf.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
         if len(_df) < 15:
             return 1.0
         _hi, _lo, _cl = _df["High"].values, _df["Low"].values, _df["Close"].values
@@ -1402,8 +1377,7 @@ def _fetch_distribution_days() -> int:
     4-5 distribution days signal institutional selling (O'Neil market health).
     """
     try:
-        import yfinance as _yf_dd
-        _df = _yf_dd.Ticker("SPY").history(period="40d", interval="1d", auto_adjust=True)
+        _df = yf.Ticker("SPY").history(period="40d", interval="1d", auto_adjust=True)
         if len(_df) < 5:
             return 0
         _df = _df.tail(26)
@@ -1423,8 +1397,7 @@ def _fetch_nh_nl_ratio() -> float:
     Falls back to neutral (1.0) if data unavailable.
     """
     try:
-        import yfinance as _yf_nl
-        _hl = _yf_nl.Ticker("^NYHL").history(period="5d", interval="1d", auto_adjust=True)
+        _hl = yf.Ticker("^NYHL").history(period="5d", interval="1d", auto_adjust=True)
         if len(_hl) >= 1:
             _net = float(_hl["Close"].iloc[-1])
             if _net > 150:   return 2.0   # strong expansion
@@ -1433,7 +1406,7 @@ def _fetch_nh_nl_ratio() -> float:
             if _net < -50:   return 0.5   # weakening
             return 1.0
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return 1.0   # neutral fallback when data unavailable
 
 
@@ -1444,7 +1417,6 @@ def _compute_ad_divergence(breadth_pct: float) -> bool:
     """
     try:
         import json as _json_ad, os as _os_ad
-        import yfinance as _yf_ad
         _bh_path = str(BASE_DIR / "logs" / "breadth_history.json")
         if not _os_ad.path.exists(_bh_path):
             return False
@@ -1455,7 +1427,7 @@ def _compute_ad_divergence(breadth_pct: float) -> bool:
         _breadth_chg = breadth_pct - float(_bh[-10])  # negative = breadth shrinking
         if _breadth_chg >= -0.03:                       # need ≥3pp breadth decline
             return False
-        _spy_hist = _yf_ad.Ticker("SPY").history(period="20d", interval="1d", auto_adjust=True)["Close"]
+        _spy_hist = yf.Ticker("SPY").history(period="20d", interval="1d", auto_adjust=True)["Close"]
         if len(_spy_hist) < 11:
             return False
         _spy_10d = float(_spy_hist.iloc[-1] / _spy_hist.iloc[-10] - 1)
@@ -1478,8 +1450,7 @@ def _vix_term_structure_pts() -> float:
     if _time_vts.time() - _vts_ts < 14400:
         return _vts_pts
     try:
-        import yfinance as _yf_vts
-        _vd = _yf_vts.download(["^VIX", "^VIX3M"], period="5d", interval="1d",
+        _vd = yf.download(["^VIX", "^VIX3M"], period="5d", interval="1d",
                                 progress=False, auto_adjust=False)["Close"]
         _vix_now  = float(_vd["^VIX"].dropna().iloc[-1])
         _vix3m    = float(_vd["^VIX3M"].dropna().iloc[-1])
@@ -1512,8 +1483,7 @@ def _yield_curve_inverted() -> bool:
     if _time_yc.time() - _ts < 14400:
         return _val
     try:
-        import yfinance as _yf_yc
-        _yc_df = _yf_yc.download(["^IRX", "^TNX"], period="5d", interval="1d",
+        _yc_df = yf.download(["^IRX", "^TNX"], period="5d", interval="1d",
                                   progress=False, auto_adjust=False)["Close"]
         _3m  = float(_yc_df["^IRX"].dropna().iloc[-1])
         _10y = float(_yc_df["^TNX"].dropna().iloc[-1])
@@ -1534,8 +1504,7 @@ def _credit_spreads_wide() -> bool:
     if _time_cs.time() - _ts2 < 14400:
         return _val2
     try:
-        import yfinance as _yf_cs
-        _csdf = _yf_cs.download(["HYG", "TLT"], period="30d", interval="1d",
+        _csdf = yf.download(["HYG", "TLT"], period="30d", interval="1d",
                                   progress=False, auto_adjust=True)["Close"]
         _hyg_r = float(_csdf["HYG"].iloc[-1] / _csdf["HYG"].iloc[-21] - 1)
         _tlt_r = float(_csdf["TLT"].iloc[-1] / _csdf["TLT"].iloc[-21] - 1)
@@ -1633,24 +1602,7 @@ _SUPER_SECTOR: dict[str, str] = {
     "Financials":             "financial",
 }
 
-_SECTOR_ETF_MAP = {
-    "Technology":             "XLK",
-    "Financial Services":     "XLF",
-    "Financials":             "XLF",   # legacy alias
-    "Healthcare":             "XLV",
-    "Health Care":            "XLV",   # legacy alias
-    "Energy":                 "XLE",
-    "Consumer Cyclical":      "XLY",
-    "Consumer Discretionary": "XLY",   # legacy alias
-    "Industrials":            "XLI",
-    "Basic Materials":        "XLB",
-    "Materials":              "XLB",   # legacy alias
-    "Real Estate":            "XLRE",
-    "Utilities":              "XLU",
-    "Consumer Defensive":     "XLP",
-    "Consumer Staples":       "XLP",   # legacy alias
-    "Communication Services": "XLC",
-}
+
 
 
 def _sector_momentum_scores() -> tuple[dict[str, float], dict[str, bool]]:
@@ -1658,7 +1610,6 @@ def _sector_momentum_scores() -> tuple[dict[str, float], dict[str, bool]]:
     Stage 2 flag (above MA200) required for positive sector bonus to apply.
     """
     try:
-        import yfinance as yf
         unique_etfs = list(set(_SECTOR_ETF_MAP.values()))
         df = yf.download(unique_etfs + ["SPY"], period="1y", interval="1d",
                          auto_adjust=True, progress=False)["Close"]
@@ -1732,7 +1683,6 @@ def _is_correlated(candidate: str, held: set, threshold: float = 0.80) -> bool:
     if not held:
         return False
     try:
-        import yfinance as yf
         import pandas as pd
         syms = [candidate] + list(held)
         df = yf.download(syms, period="3mo", interval="1d",
@@ -1810,9 +1760,47 @@ def run_daily():
         _SCAN_LOCK.release()
 
 
+def _archive_old_jsonl(max_age_days: int = 180):
+    """Move JSONL log entries older than max_age_days to logs/archive/.
+    Keeps the active files lean; archived files are never deleted.
+    """
+    import json as _j
+    archive_dir = LOG_DIR / "archive"
+    archive_dir.mkdir(exist_ok=True)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    for fname in ("trade_journal.jsonl", "sync_audit.jsonl"):
+        src = LOG_DIR / fname
+        if not src.exists():
+            continue
+        try:
+            lines = src.read_text().splitlines()
+            keep, old = [], []
+            for ln in lines:
+                if not ln.strip():
+                    continue
+                try:
+                    rec = _j.loads(ln)
+                    ts_str = rec.get("closed_at") or rec.get("timestamp") or rec.get("date", "")
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else cutoff
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    (old if ts < cutoff else keep).append(ln)
+                except Exception:
+                    keep.append(ln)  # keep unparseable lines in active file
+            if old:
+                arc_file = archive_dir / fname
+                with open(arc_file, "a") as af:
+                    af.write("\n".join(old) + "\n")
+                src.write_text("\n".join(keep) + ("\n" if keep else ""))
+                _log.info("[main] Archived %d old entries from %s", len(old), fname)
+        except Exception as e:
+            _log.warning("[main] JSONL archive failed for %s: %s", fname, e)
+
+
 def _run_daily_impl():
     """Actual pipeline — always called under _SCAN_LOCK."""
     _heartbeat()
+    _archive_old_jsonl()
 
     today = str(date.today())
     _log.info("=" * 70)
@@ -2006,10 +1994,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _sh_held = any(p["symbol"] in ("SH", "PSQ") for p in positions)
         if not _sh_held:
             try:
-                import yfinance as _yf_sh
                 from broker import place_buy_stop as _pbs_sh
                 from risk_manager import position_size as _psz_sh, register_trade as _reg_sh
-                _sh_fi = _yf_sh.Ticker("SH").fast_info
+                _sh_fi = yf.Ticker("SH").fast_info
                 _sh_px = float(getattr(_sh_fi, "last_price", None) or
                                getattr(_sh_fi, "regularMarketPrice", 0))
                 if _sh_px > 0:
@@ -2169,8 +2156,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # VIX spike: if VIX jumps >15% in a single session, markets are in sudden distress
     _vix_spike_today = False
     try:
-        import yfinance as _yf_vs
-        _vix_hist = _yf_vs.Ticker("^VIX").history(period="5d", interval="1d", auto_adjust=False)
+        _vix_hist = yf.Ticker("^VIX").history(period="5d", interval="1d", auto_adjust=False)
         if len(_vix_hist) >= 2:
             _vix_prev = float(_vix_hist["Close"].iloc[-2])
             _vix_chg  = (_current_vix - _vix_prev) / _vix_prev if _vix_prev > 0 else 0.0
@@ -2179,7 +2165,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 _log.warning("[tudor] VIX SPIKE: %.1f → %.1f (+%.0f%%) — sudden market distress",
                              _vix_prev, _current_vix, _vix_chg * 100)
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     _log.info("[tudor] VIX=%.1f → size factor=%.0f%%", _current_vix, _vix_size_factor(_current_vix)*100)
     sector_momentum, sector_stage2 = _sector_momentum_scores()
     _power_trend      = _fetch_power_trend()
@@ -2192,16 +2178,15 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
               ("complacency(+0.25)" if _vix_slope < -2.0 else "neutral"))
     # Enrich trend results with RS vs own sector ETF (pre-fetched sector data)
     try:
-        import yfinance as _yf_rs
         import pandas as _pd_rs
         _etf_closes: dict = {}
         for _etf in set(_SECTOR_ETF_MAP.values()):
             try:
-                _h = _yf_rs.Ticker(_etf).history(period="1y", interval="1d", auto_adjust=True)
+                _h = yf.Ticker(_etf).history(period="1y", interval="1d", auto_adjust=True)
                 if not _h.empty:
                     _etf_closes[_etf] = _h["Close"]
             except Exception:
-                pass
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         for _tr in vcp_passed:
             _sec = get_sector(_tr.symbol)
             _etf = _SECTOR_ETF_MAP.get(_sec)
@@ -2215,9 +2200,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                         _ep = float(_etf_c.iloc[-1] / _etf_c.iloc[-_n] - 1)
                         _tr.rs_vs_sector = round(_sp - _ep, 4)
                 except Exception:
-                    pass
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     _log.info("[tudor] 10Y yield slope=%.0fbps (%s)",
               _rate_slope_bps,
               "rising-hard(-1.0)" if _rate_slope_bps > 50 else
@@ -2357,8 +2342,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # SPY choppiness gate: 14-day ATR/price > 1.5% = directionless market
     # VIX catches fear spikes; this catches sideways grind where breakouts consistently fail
     try:
-        import yfinance as _yf_chop
-        _spy_chop = _yf_chop.Ticker("SPY").history(period="30d", interval="1d", auto_adjust=True)
+        _spy_chop = yf.Ticker("SPY").history(period="30d", interval="1d", auto_adjust=True)
         if len(_spy_chop) >= 15:
             _tr_chop = (_spy_chop["High"] - _spy_chop["Low"]).tail(14).mean()
             _pr_chop = float(_spy_chop["Close"].iloc[-1])
@@ -2368,8 +2352,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                           _atr_pct * 100, max_new_pos, max(1, max_new_pos // 2))
                 max_new_pos = max(1, max_new_pos // 2)
     except Exception:
-        pass
-
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     _reject_reasons: dict[str, str] = {}
     for vcp, trend_r, composite in vcp_scored:
         if len(orders_placed) >= max_new_pos:
@@ -2453,8 +2436,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         # Gap-up breakout: open above prior day's high = institutional conviction → +10% size
         _gap_up_f = 1.0
         try:
-            import yfinance as _yf_gap
-            _df_gap = _yf_gap.Ticker(vcp.symbol).history(
+            _df_gap = yf.Ticker(vcp.symbol).history(
                 period="5d", interval="1d", auto_adjust=True)
             if len(_df_gap) >= 2:
                 _gap_open   = float(_df_gap["Open"].iloc[-1])
@@ -2464,7 +2446,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                     _log.info("[main] %s gap-up breakout (open $%.2f > prior high $%.2f) — size +10%%",
                               vcp.symbol, _gap_open, _gap_prev_h)
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         risk_pct  = (_adaptive_risk_pct(composite, base_risk, _current_vix)
                      * regime_size_factor * loss_factor * win_factor
                      * _atr_f * _sym_beta_f * _extended_factor * _qqq_factor
@@ -2502,8 +2484,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
         # Liquidity gate: position must not exceed 2% of 20-day avg dollar volume
         try:
-            import yfinance as _yf_liq
-            _liq = _yf_liq.Ticker(vcp.symbol).history(
+            _liq = yf.Ticker(vcp.symbol).history(
                 period="30d", interval="1d", auto_adjust=True)
             if len(_liq) >= 20:
                 _adv = float((_liq["Close"] * _liq["Volume"]).tail(20).mean())
@@ -2512,8 +2493,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                               vcp.symbol, sizing["notional"], _adv)
                     continue
         except Exception:
-            pass
-
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         if vcp.current_price >= vcp.breakout_level * 1.005:
             _log.info("[main] %s already above breakout ($%.2f >= $%.2f) — skip",
                       vcp.symbol, vcp.current_price, vcp.breakout_level)
@@ -2576,8 +2556,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             # Store active signal names in order_rec so position_monitor can close the loop
             order_rec["active_signals"] = _active
         except Exception:
-            pass
-
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         vol_tag = " 🔥" if vcp.breakout_volume else ""
         _log.info(
             "[main] ✅ %s | %d sh | buy-stop=$%.2f | SL=$%.2f | TP=$%.2f | "
@@ -2864,7 +2843,7 @@ def _startup_healthcheck() -> bool:
                 f"{len(failures)} critical issue(s):\n"
                 + "\n".join(f"• {f}" for f in failures))
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         return False
 
     _log.info("[startup] ✅ All health checks passed — bot ready")

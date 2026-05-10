@@ -96,16 +96,17 @@ def _kelly_factor() -> float:
 
 
 def _stop_distance_factor(entry_price: float, stop_price: float) -> float:
-    """Scale position size down for wide stops — tight VCP handle = bigger position.
-    A 5% stop means the setup is ideal; 10%+ stop = lower conviction, smaller size.
-    """
+    """Scale position size down for wide stops — tight VCP handle = bigger position."""
     if entry_price <= 0 or stop_price >= entry_price:
         return 1.0
     stop_pct = (entry_price - stop_price) / entry_price
-    if stop_pct <= 0.05:  return 1.00   # ideal tight handle
-    if stop_pct <= 0.07:  return 0.85   # slightly wide
-    if stop_pct <= 0.10:  return 0.70   # moderately wide
-    return 0.55                          # very wide — reduced conviction
+    tiers = RISK.get("stop_distance_tiers", [
+        (0.05, 1.00), (0.07, 0.85), (0.10, 0.70), (1.00, 0.55),
+    ])
+    for threshold, factor in tiers:
+        if stop_pct <= threshold:
+            return factor
+    return tiers[-1][1]
 
 
 def position_size(portfolio_value: float, entry_price: float,
@@ -166,8 +167,7 @@ def position_size(portfolio_value: float, entry_price: float,
                               measured_move, _atr_cap, _atr_pct * 100)
                     measured_move = _atr_cap
     except Exception:
-        pass
-
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     rr_ratio = measured_move / risk_per_share
 
     return {

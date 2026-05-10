@@ -17,6 +17,7 @@ from datetime import datetime, time as dt_time, timedelta
 
 import pytz
 import requests
+import yfinance as yf
 
 _log = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ def _load_state() -> dict:
             with open(_STATE_FILE) as f:
                 return json.load(f)
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return {}
 
 
@@ -330,16 +331,7 @@ def _trading_days_held(entry_date_str: str) -> int:
         return 0
 
 
-# ── Sector ETF map (minimal copy for position monitor) ─────────────────────
-_SECTOR_ETF_PM: dict[str, str] = {
-    "Technology": "XLK", "Financial Services": "XLF", "Financials": "XLF",
-    "Healthcare": "XLV", "Health Care": "XLV", "Energy": "XLE",
-    "Consumer Cyclical": "XLY", "Consumer Discretionary": "XLY",
-    "Industrials": "XLI", "Basic Materials": "XLB", "Materials": "XLB",
-    "Real Estate": "XLRE", "Utilities": "XLU",
-    "Consumer Defensive": "XLP", "Consumer Staples": "XLP",
-    "Communication Services": "XLC",
-}
+from config import SECTOR_ETF_MAP as _SECTOR_ETF_PM
 _sector_etf_cache: dict[str, tuple[bool, float]] = {}
 
 
@@ -356,8 +348,7 @@ def _sector_etf_below_ma50(symbol: str) -> bool:
         _now = _time_s.time()
         if etf in _sector_etf_cache and _now - _sector_etf_cache[etf][1] < 3600:
             return _sector_etf_cache[etf][0]
-        import yfinance as _yf_etf
-        _col = _yf_etf.Ticker(etf).history(
+        _col = yf.Ticker(etf).history(
             period="60d", interval="1d", auto_adjust=True)["Close"]
         _result = len(_col) >= 51 and float(_col.iloc[-1]) < float(_col.tail(50).mean())
         _sector_etf_cache[etf] = (_result, _now)
@@ -378,8 +369,7 @@ def _get_cached_regime() -> str:
     if _time_r.time() - _regime_ts_pm < 3600:
         return _cached_regime_pm
     try:
-        import yfinance as _yf_rg
-        _spy = _yf_rg.Ticker("SPY").history(
+        _spy = yf.Ticker("SPY").history(
             period="200d", interval="1d", auto_adjust=True)["Close"]
         if len(_spy) >= 50:
             _ma200 = float(_spy.tail(200).mean())
@@ -387,7 +377,7 @@ def _get_cached_regime() -> str:
             _cached_regime_pm = ("bull" if _pct > 0.02
                                   else ("bear" if _pct < -0.02 else "neutral"))
     except Exception:
-        pass
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     _regime_ts_pm = _time_r.time()
     return _cached_regime_pm
 
@@ -419,7 +409,7 @@ def _lookup_position_metadata(symbol: str) -> dict:
                         "active_signals":    list(order.get("active_signals", [])),
                     }
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     return {"stop_loss": 0.0, "quality_score": 0, "composite_score": 0.0,
             "measured_move_pct": 0.0, "buy_stop": 0.0, "active_signals": []}
 
@@ -513,7 +503,7 @@ def check_positions() -> None:
                     timeout=8,
                 )
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         return   # skip entire monitoring cycle — do NOT touch orders
 
     try:
@@ -533,7 +523,7 @@ def check_positions() -> None:
                     timeout=8,
                 )
         except Exception:
-            pass
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         return
     if not positions:
         return
@@ -559,8 +549,7 @@ def check_positions() -> None:
             _log.info("[monitor] SOFT-DD MODE active (day_pnl=%.1f%%) — trail=5%% breakeven=5%%",
                       _daily_pnl * 100)
     except Exception:
-        pass
-
+        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     state = _load_state()
     changed = False
 
@@ -586,13 +575,53 @@ def check_positions() -> None:
         })
         sym["last_price"] = cur_price   # keep last known price for close_trade P&L
 
+        # Stock split detection: if Alpaca qty diverges significantly from our recorded qty,
+        # a corporate action (split / reverse-split) likely occurred. Alert and rescale stop.
+        _recorded_qty = sym.get("initial_qty", 0)
+        if _recorded_qty > 0 and not sym.get("split_detected"):
+            _pyramid_qty = sym.get("pyramid_qty", 0)
+            _expected_qty = _recorded_qty + _pyramid_qty
+            if _expected_qty > 0:
+                _qty_ratio = qty / _expected_qty
+                if _qty_ratio >= 1.8 or _qty_ratio <= 0.6:
+                    _split_factor = round(_qty_ratio)
+                    sym["split_detected"] = True
+                    sym["split_factor"]   = _qty_ratio
+                    _old_sl = sym.get("stop_loss", 0)
+                    if _old_sl > 0 and _split_factor > 0:
+                        sym["stop_loss"]         = round(_old_sl / _qty_ratio, 4)
+                        sym["stop_loss_initial"] = round(
+                            sym.get("stop_loss_initial", _old_sl) / _qty_ratio, 4)
+                    _log.warning(
+                        "[monitor] %s SPLIT DETECTED — qty %d→%d (ratio=%.2f) "
+                        "SL adjusted $%.2f→$%.2f",
+                        symbol, _expected_qty, qty, _qty_ratio,
+                        _old_sl, sym.get("stop_loss", 0),
+                    )
+                    try:
+                        import requests as _rq_sp, os as _os_sp
+                        _tok_sp = _os_sp.getenv("TELEGRAM_BOT_TOKEN", "")
+                        _cid_sp = _os_sp.getenv("TELEGRAM_CHAT_ID", "")
+                        if _tok_sp and _cid_sp:
+                            _rq_sp.post(
+                                f"https://api.telegram.org/bot{_tok_sp}/sendMessage",
+                                json={"chat_id": _cid_sp, "parse_mode": "Markdown",
+                                      "text": (
+                                          f"⚠️ *Stock Split Detected — {symbol}*\n"
+                                          f"Qty {_expected_qty} → {qty} (ratio {_qty_ratio:.2f}x)\n"
+                                          f"Stop adjusted: ${_old_sl:.2f} → ${sym.get('stop_loss', 0):.2f}\n"
+                                          "Please verify position parameters."
+                                      )},
+                                timeout=8,
+                            )
+                    except Exception:
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # On first encounter: check intraday breakout volume confirmation.
         # Minervini rule: breakout on < 1.0× avg volume = false breakout, exit fast.
         if not sym.get("_vol_checked"):
             sym["_vol_checked"] = True
             try:
-                import yfinance as _yf_vol
-                _dfv = _yf_vol.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
+                _dfv = yf.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
                 if len(_dfv) >= 20:
                     _avg20_vol = float(_dfv["Volume"].tail(20).mean())
                     _today_vol = float(_dfv["Volume"].iloc[-1])
@@ -618,14 +647,17 @@ def check_positions() -> None:
                                           )},
                                     timeout=8)
                         except Exception:
-                            pass
+                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             except Exception as _ve:
                 _log.debug("[monitor] vol check %s: %s", symbol, _ve)
 
-        # On first encounter: look up VCP stop loss + quality from daily report
-        if not sym.get("_meta_loaded"):
+        # Load (or reload) VCP metadata once per trading day so the monitor always
+        # uses the latest daily-report values for stop, quality, and composite score.
+        _today_str = datetime.now(_ET).strftime("%Y-%m-%d")
+        if not sym.get("_meta_loaded") or sym.get("_meta_date") != _today_str:
             meta = _lookup_position_metadata(symbol)
             sym["_meta_loaded"]       = True
+            sym["_meta_date"]         = _today_str
             sym["stop_loss"]          = meta["stop_loss"]
             sym["stop_loss_initial"]  = meta["stop_loss"]  # preserved for R-multiple calc
             sym["quality_score"]      = meta["quality_score"]
@@ -637,8 +669,7 @@ def check_positions() -> None:
             # ATR-dynamic trailing stop: 2×ATR(14) as trail %, clamped 4-12%.
             # Low-vol stocks get tighter stops; high-vol stocks get room to breathe.
             try:
-                import yfinance as _yf_atr_m
-                _df_atr_m = _yf_atr_m.Ticker(symbol).history(
+                _df_atr_m = yf.Ticker(symbol).history(
                     period="30d", interval="1d", auto_adjust=True)
                 if len(_df_atr_m) >= 15:
                     _hi_m = _df_atr_m["High"].values
@@ -677,8 +708,7 @@ def check_positions() -> None:
             # Breakout volume validation: if fill-day volume < 1.5x 60-day avg, tighten stop
             # Low-volume breakouts have 3x higher failure rate — Minervini hard rule
             try:
-                import yfinance as _yf_bv
-                _bv_df = _yf_bv.Ticker(symbol).history(
+                _bv_df = yf.Ticker(symbol).history(
                     period="90d", interval="1d", auto_adjust=True)
                 if len(_bv_df) >= 61:
                     _bv_avg   = float(_bv_df["Volume"].iloc[-61:-1].mean())
@@ -694,7 +724,7 @@ def check_positions() -> None:
                                           sym["stop_loss"], _new_sl)
                                 sym["stop_loss"] = _new_sl
             except Exception:
-                pass
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             changed = True
 
         _log.debug("[monitor] %s  qty=%d  avg=$%.2f  cur=$%.2f  pnl=%.1f%%",
@@ -756,7 +786,7 @@ def check_positions() -> None:
                                       )},
                                 timeout=8)
                     except Exception:
-                        pass
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             except Exception as _sve:
                 _log.debug("[monitor] stop_revalidation %s: %s", symbol, _sve)
 
@@ -801,8 +831,7 @@ def check_positions() -> None:
                                       )},
                                 timeout=8)
                     except Exception:
-                        pass
-
+                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # Quality-adjusted exits: elite setups get more room to run
         composite      = sym.get("composite_score", 0.0)
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
@@ -819,8 +848,7 @@ def check_positions() -> None:
                 and pnl_pct > 0):
             sym["_gap_check_date"] = _gap_today
             try:
-                import yfinance as _yf_g
-                _dfg = _yf_g.Ticker(symbol).history(
+                _dfg = yf.Ticker(symbol).history(
                     period="5d", interval="1d", auto_adjust=True)
                 if len(_dfg) >= 2:
                     _prev_close = float(_dfg["Close"].iloc[-2])
@@ -872,7 +900,7 @@ def check_positions() -> None:
                                                                 f"Stop moved to breakeven ${avg_cost:.2f}")},
                                                  timeout=8)
                                 except Exception:
-                                    pass
+                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                         elif pnl_pct < 0.01 and _days_earn <= 3 and _remaining > 0:
                             # Flat/losing with report in 3 days → exit now
                             _cancel_stop_orders(symbol)
@@ -893,7 +921,7 @@ def check_positions() -> None:
                                                                 f"Exiting before earnings risk")},
                                                  timeout=8)
                                 except Exception:
-                                    pass
+                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             except Exception as _e:
                 _log.debug("[monitor] earnings check %s: %s", symbol, _e)
 
@@ -908,8 +936,7 @@ def check_positions() -> None:
             if sym.get("_iv_check_date") != _iv_today:
                 sym["_iv_check_date"] = _iv_today
                 try:
-                    import yfinance as _yf_iv
-                    _tk_iv = _yf_iv.Ticker(symbol)
+                    _tk_iv = yf.Ticker(symbol)
                     _exps  = _tk_iv.options
                     if _exps:
                         _chain = _tk_iv.option_chain(_exps[0])
@@ -944,7 +971,7 @@ def check_positions() -> None:
                                                       )},
                                                 timeout=8)
                                     except Exception:
-                                        pass
+                                        _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 except Exception as _ive:
                     _log.debug("[monitor] iv_crush %s: %s", symbol, _ive)
 
@@ -1006,7 +1033,7 @@ def check_positions() -> None:
                     from risk_manager import record_pivot_failure as _rpf
                     _rpf(symbol)
                 except Exception:
-                    pass
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 changed = True
                 try:
                     import requests as _rz, os as _oz
@@ -1020,8 +1047,7 @@ def check_positions() -> None:
                                                 f"Day {_trading_days_held(_ed_z)} — cutting loss")},
                                  timeout=8)
                 except Exception:
-                    pass
-
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Weak vol override: tighten stop to -3% if weak breakout and price drops ───
         if (sym.get("weak_vol_breakout")
                 and not sym.get("weak_vol_stop_set")
@@ -1053,8 +1079,7 @@ def check_positions() -> None:
                 if sym.get("_pivot_trail_date") != _pt_today:
                     sym["_pivot_trail_date"] = _pt_today
                     try:
-                        import yfinance as _yf_pt
-                        _dfp = _yf_pt.Ticker(symbol).history(
+                        _dfp = yf.Ticker(symbol).history(
                             period="30d", interval="1d", auto_adjust=True)
                         if len(_dfp) >= 5:
                             # Find most recent swing low in last 20 bars (skip last 2 incomplete)
@@ -1099,8 +1124,7 @@ def check_positions() -> None:
             if _ed_ma and _trading_days_held(_ed_ma) >= 10:
                 sym["_ma20_check_date"] = _ma20_today
                 try:
-                    import yfinance as _yf_ma
-                    _dfm = _yf_ma.Ticker(symbol).history(
+                    _dfm = yf.Ticker(symbol).history(
                         period="35d", interval="1d", auto_adjust=True)
                     if len(_dfm) >= 20:
                         _ma20_val  = float(_dfm["Close"].rolling(20).mean().iloc[-1])
@@ -1151,8 +1175,7 @@ def check_positions() -> None:
                                        f"holding full position to week 8")},
                         timeout=8)
             except Exception:
-                pass
-
+                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
         initial_qty = sym.get("initial_qty", qty)
         # Superperformance skip: composite ≥8 setups (elite VCPs) need more room before first partial
@@ -1214,8 +1237,7 @@ def check_positions() -> None:
                 _pyr_qty = max(1, round(sym.get("initial_qty", qty) * 0.30))
                 _pyr_above_ma20 = False
                 try:
-                    import yfinance as _yf_pyr
-                    _df_pyr = _yf_pyr.Ticker(symbol).history(
+                    _df_pyr = yf.Ticker(symbol).history(
                         period="40d", interval="1d", auto_adjust=True)
                     if len(_df_pyr) >= 20:
                         _ma20_pyr = float(_df_pyr["Close"].rolling(20).mean().iloc[-1])
@@ -1243,8 +1265,7 @@ def check_positions() -> None:
                                                    f"(+{pnl_pct*100:.1f}%, day {_pyr_days})")},
                                     timeout=8)
                         except Exception:
-                            pass
-
+                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
         # ── Step C: Move stop to breakeven at +8% (if no partial yet) ───────────
         elif pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
             breakeven = round(avg_cost, 2)
@@ -1357,8 +1378,7 @@ def check_positions() -> None:
             if sym.get("_vc_check_date") != _vc_today:
                 sym["_vc_check_date"] = _vc_today
                 try:
-                    import yfinance as _yf_vc
-                    _dfvc = _yf_vc.Ticker(symbol).history(
+                    _dfvc = yf.Ticker(symbol).history(
                         period="90d", interval="1d", auto_adjust=True)
                     if len(_dfvc) >= 50:
                         _vol_cur  = float(_dfvc["Volume"].iloc[-1])
@@ -1392,7 +1412,7 @@ def check_positions() -> None:
                                                            f"Sold 50% — Minervini blow-off top")},
                                             timeout=8)
                                 except Exception:
-                                    pass
+                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 except Exception as _vce:
                     _log.debug("[monitor] volume climax %s: %s", symbol, _vce)
 
@@ -1402,8 +1422,7 @@ def check_positions() -> None:
         if (sym.get("partial2_done")
                 and not sym.get("lhll_stopped")):
             try:
-                import yfinance as _yf_ll
-                _dfll = _yf_ll.Ticker(symbol).history(
+                _dfll = yf.Ticker(symbol).history(
                     period="15d", interval="1d", auto_adjust=True)
                 if len(_dfll) >= 4:
                     _hh = _dfll["High"].values
@@ -1433,8 +1452,7 @@ def check_positions() -> None:
             if sym.get("_pead_check_date") != _pead_today:
                 sym["_pead_check_date"] = _pead_today
                 try:
-                    import yfinance as _yf_pd
-                    _ed_df = _yf_pd.Ticker(symbol).earnings_dates
+                    _ed_df = yf.Ticker(symbol).earnings_dates
                     if _ed_df is not None and not _ed_df.empty:
                         _ed_r = _ed_df.reset_index()
                         _now_ts = pd.Timestamp.now(tz="UTC")
@@ -1470,7 +1488,7 @@ def check_positions() -> None:
                                                   )},
                                             timeout=8)
                                 except Exception:
-                                    pass
+                                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 except Exception as _pde:
                     _log.debug("[monitor] pead_check %s: %s", symbol, _pde)
 
@@ -1483,10 +1501,9 @@ def check_positions() -> None:
                 and sym.get("_rsd_date") != _rsd_today):
             sym["_rsd_date"] = _rsd_today
             try:
-                import yfinance as _yf_rsd
-                _df_rsd = _yf_rsd.Ticker(symbol).history(
+                _df_rsd = yf.Ticker(symbol).history(
                     period="60d", interval="1d", auto_adjust=True)
-                _spy_rsd = _yf_rsd.Ticker("SPY").history(
+                _spy_rsd = yf.Ticker("SPY").history(
                     period="60d", interval="1d", auto_adjust=True)["Close"]
                 if len(_df_rsd) >= 22 and len(_spy_rsd) >= 22:
                     _c_rsd   = _df_rsd["Close"]
@@ -1534,7 +1551,7 @@ def check_positions() -> None:
                                               )},
                                         timeout=8)
                             except Exception:
-                                pass
+                                _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
             except Exception as _rsd_e:
                 _log.debug("[monitor] rs_divergence %s: %s", symbol, _rsd_e)
 
@@ -1578,7 +1595,7 @@ def check_positions() -> None:
                                                    + f"P&L {pnl_pct*100:+.1f}% - locking gains")},
                                     timeout=8)
                         except Exception:
-                            pass
+                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 elif _rem_hm > 0:
                     _cancel_stop_orders(symbol)
                     if _place_market_sell(symbol, _rem_hm):
@@ -1599,8 +1616,7 @@ def check_positions() -> None:
                                                    + "60-day absolute cap reached")},
                                     timeout=8)
                         except Exception:
-                            pass
-
+                            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     # -- Stale position review (>30 trading days, no major exit milestone) --------
     for _sym_st, _sym_std in state.items():
         if _sym_st not in {p["symbol"] for p in positions}:
@@ -1634,8 +1650,7 @@ def check_positions() -> None:
                     timeout=5)
                 changed = True
         except Exception:
-            pass
-
+            _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
     # Clean up state for positions that are now closed — call close_trade()
     # so risk_state (portfolio heat, daily P&L, consecutive losses) stays accurate.
     open_syms = {p["symbol"] for p in positions}
@@ -1687,7 +1702,7 @@ def check_positions() -> None:
                                     _sa2[_sig2].get("total_r", 0.0) + _r_val, 3)
                         open(_sa_path, "w").write(_jsa2.dumps(_sa2, indent=2))
                 except Exception:
-                    pass
+                    _log.debug("[%s] suppressed: %%s", __name__, exc_info=True)
                 # Re-entry cooldown: shorter if pyramid was added (shakeout of add-on
                 # shares ≠ full base failure), normal 5 days otherwise
                 if pnl_pct < 0:
