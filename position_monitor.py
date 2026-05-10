@@ -56,7 +56,20 @@ def _load_state() -> dict:
     try:
         if os.path.exists(_STATE_FILE):
             with open(_STATE_FILE) as f:
-                return json.load(f)
+                state = json.load(f)
+            # Schema check: state must be a dict keyed by symbol (str → dict).
+            # A corrupted file (e.g. "positions": []) would silently lose all tracking.
+            if not isinstance(state, dict):
+                _log.error("[monitor] monitor_state.json is not a dict — resetting "
+                           "(was: %s)", type(state).__name__)
+                return {}
+            # Prune any non-dict values that slipped in
+            bad = [k for k, v in state.items() if not isinstance(v, dict)]
+            if bad:
+                _log.warning("[monitor] Removing %d malformed state entries: %s", len(bad), bad)
+                for k in bad:
+                    del state[k]
+            return state
     except Exception:
         _log.debug("[%s] suppressed", __name__, exc_info=True)
     return {}
@@ -325,12 +338,16 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
 
 
 def _trading_days_held(entry_date_str: str) -> int:
-    """Return number of US trading days since entry_date (excluding weekends, not calendar)."""
+    """Return US trading days since entry_date (excludes weekends AND market holidays).
+    Uses pandas BDay which skips non-business days including federal holidays.
+    """
     try:
-        import numpy as np
-        entry = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
-        today = datetime.now(_ET).date()
-        return int(np.busday_count(entry.isoformat(), today.isoformat()))
+        from pandas.tseries.offsets import BDay
+        import pandas as _pd
+        entry = _pd.Timestamp(entry_date_str)
+        today = _pd.Timestamp(datetime.now(_ET).date())
+        delta = today - entry
+        return max(0, int(delta / BDay(1)))
     except Exception:
         return 0
 
@@ -538,6 +555,42 @@ def check_positions() -> None:
     if not positions:
         return
 
+    # ── Pre-fetch 90-day OHLCV for all positions once per cycle ──────────────
+    # Without this, each position triggers 7+ individual yfinance calls per cycle:
+    # 8 positions × 7 calls × 4 cycles/hr = 224 calls/hr = 5,376/day.
+    # A single batch download + in-memory slice cuts this to ~32 calls/day.
+    _price_cache: dict = {}
+    try:
+        _batch_syms = [p["symbol"] for p in positions]
+        if _batch_syms:
+            _raw_batch = yf.download(
+                _batch_syms, period="90d", interval="1d",
+                auto_adjust=True, progress=False, group_by="ticker", threads=True
+            )
+            if len(_batch_syms) == 1:
+                if not _raw_batch.empty:
+                    _price_cache[_batch_syms[0]] = _raw_batch
+            elif not _raw_batch.empty:
+                for _bs in _batch_syms:
+                    try:
+                        _df_bs = _raw_batch[_bs].dropna(how="all")
+                        if not _df_bs.empty:
+                            _price_cache[_bs] = _df_bs
+                    except Exception:
+                        pass
+    except Exception as _e_batch:
+        _log.debug("[monitor] price batch pre-fetch failed: %s", _e_batch)
+
+    def _get_hist(sym: str):
+        """Return cached 90-day OHLCV, or fetch fresh if cache missed for this symbol."""
+        if sym in _price_cache:
+            return _price_cache[sym]
+        try:
+            return yf.Ticker(sym).history(period="90d", interval="1d", auto_adjust=True)
+        except Exception:
+            import pandas as _pd_miss
+            return _pd_miss.DataFrame()
+
     from config import MONITOR as cfg, RISK as _risk_cfg
     trail_pct         = cfg.get("trailing_stop_pct", 0.07)
     breakeven_trigger = cfg.get("breakeven_trigger", 0.08)
@@ -562,6 +615,38 @@ def check_positions() -> None:
         _log.debug("[%s] suppressed", __name__, exc_info=True)
     state = _load_state()
     changed = False
+
+    # Retroactively tighten stops when soft-DD activates: existing positions that
+    # already have stops placed at a wider trail need to be updated NOW, not only
+    # when their per-position logic next runs. Without this, a 7% trailing stop
+    # set 3 hours ago stays in place even though the portfolio is bleeding.
+    if _soft_dd_mode:
+        _dd_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        for _sdd_pos in positions:
+            _sdd_sym  = _sdd_pos["symbol"]
+            _sdd_sym_state = state.get(_sdd_sym, {})
+            if (_sdd_sym_state.get("trailing_stop_placed")
+                    and not _sdd_sym_state.get("stop_tightened_for_dd")
+                    and _sdd_sym_state.get("_dd_tighten_date") != _dd_today):
+                _sdd_qty  = int(float(_sdd_pos["qty"]))
+                _sdd_cost = float(_sdd_pos["avg_entry_price"])
+                _sdd_cur  = float(_sdd_pos["current_price"])
+                _sdd_pnl  = (_sdd_cur - _sdd_cost) / _sdd_cost if _sdd_cost > 0 else 0
+                if _sdd_pnl > 0:  # only tighten winning positions, don't move stops on losers
+                    _sdd_remaining = _sdd_qty - _sdd_sym_state.get("partial_qty", 0)
+                    if _sdd_remaining > 0:
+                        _cancel_stop_orders(_sdd_sym)
+                        _sdd_oid = _place_trailing_stop(_sdd_sym, _sdd_remaining, 0.05)
+                        if _sdd_oid:
+                            _sdd_sym_state["stop_order_id"]         = _sdd_oid
+                            _sdd_sym_state["stop_tightened_for_dd"] = True
+                            _sdd_sym_state["_dd_tighten_date"]      = _dd_today
+                            changed = True
+                            _log.info(
+                                "[monitor] %s SOFT-DD retroactive tighten: "
+                                "stop updated to 5%% trailing (pnl=+%.1f%%)",
+                                _sdd_sym, _sdd_pnl * 100
+                            )
 
     for pos in positions:
         symbol    = pos["symbol"]
@@ -593,7 +678,7 @@ def check_positions() -> None:
             _expected_qty = _recorded_qty + _pyramid_qty
             if _expected_qty > 0:
                 _qty_ratio = qty / _expected_qty
-                if _qty_ratio >= 1.8 or _qty_ratio <= 0.6:
+                if _qty_ratio >= 1.4 or _qty_ratio <= 0.65:  # catches 1.5× splits and 2:3 reverse
                     _split_factor = round(_qty_ratio)
                     sym["split_detected"] = True
                     sym["split_factor"]   = _qty_ratio
@@ -631,7 +716,7 @@ def check_positions() -> None:
         if not sym.get("_vol_checked"):
             sym["_vol_checked"] = True
             try:
-                _dfv = yf.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
+                _dfv = _get_hist(symbol)
                 if len(_dfv) >= 20:
                     _avg20_vol = float(_dfv["Volume"].tail(20).mean())
                     _today_vol = float(_dfv["Volume"].iloc[-1])
@@ -679,8 +764,7 @@ def check_positions() -> None:
             # ATR-dynamic trailing stop: 2×ATR(14) as trail %, clamped 4-12%.
             # Low-vol stocks get tighter stops; high-vol stocks get room to breathe.
             try:
-                _df_atr_m = yf.Ticker(symbol).history(
-                    period="30d", interval="1d", auto_adjust=True)
+                _df_atr_m = _get_hist(symbol)
                 if len(_df_atr_m) >= 15:
                     _hi_m = _df_atr_m["High"].values
                     _lo_m = _df_atr_m["Low"].values
@@ -718,8 +802,7 @@ def check_positions() -> None:
             # Breakout volume validation: if fill-day volume < 1.5x 60-day avg, tighten stop
             # Low-volume breakouts have 3x higher failure rate — Minervini hard rule
             try:
-                _bv_df = yf.Ticker(symbol).history(
-                    period="90d", interval="1d", auto_adjust=True)
+                _bv_df = _get_hist(symbol)
                 if len(_bv_df) >= 61:
                     _bv_avg   = float(_bv_df["Volume"].iloc[-61:-1].mean())
                     _bv_today = float(_bv_df["Volume"].iloc[-1])
@@ -858,8 +941,7 @@ def check_positions() -> None:
                 and pnl_pct > 0):
             sym["_gap_check_date"] = _gap_today
             try:
-                _dfg = yf.Ticker(symbol).history(
-                    period="5d", interval="1d", auto_adjust=True)
+                _dfg = _get_hist(symbol)
                 if len(_dfg) >= 2:
                     _prev_close = float(_dfg["Close"].iloc[-2])
                     _gap_pct    = (cur_price - _prev_close) / _prev_close if _prev_close > 0 else 0.0
@@ -1089,8 +1171,7 @@ def check_positions() -> None:
                 if sym.get("_pivot_trail_date") != _pt_today:
                     sym["_pivot_trail_date"] = _pt_today
                     try:
-                        _dfp = yf.Ticker(symbol).history(
-                            period="30d", interval="1d", auto_adjust=True)
+                        _dfp = _get_hist(symbol)
                         if len(_dfp) >= 5:
                             # Find most recent swing low in last 20 bars (skip last 2 incomplete)
                             _lows  = _dfp["Low"].values
@@ -1134,8 +1215,7 @@ def check_positions() -> None:
             if _ed_ma and _trading_days_held(_ed_ma) >= 10:
                 sym["_ma20_check_date"] = _ma20_today
                 try:
-                    _dfm = yf.Ticker(symbol).history(
-                        period="35d", interval="1d", auto_adjust=True)
+                    _dfm = _get_hist(symbol)
                     if len(_dfm) >= 20:
                         _ma20_val  = float(_dfm["Close"].rolling(20).mean().iloc[-1])
                         _ma20_stop = round(_ma20_val * 0.98, 2)
@@ -1223,9 +1303,10 @@ def check_positions() -> None:
                 _log.info("[monitor] ✓ %s PARTIAL-2 (33%%): sold %d sh @ $%.2f (+%.1f%%)"
                           " — runner with 5%% trailing",
                           symbol, sell_qty2, cur_price, pnl_pct * 100)
-                # Tighten trailing stop for the remaining ~34% runner
-                # Use tighter of ATR-derived trail or 5% fixed
-                runner_qty = initial_qty - sym["partial_qty"]
+                # Tighten trailing stop for the remaining runner.
+                # Use current Alpaca qty minus the just-placed B2 sell qty so pyramid
+                # shares (if any were added by Step P) are included in the runner count.
+                runner_qty = qty - sell_qty2
                 if runner_qty > 0:
                     _cancel_stop_orders(symbol)
                     _runner_trail = min(sym.get("atr_trail_pct", 0.05), 0.05)
@@ -1238,17 +1319,18 @@ def check_positions() -> None:
         # Conditions: partial1 already taken (position proved itself), gain 12–20%,
         # held at least 3 trading days, not yet pyramided, market is open.
         # Uses market order — pyramid shares are entered at current price.
+        # Strict pnl < partial2_trigger guard: belt-and-suspenders to prevent pyramid
+        # firing in the same cycle as B2 if partial2_done was somehow not yet written.
         if (sym.get("partial1_done")
                 and not sym.get("pyramid_done")
                 and not sym.get("partial2_done")
-                and 0.12 <= pnl_pct <= 0.20):
+                and 0.12 <= pnl_pct < partial2_trigger):
             _pyr_days = _trading_days_held(sym.get("entry_date", ""))
             if _pyr_days >= 3:
                 _pyr_qty = max(1, round(sym.get("initial_qty", qty) * 0.30))
                 _pyr_above_ma20 = False
                 try:
-                    _df_pyr = yf.Ticker(symbol).history(
-                        period="40d", interval="1d", auto_adjust=True)
+                    _df_pyr = _get_hist(symbol)
                     if len(_df_pyr) >= 20:
                         _ma20_pyr = float(_df_pyr["Close"].rolling(20).mean().iloc[-1])
                         _pyr_above_ma20 = cur_price > _ma20_pyr
@@ -1388,8 +1470,7 @@ def check_positions() -> None:
             if sym.get("_vc_check_date") != _vc_today:
                 sym["_vc_check_date"] = _vc_today
                 try:
-                    _dfvc = yf.Ticker(symbol).history(
-                        period="90d", interval="1d", auto_adjust=True)
+                    _dfvc = _get_hist(symbol)
                     if len(_dfvc) >= 50:
                         _vol_cur  = float(_dfvc["Volume"].iloc[-1])
                         _vol_avg  = float(_dfvc["Volume"].tail(51).iloc[:-1].mean())
@@ -1432,8 +1513,7 @@ def check_positions() -> None:
         if (sym.get("partial2_done")
                 and not sym.get("lhll_stopped")):
             try:
-                _dfll = yf.Ticker(symbol).history(
-                    period="15d", interval="1d", auto_adjust=True)
+                _dfll = _get_hist(symbol)
                 if len(_dfll) >= 4:
                     _hh = _dfll["High"].values
                     _ll = _dfll["Low"].values
@@ -1511,8 +1591,7 @@ def check_positions() -> None:
                 and sym.get("_rsd_date") != _rsd_today):
             sym["_rsd_date"] = _rsd_today
             try:
-                _df_rsd = yf.Ticker(symbol).history(
-                    period="60d", interval="1d", auto_adjust=True)
+                _df_rsd = _get_hist(symbol)
                 _spy_rsd = yf.Ticker("SPY").history(
                     period="60d", interval="1d", auto_adjust=True)["Close"]
                 if len(_df_rsd) >= 22 and len(_spy_rsd) >= 22:

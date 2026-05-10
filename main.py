@@ -1900,6 +1900,10 @@ def _run_daily_impl():
         _log.error("[main] %s", msg)
         _tg(f"❌ *Three Masters* — {msg}")
         report["errors"].append("scan_timeout")
+        # Clear partial results so the report doesn't mislead — only errors are kept
+        report["trend_passed"]  = []
+        report["vcp_passed"]    = []
+        report["orders_placed"] = []
         _save_report(report)
     finally:
         signal.alarm(0)
@@ -2817,6 +2821,18 @@ def _startup_healthcheck() -> bool:
         _log.info("[startup] ✓ Alpaca OK — equity=$%.2f  status=%s", equity, status)
         if status != "ACTIVE":
             warnings_hc.append(f"Alpaca account status is {status!r} (expected ACTIVE)")
+        # Live-account guard: default URL is paper-api, but env-var can override.
+        # A wrong URL would trade real money — hard-fail if "paper" is not in the URL.
+        _alpaca_url = _os_hc.environ.get("THREE_MASTERS_ALPACA_URL",
+                                          "https://paper-api.alpaca.markets")
+        if "paper" not in _alpaca_url.lower():
+            failures.append(
+                f"LIVE ACCOUNT GUARD: ALPACA_BASE_URL does not contain 'paper' — "
+                f"refusing to run against a live account ({_alpaca_url!r}). "
+                f"Set THREE_MASTERS_ALPACA_URL to a paper-trading URL to proceed."
+            )
+        else:
+            _log.info("[startup] ✓ Paper account confirmed — %s", _alpaca_url)
     except Exception as _e_alp:
         failures.append(f"Alpaca unreachable: {_e_alp}")
 
@@ -2886,8 +2902,38 @@ def _startup_healthcheck() -> bool:
     return True
 
 
+_PID_FILE = LOG_DIR / "main.pid"
+
+
+def _acquire_pidlock() -> None:
+    """Prevent two bot instances from running simultaneously.
+    Writes our PID to logs/main.pid; checks existing PID is not alive first.
+    Raises SystemExit if another instance is running.
+    """
+    import atexit
+    if _PID_FILE.exists():
+        try:
+            old_pid = int(_PID_FILE.read_text().strip())
+            # Send signal 0 to check if process is alive without killing it
+            os.kill(old_pid, 0)
+            # If we get here the old process is still running
+            _log.critical("[main] Another instance already running (PID %d) — aborting", old_pid)
+            sys.exit(1)
+        except (ValueError, ProcessLookupError):
+            # PID file stale (process gone) — safe to overwrite
+            pass
+        except PermissionError:
+            # Process exists but we can't signal it (different user) — abort to be safe
+            _log.critical("[main] PID file exists and process appears alive — aborting", )
+            sys.exit(1)
+    _PID_FILE.write_text(str(os.getpid()))
+    atexit.register(lambda: _PID_FILE.unlink(missing_ok=True))
+    _log.info("[main] PID lock acquired (PID=%d)", os.getpid())
+
+
 def main():
     _setup_logging()
+    _acquire_pidlock()
     _log.info("=" * 70)
     _log.info("  Three Masters Bot — Starting")
     _log.info("  Daily scan:      %02d:%02d CEST (after US close)",

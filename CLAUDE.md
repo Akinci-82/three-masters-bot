@@ -158,6 +158,24 @@ tail -20 logs/trade_journal.jsonl | python3 -m json.tool
 
 ## Ändringshistorik (senaste patches)
 
+### patch-20 — Strategi-korrekthet, säkerhet och prestanda (2026-05-10)
+
+**main.py**
+- `_acquire_pidlock()`: PID-fil `logs/main.pid` förhindrar att två instanser körs parallellt — `sys.exit(1)` om annan process lever. `atexit` städar filen.
+- Live-Alpaca-guard i `_startup_healthcheck()`: hårt fel om `ALPACA_BASE_URL` inte innehåller "paper" — förhindrar oavsiktlig handel med riktiga pengar
+- `ScanTimeout` cleanup: nollställer `trend_passed/vcp_passed/orders_placed` i rapporten vid timeout
+
+**position_monitor.py**
+- B2 `runner_qty`: ändrat `initial_qty - partial_qty` → `qty - sell_qty2` (inkluderar pyramid-aktier i stop-beräkning)
+- Pyramid+B2 guard: `pnl_pct <= 0.20` → `pnl_pct < partial2_trigger` (strict less-than, belt-and-suspenders mot att pyramid triggas i B2-zonen)
+- `_trading_days_held()`: ersatt `np.busday_count()` med pandas `BDay` — räknar nu US börsfritdagar korrekt (Thanksgiving, MLK Day etc.)
+- Batch OHLCV: `_price_cache` + `_get_hist()` closure i `check_positions()` — alla 10 per-symbol `yf.Ticker().history()` i loop ersatta, ~5 376 API-anrop/dag → ~32
+- `_load_state()`: schema-validering — loggar fel om state inte är dict, rensar malformade poster
+- Soft-DD retroaktiv stop-tightening: när portfolio är −2% intraday, uppdateras ALLA öppna positions trailing stops till 5% omedelbart (inte bara nästa anrop)
+- Stock split-threshold: `>= 1.8 or <= 0.6` → `>= 1.4 or <= 0.65` — fångar nu 1.5×-splits
+
+---
+
 ### patch-19 — Robusthet och dataintegritet (2026-05-10)
 
 **main.py**
