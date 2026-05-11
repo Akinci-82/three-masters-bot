@@ -20,6 +20,13 @@ ALPACA_BASE_URL   = os.environ.get("THREE_MASTERS_ALPACA_URL", "https://paper-ap
 
 # ── Claude AI (Minervini VCP layer) ─────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+FMP_API_KEY        = os.environ.get("FMP_API_KEY", "")
+ALPHA_VANTAGE_KEY   = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+MASSIVE_REST_KEY    = os.environ.get("MASSIVE_SECRET_ACCESS_KEY", "")
+MASSIVE_ACCESS_KEY_ID     = os.environ.get("MASSIVE_ACCESS_KEY_ID", "")
+MASSIVE_SECRET_ACCESS_KEY = os.environ.get("MASSIVE_SECRET_ACCESS_KEY", "")
+MASSIVE_S3_ENDPOINT       = os.environ.get("MASSIVE_S3_ENDPOINT", "https://files.massive.com")
+MASSIVE_BUCKET            = os.environ.get("MASSIVE_BUCKET", "flatfiles")
 CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
 CLAUDE_MODEL_DEEP  = "claude-sonnet-4-6"
 CLAUDE_MODEL_ULTRA = "claude-opus-4-7"
