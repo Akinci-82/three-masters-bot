@@ -2091,6 +2091,26 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         if _ad_divergence:
             _log.info("[tudor] A/D DIVERGENCE detected: SPY rising but breadth declining — −0.5 T-pts")
         report["trend_passed"] = [r.symbol for r in trend_passed]
+        # Store full trend candidate data for broker report radar section
+        report["trend_candidates"] = [
+            {
+                "symbol":          r.symbol,
+                "price":           round(r.price, 2),
+                "rs_rating":       round(r.rs_rating, 1),
+                "rs_delta_4w":     round(getattr(r, "rs_delta_4w", 0.0), 1),
+                "pct_from_high":   round(r.pct_from_high, 4),
+                "high_52w":        round(r.high_52w, 2),
+                "rs_line_high":    r.rs_line_at_high,
+                "rs_line_leading": getattr(r, "rs_line_leading", False),
+                "rs_trending":     getattr(r, "rs_trending", False),
+                "three_weeks_tight": getattr(r, "three_weeks_tight", False),
+                "eps_accelerating":  getattr(r, "eps_accelerating", False),
+                "weekly_stage2":   getattr(r, "weekly_stage2", False),
+                "last_candle":     r.last_candle,
+                "sector":          get_sector(r.symbol),
+            }
+            for r in trend_passed[:20]
+        ]
         _log.info("[simons] %d/%d passed Trend Template",
                   len(trend_passed), len(screen_results))
         _log.info("[simons] Top 10: %s", [r.symbol for r in trend_passed[:10]])
@@ -2128,11 +2148,24 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         return
 
     if not vcp_passed:
-        msg = f"{len(trend_passed)} in uptrend but 0 show VCP pattern today."
-        _log.info("[main] %s", msg)
-        _tg(f"📊 *Three Masters*\n{msg}")
-        report["summary"] = msg
+        _log.info("[main] %d in uptrend but 0 show VCP pattern today.", len(trend_passed))
+        # Populate regime/VIX/breadth so the broker report has full context
+        try:
+            _r, _sp, _sm, _spct = _check_market_regime()
+            report["regime"]      = _r
+            report["spy_price"]   = round(_sp, 2)
+            report["spy_pct"]     = round(_spct, 4)
+        except Exception:
+            report["regime"] = "unknown"
+        try:
+            report["vix"]         = round(_fetch_vix(), 1)
+        except Exception:
+            pass
+        report["breadth_pct"]  = round(_breadth_pct, 3)
+        report["vcp_candidates"] = []
+        report["summary"] = f"no_vcp_{len(trend_passed)}_trend"
         _save_report(report)
+        _send_daily_summary(report, len(trend_passed), 0, portfolio_value)
         return
 
     # ── Market regime filter ─────────────────────────────────────────────────
@@ -2856,14 +2889,22 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
     ]
     if not orders and not report.get("vcp_candidates"):
         _summary = report.get("summary", "")
-        _gate = (_summary
-                 .replace("macro_blackout_", "Makro-stopp: ")
-                 .replace("bear_regime_no_orders", "Björnmarknad — inga långa ordrar")
-                 .replace("breadth_gate_neutral_no_orders", "Breddgate: Neutral regim")
-                 .replace("breadth_gate_bear_no_orders", "Breddgate: Björnmarknad")
-                 .replace("earnings_cluster_", "Earnings-kluster: ").replace("_positions", " positioner"))
-        if _gate:
-            ov.append(f"\n⛔ {_gate}")
+        if _summary.startswith("no_vcp_"):
+            _n_trend = _summary.replace("no_vcp_", "").replace("_trend", "")
+            _cands = report.get("trend_candidates", [])
+            if _cands:
+                ov.append(f"\n📡 {_n_trend} aktier i Stage 2 uptrend — inget VCP-mönster ännu. Se radar nedan.")
+            else:
+                ov.append(f"\n⛔ {_n_trend} aktier i uptrend — inget VCP-mönster idag")
+        else:
+            _gate = (_summary
+                     .replace("macro_blackout_", "Makro-stopp: ")
+                     .replace("bear_regime_no_orders", "Björnmarknad — inga långa ordrar")
+                     .replace("breadth_gate_neutral_no_orders", "Breddgate: Neutral regim")
+                     .replace("breadth_gate_bear_no_orders", "Breddgate: Björnmarknad")
+                     .replace("earnings_cluster_", "Earnings-kluster: ").replace("_positions", " positioner"))
+            if _gate:
+                ov.append(f"\n⛔ {_gate}")
     _tg("\n".join(ov))
 
     # ── Meddelande per order: Detaljerat handelskort ─────────────────────────
@@ -2959,6 +3000,42 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
 
     if not orders:
         _tg("*Inga ordrar idag* — villkoren för att handla är inte uppfyllda.")
+
+    # ── Radar: Trend Template-kandidater utan VCP-mönster än ─────────────────
+    # Visas när inga VCP bekräftades idag. Dessa aktier är i Stage 2 uptrend
+    # och kan bilda VCP-mönster inom dagar/veckor. Bevaka dem.
+    _trend_cands = report.get("trend_candidates", [])
+    if _trend_cands and vcp_n == 0:
+        radar_lines = [
+            f"📡 *RADAR — {len(_trend_cands)} Stage 2 Aktier (ingen VCP idag)*",
+            f"Dessa aktier uppfyller Trend Template men har inget bekräftat VCP-mönster.",
+            f"Bevaka för möjlig entry när basen komprimerar.",
+            f"",
+        ]
+        for c in _trend_cands[:12]:
+            sym      = c["symbol"]
+            price    = c["price"]
+            rs       = c["rs_rating"]
+            rd       = c.get("rs_delta_4w", 0.0)
+            pfh      = abs(c.get("pct_from_high", 0)) * 100
+            h52      = c.get("high_52w", 0.0)
+            sect     = c.get("sector", "?")
+            sigs3    = []
+            if c.get("rs_line_high"):    sigs3.append("⭐RS-high")
+            if c.get("rs_line_leading"): sigs3.append("⭐RS-leading")
+            if c.get("three_weeks_tight"): sigs3.append("🔒3wt")
+            if c.get("eps_accelerating"):  sigs3.append("📈EPS-accel")
+            if rd > 5:                     sigs3.append(f"↗+{rd:.0f}p")
+            if c.get("weekly_stage2"):     sigs3.append("📊W-S2")
+            sig_str3 = "  " + " | ".join(sigs3) if sigs3 else ""
+            radar_lines.append(
+                f"🔹 *{sym}*  ${price:.2f}  RS {rs:.0f}"
+                + (f" ↗+{rd:.0f}p" if rd > 5 else "")
+                + f"  {pfh:.1f}% under 52v-high (${h52:.2f})"
+                + f"\n   {sect}"
+                + (f"\n{sig_str3}" if sig_str3 else "")
+            )
+        _tg("\n".join(radar_lines))
 
     # ── Watchlist: VCP-kandidater som avvisades av riskfiltren ───────────────
     _noise   = {"already held", "order retained", "price extended past breakout"}
