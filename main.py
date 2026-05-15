@@ -824,6 +824,227 @@ def _send_weekly_report(portfolio_value: float) -> None:
         _log.warning("[weekly] Report failed: %s", e)
 
 
+# ── Opus Sunday portfolio analysis ───────────────────────────────────────────
+_last_sunday_analysis_date: date | None = None
+
+
+def _run_sunday_opus_analysis() -> None:
+    """Opus analyzes full portfolio on Sundays — 3 concrete recommendations via Telegram."""
+    try:
+        import anthropic as _ant
+        from config import CLAUDE_MODEL_ULTRA, ANTHROPIC_API_KEY
+
+        ms_file = LOG_DIR / "monitor_state.json"
+        rs_file = LOG_DIR / "risk_state.json"
+        jf      = LOG_DIR / "trade_journal.jsonl"
+        bt_file = LOG_DIR / "weekly_backtest.json"
+
+        monitor_state = json.loads(ms_file.read_text()) if ms_file.exists() else {}
+        risk_state    = json.loads(rs_file.read_text())  if rs_file.exists() else {}
+
+        if not monitor_state:
+            _tg("🧠 *Opus Söndagsanalys*\nInga öppna positioner att analysera idag.")
+            return
+
+        # Recent 30-day trades
+        recent_trades: list[dict] = []
+        if jf.exists():
+            cutoff = (date.today() - timedelta(days=30)).isoformat()
+            for _jl in jf.read_text().splitlines():
+                try:
+                    _jt = json.loads(_jl)
+                    if _jt.get("ts", "")[:10] >= cutoff:
+                        recent_trades.append(_jt)
+                except Exception:
+                    pass
+
+        bt_summary = ""
+        if bt_file.exists():
+            try:
+                _bt = json.loads(bt_file.read_text())
+                bt_summary = (
+                    f"Backtest (1yr, run {_bt.get('run_date','?')}): "
+                    f"{_bt.get('total_trades',0)} trades, "
+                    f"WR={_bt.get('win_rate',0):.0%}, "
+                    f"E={_bt.get('expectancy',0):+.2f}R, "
+                    f"CAGR={_bt.get('cagr_pct',0):.1f}%"
+                )
+            except Exception:
+                pass
+
+        pos_lines = []
+        for sym, st in monitor_state.items():
+            avg    = st.get("avg_cost", 0)
+            shares = st.get("shares", st.get("qty", 0))
+            stop   = st.get("stop_loss", 0)
+            risk_p = (avg - stop) / avg * 100 if avg and stop else 0
+            days   = st.get("days_held", 0)
+            pnl    = st.get("unrealized_pnl_pct", 0) * 100 if st.get("unrealized_pnl_pct") else 0
+            steps  = [s.replace("_done", "").replace("step_", "") for s in
+                      ["step_f_done", "b1_done", "step_p_done", "b2_done", "step_f2_done"]
+                      if st.get(s)]
+            sect   = get_sector(sym)
+            pos_lines.append(
+                f"- {sym} ({sect}): {shares}st @ ${avg:.2f}, "
+                f"stop ${stop:.2f} ({risk_p:.1f}% risk), "
+                f"P&L ~{pnl:+.1f}%, {days}d hållen, "
+                f"steg: {'+'.join(steps) if steps else 'A (initial)'}"
+            )
+
+        heat   = risk_state.get("portfolio_heat", 0) * 100
+        regime = risk_state.get("confirmed_regime", "unknown")
+        cons_l = risk_state.get("consecutive_losses", 0)
+
+        trade_lines = "\n".join(
+            f"  {t.get('symbol','?')}: {t.get('r_multiple',0):+.2f}R "
+            f"({t.get('pnl_pct',0):+.1f}%) exit={t.get('exit_step','?')}"
+            for t in recent_trades[-10:]
+        ) or "  (inga avslutade trades)"
+
+        prompt = f"""Du är en senior portföljförvaltare med Minervini/Simons/Tudor Jones-metodik.
+Analysera portföljkvaliteten och ge EXAKT 3 konkreta rekommendationer numrerade 1–3.
+
+PORTFÖLJ ({len(monitor_state)} positioner | heat={heat:.1f}% | regim={regime} | cons.losses={cons_l}):
+{chr(10).join(pos_lines)}
+
+SENASTE 30D AVSLUTADE TRADES ({len(recent_trades)} st):
+{trade_lines}
+
+{bt_summary}
+
+Fokusera på:
+(1) Vilken/vilka positioner är starkast/svagast risk-reward just nu?
+(2) Finns sektorkoncen­tration eller korrelationsrisk?
+(3) Konkret exit-planering — vad bör göras DENNA vecka?
+
+Max 280 ord totalt. Svara på svenska. Var direkt och specifik — nämn symbolnamn."""
+
+        client   = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+        resp     = client.messages.create(
+            model=CLAUDE_MODEL_ULTRA,
+            max_tokens=450,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        analysis = resp.content[0].text.strip()
+        _tg(
+            f"🧠 *Opus Söndagsanalys — {date.today()}*\n"
+            f"_{len(monitor_state)} öppna positioner | heat {heat:.1f}% | {regime}_\n\n"
+            f"{analysis}"
+        )
+        _log.info("[opus_weekly] Portfolio analysis sent (%d in / %d out tokens)",
+                  resp.usage.input_tokens, resp.usage.output_tokens)
+    except Exception as e:
+        _log.warning("[opus_weekly] Analysis failed: %s", e)
+
+
+def _maybe_sunday_opus_analysis() -> None:
+    global _last_sunday_analysis_date
+    import pytz
+    now = datetime.now(pytz.timezone("Europe/Stockholm"))
+    if now.weekday() != 6:   # Only Sundays
+        return
+    if not (now.hour == 9 and 30 <= now.minute <= 44):   # 09:30 CEST = 07:30 UTC
+        return
+    today = now.date()
+    if _last_sunday_analysis_date == today:
+        return
+    _last_sunday_analysis_date = today
+    import threading
+    threading.Thread(target=_run_sunday_opus_analysis, daemon=True).start()
+
+
+# ── Haiku midday momentum check (13:00 ET = 19:00 CEST) ─────────────────────
+_last_midday_check_date: date | None = None
+
+
+def _run_midday_momentum_check() -> None:
+    """Haiku midday check (13:00 ET) — håll/stram stop per open position."""
+    try:
+        import anthropic as _ant
+        from config import CLAUDE_MODEL, ANTHROPIC_API_KEY
+        import pytz
+
+        ms_file = LOG_DIR / "monitor_state.json"
+        if not ms_file.exists():
+            return
+        monitor_state = json.loads(ms_file.read_text())
+        if not monitor_state:
+            return
+
+        client  = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=20.0)
+        results: list[str] = []
+
+        for sym, st in monitor_state.items():
+            try:
+                avg_cost = float(st.get("avg_cost", 0))
+                stop     = float(st.get("stop_loss", 0))
+                if not avg_cost:
+                    continue
+
+                # 5-min bars for today
+                df5 = yf.Ticker(sym).history(period="1d", interval="5m", auto_adjust=True)
+                if df5.empty:
+                    continue
+                curr_price  = float(df5["Close"].iloc[-1])
+                curr_vol    = int(df5["Volume"].iloc[-1])
+                avg_vol_5m  = max(int(df5["Volume"].mean()), 1)
+                vol_ratio   = curr_vol / avg_vol_5m
+
+                # Prior day for context
+                df1d        = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=True)
+                prev_high   = float(df1d["High"].iloc[-2]) if len(df1d) >= 2 else curr_price
+                prev_vol    = float(df1d["Volume"].iloc[-2]) if len(df1d) >= 2 else avg_vol_5m
+
+                pnl_p       = (curr_price - avg_cost) / avg_cost * 100
+                stop_dist_p = (curr_price - stop) / curr_price * 100 if stop else 0
+
+                prompt = (
+                    f"{sym}: pris ${curr_price:.2f} (entry ${avg_cost:.2f}, P&L {pnl_p:+.1f}%), "
+                    f"stop ${stop:.2f} ({stop_dist_p:.1f}% distans), "
+                    f"sista 5m vol {curr_vol:,} ({vol_ratio:.1f}x av dagssnitt), "
+                    f"gårdagens high ${prev_high:.2f}, gårdagens vol {int(prev_vol):,}. "
+                    f"Det är 13:00 ET mitt på handelsdagen. "
+                    f"Svara EXAKT med 'HÅLL' eller 'STRAM STOP' följt av EN mening varför. "
+                    f"Max 30 ord."
+                )
+
+                resp    = client.messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=80,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                verdict = resp.content[0].text.strip()
+                emoji   = "✅" if verdict.upper().startswith("HÅLL") else "⚠️"
+                results.append(
+                    f"{emoji} *{sym}* ${curr_price:.2f} ({pnl_p:+.1f}%): {verdict}"
+                )
+            except Exception as e:
+                _log.debug("[midday] %s check failed: %s", sym, e)
+
+        if not results:
+            return
+        msg = "🔍 *Haiku Middag-check (13:00 ET)*\n" + "\n\n".join(results)
+        _tg(msg)
+        _log.info("[midday] Momentum check sent for %d positions", len(results))
+    except Exception as e:
+        _log.warning("[midday] Momentum check failed: %s", e)
+
+
+def _maybe_midday_momentum_check() -> None:
+    global _last_midday_check_date
+    import pytz
+    now = datetime.now(pytz.timezone("Europe/Stockholm"))
+    if now.weekday() >= 5:   # skip weekends
+        return
+    if not (now.hour == 19 and 0 <= now.minute <= 8):   # 19:00 CEST = 13:00 ET
+        return
+    today = now.date()
+    if _last_midday_check_date == today:
+        return
+    _last_midday_check_date = today
+    import threading
+    threading.Thread(target=_run_midday_momentum_check, daemon=True).start()
+
 
 # ── Market regime filter ──────────────────────────────────────────────────────
 
@@ -3387,6 +3608,8 @@ def main():
             _heartbeat()
             _maybe_morning_briefing()
             _maybe_opening_range_check()
+            _maybe_midday_momentum_check()
+            _maybe_sunday_opus_analysis()
 
         if _SHUTDOWN:
             break
