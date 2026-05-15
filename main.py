@@ -802,22 +802,106 @@ def _send_weekly_report(portfolio_value: float) -> None:
                 lines.append(f"  Avg hold: {_avg_hold:.0f} trading days")
 
         # ── Last backtest results (written by Sunday cron job) ───────────────
+        _bt_wr_ref = None   # kept for live comparison below
         try:
             _bt_file = LOG_DIR / "weekly_backtest.json"
             if _bt_file.exists():
                 import json as _jbt
                 _bt = _jbt.loads(_bt_file.read_text())
-                _bt_date = _bt.get("run_date", "?")
-                _bt_n    = _bt.get("total_trades", 0)
-                _bt_wr   = _bt.get("win_rate", 0)
-                _bt_exp  = _bt.get("expectancy", 0)
-                _bt_cagr = _bt.get("cagr_pct", 0)
+                _bt_date  = _bt.get("run_date", "?")
+                _bt_stats = _bt.get("stats", _bt)   # support both {stats:{...}} and flat
+                _bt_n     = _bt_stats.get("total_trades", _bt.get("total_trades", 0))
+                _bt_wr    = _bt_stats.get("win_rate",     _bt.get("win_rate", 0))
+                _bt_exp   = _bt_stats.get("expectancy",   _bt.get("expectancy", 0))
+                _bt_cagr  = _bt_stats.get("cagr_pct",    _bt.get("cagr_pct", 0))
+                _bt_bkts  = _bt.get("score_buckets", {})
+                _bt_wr_ref = _bt_wr
                 lines.append("")
                 lines.append(f"*Backtest ({_bt_date}, 1yr):*")
                 lines.append(f"  {_bt_n} trades  WR={_bt_wr:.0%}  "
                               f"E={_bt_exp:+.2f}R  CAGR={_bt_cagr:.1f}%")
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
+
+        # ── Backtest vs live validation (overfitting check) ───────────────────
+        try:
+            _fb_file = LOG_DIR / "feedback_state.json"
+            _sa_file = LOG_DIR / "signal_accuracy.json"
+            if _fb_file.exists() and total_trades >= 5:
+                _fb = json.loads(_fb_file.read_text())
+                _live_wr  = _fb.get("win_rate", 0.0)
+                _live_exp = _fb.get("expectancy", 0.0)
+                _live_n   = _fb.get("total_trades", total_trades)
+                lines.append("")
+                lines.append(f"*Backtest vs Live ({_live_n} avslutade trades):*")
+
+                if _bt_wr_ref is not None:
+                    _wr_diff = _live_wr - _bt_wr_ref
+                    _abs_diff = abs(_wr_diff)
+                    _dir = "↓" if _wr_diff < 0 else "↑"
+                    if _abs_diff >= 0.20:
+                        lines.append(
+                            f"  ⚠️ AVVIKELSE {_dir}{_abs_diff:.0%}  "
+                            f"BT={_bt_wr_ref:.0%} vs Live={_live_wr:.0%}")
+                        lines.append(f"  Möjlig overfitting — granska signals!")
+                    elif _abs_diff >= 0.10:
+                        lines.append(
+                            f"  🔶 Avvikelse {_dir}{_abs_diff:.0%}  "
+                            f"BT={_bt_wr_ref:.0%} vs Live={_live_wr:.0%}")
+                    else:
+                        lines.append(
+                            f"  ✅ BT={_bt_wr_ref:.0%} vs Live={_live_wr:.0%}  "
+                            f"avvikelse {_abs_diff:.0%} — OK")
+                lines.append(f"  Live expectancy: {_live_exp:+.2f}R per trade")
+
+                # Score bucket alignment: live (5-6/6-7/7-8/8+) vs backtest (4-6/6-8/8-10)
+                _live_bkts = _fb.get("score_buckets", {})
+                _bt_bkts_local = _bt_bkts if _bt_wr_ref is not None else {}
+                _bkt_lines: list[str] = []
+                _live_map = {   # map live bucket to closest backtest bucket
+                    "5.0-6.0": "4-6",
+                    "6.0-7.0": "6-8",
+                    "7.0-8.0": "6-8",
+                    "8.0+":    "8-10",
+                }
+                for _lbkt, _ldata in _live_bkts.items():
+                    _ln = _ldata.get("count", 0)
+                    if _ln < 3:
+                        continue
+                    _lwr  = _ldata.get("win_rate", 0.0)
+                    _bt_bkt_key = _live_map.get(_lbkt, "")
+                    _bt_bkt_wr  = _bt_bkts_local.get(_bt_bkt_key, {}).get("win_rate")
+                    if _bt_bkt_wr is not None:
+                        _bdiff = _lwr - _bt_bkt_wr
+                        _flag  = "⚠️" if abs(_bdiff) >= 0.20 else "✅"
+                        _bkt_lines.append(
+                            f"  {_flag} Score {_lbkt}: live {_lwr:.0%} vs BT ~{_bt_bkt_wr:.0%}"
+                            + (f" ({_bdiff:+.0%})" if abs(_bdiff) >= 0.10 else ""))
+                    else:
+                        _bkt_lines.append(
+                            f"  Score {_lbkt}: live {_lwr:.0%}  ({_ln} trades)")
+                if _bkt_lines:
+                    lines.append("  *Score-bucket jämförelse:*")
+                    lines.extend(_bkt_lines)
+
+                # Flag underperforming signals from signal_accuracy.json
+                if _sa_file.exists():
+                    _sa = json.loads(_sa_file.read_text())
+                    _bad_signals = []
+                    for _sn, _sd in _sa.items():
+                        _sn_total = _sd.get("wins", 0) + _sd.get("losses", 0)
+                        if _sn_total < 5:
+                            continue
+                        _sn_wr = _sd.get("wins", 0) / _sn_total
+                        if _sn_wr < 0.35:
+                            _bad_signals.append(f"{_sn} ({_sn_wr:.0%} WR, {_sn_total})")
+                    if _bad_signals:
+                        lines.append(f"  ⚠️ Svaga signals (WR<35%, ≥5 trades):")
+                        for _bs in _bad_signals[:5]:
+                            lines.append(f"    — {_bs}")
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
+
         _tg("\n".join(lines))
         _log.info("[weekly] Weekly report sent")
     except Exception as e:
