@@ -168,6 +168,8 @@ class VCPResult:
     measured_move_pct: float = 0.0     # Claude estimate: full base height / entry price
     pattern_type: str  = "vcp"          # "vcp" | "cwh" | "both"
     catalyst_score: float = 0.0         # parsed from ai_reasoning: strong/weak catalyst signals
+    news_positive: bool = False          # Haiku news sentiment gate: positive headlines present
+    news_negative: bool = False          # Haiku news sentiment gate: negative headlines → raised min_conf
 
     @property
     def risk_reward(self) -> float:
@@ -813,6 +815,41 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             except Exception as _ce:
                 _log.debug("[vcp] cache deserialize error %s: %s", symbol, _ce)
 
+    # ── News sentiment pre-filter ────────────────────────────────────────────
+    # Haiku reads 3 recent headlines — negative news raises min_conf threshold,
+    # positive news is stored in result for broker report badge.
+    _news_conf_penalty = 0.0
+    _news_positive     = False
+    _news_negative     = False
+    try:
+        _headlines = _get_recent_news(symbol, 3)
+        if _headlines and "unavailable" not in _headlines.lower() and "No recent" not in _headlines:
+            _ns_prompt = (
+                f"Company ticker: {symbol}\nRecent news headlines:\n{_headlines}\n\n"
+                f"Rate the OVERALL sentiment of these headlines for a swing trader. "
+                f'Respond ONLY with JSON: {{"sentiment": "positive" or "neutral" or "negative", '
+                f'"reason": "<8 words>"}}'
+            )
+            _ns_resp = _get_client().messages.create(
+                model=_HAIKU_MODEL, max_tokens=60,
+                messages=[{"role": "user", "content": _ns_prompt}],
+            )
+            _ns_raw = _ns_resp.content[0].text.strip()
+            if _ns_raw.startswith("```"):
+                _ns_raw = _ns_raw.split("```")[1].lstrip("json").strip()
+            _ns = json.loads(_ns_raw)
+            _ns_sent = _ns.get("sentiment", "neutral")
+            if _ns_sent == "negative":
+                _news_conf_penalty = 0.10
+                _news_negative     = True
+                _log.info("[vcp] %s news NEGATIVE (%s) → min_conf +0.10",
+                          symbol, _ns.get("reason", "")[:50])
+            elif _ns_sent == "positive":
+                _news_positive = True
+                _log.info("[vcp] %s news POSITIVE (%s)", symbol, _ns.get("reason", "")[:50])
+    except Exception:
+        _log.debug("[vcp] %s news sentiment check suppressed", symbol, exc_info=True)
+
     # ── Tier 1: Haiku pre-screen ─────────────────────────────────────────────
     h_prompt = _build_haiku_prompt(symbol, df, quant, last_candle)
     h_data   = _call_haiku(symbol, h_prompt)
@@ -899,6 +936,11 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             _log.debug("[vcp] %s adaptive min_conf=%.2f (regime=%s)", symbol, min_conf, _regime)
     except Exception:
         pass
+    # News sentiment penalty: negative headlines raise effective threshold
+    min_conf = min(0.95, min_conf + _news_conf_penalty)
+    if _news_conf_penalty > 0:
+        _log.info("[vcp] %s effective min_conf=%.2f (news penalty +%.2f)",
+                  symbol, min_conf, _news_conf_penalty)
     min_quality = cfg.get("min_quality_score", 3)
 
     # Reject if Sonnet is not confident enough or quality is too low
@@ -979,6 +1021,8 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
         vol_at_multiweek_low=vol_multiweek,
         measured_move_pct=float(s_data.get("measured_move_pct", 0.0) or 0.0),
         pattern_type=str(s_data.get("pattern_type", "vcp") or "vcp"),
+        news_positive=_news_positive,
+        news_negative=_news_negative,
     )
 
     if passed:

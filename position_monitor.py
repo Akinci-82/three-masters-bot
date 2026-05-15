@@ -1047,6 +1047,68 @@ def check_positions() -> None:
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
 
+        # ── PM-Keltner: Dynamic Keltner Channel stop — ratchet up once per day ──────
+        # Stop climbs to EMA20 - 2×ATR14 (lower Keltner band) when that level is above
+        # the current stop. Gives more room in fast-moving trends, tightens in volatile dips.
+        # Guard: only fires once/day, only when keltner_low > current stop AND < 98.5% of price.
+        _kelt_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (not sym.get("max_loss_exited")
+                and not sym.get("time_stopped")
+                and sym.get("stop_loss", 0) > 0
+                and sym.get("_keltner_date") != _kelt_today
+                and pnl_pct > 0.0):
+            sym["_keltner_date"] = _kelt_today
+            try:
+                _kdf = _get_hist(symbol)
+                if len(_kdf) >= 22:
+                    _kclose  = _kdf["Close"].values
+                    _khigh   = _kdf["High"].values
+                    _klow    = _kdf["Low"].values
+                    # EMA20 of close
+                    _alpha   = 2.0 / (20 + 1)
+                    _ema20   = _kclose[-20]
+                    for _cv in _kclose[-19:]:
+                        _ema20 = _alpha * _cv + (1 - _alpha) * _ema20
+                    # ATR14
+                    _ktr = [max(_khigh[i] - _klow[i],
+                                abs(_khigh[i] - _kclose[i-1]),
+                                abs(_klow[i]  - _kclose[i-1]))
+                            for i in range(1, len(_kclose))]
+                    _katr14 = sum(_ktr[-14:]) / 14
+                    # Lower Keltner band = EMA20 - 2×ATR14
+                    _keltner_low = round(_ema20 - 2.0 * _katr14, 2)
+                    _old_ksl     = sym["stop_loss"]
+                    # Only ratchet UP — never lower the stop
+                    if (_keltner_low > _old_ksl
+                            and _keltner_low < cur_price * 0.985   # needs breathing room
+                            and _keltner_low > avg_cost * 0.90):   # at least near breakeven
+                        sym["stop_loss"]      = _keltner_low
+                        sym["keltner_raised"] = True
+                        changed               = True
+                        _log.info(
+                            "[monitor] %s Keltner stop ratchet: $%.2f → $%.2f "
+                            "(EMA20=%.2f ATR14=%.2f)",
+                            symbol, _old_ksl, _keltner_low, _ema20, _katr14)
+                        try:
+                            import requests as _rqkc, os as _oskc
+                            _tkc = _oskc.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _ckc = _oskc.getenv("TELEGRAM_CHAT_ID", "")
+                            if _tkc and _ckc:
+                                _rqkc.post(
+                                    f"https://api.telegram.org/bot{_tkc}/sendMessage",
+                                    json={"chat_id": _ckc, "parse_mode": "Markdown",
+                                          "text": (
+                                              f"📐 *Keltner Stop — {symbol}*\n"
+                                              f"Stop ratcheted ${_old_ksl:.2f} → ${_keltner_low:.2f}\n"
+                                              f"EMA20 ${_ema20:.2f} − 2×ATR14 ${_katr14:.2f}\n"
+                                              f"P&L {pnl_pct*100:+.1f}% | Price ${cur_price:.2f}"
+                                          )},
+                                    timeout=8)
+                        except Exception:
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+            except Exception:
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
+
         # ── PM8: Max loss per trade cap — hard 2R floor (Tudor Jones) ──────────────
         # GTC stops can be gapped through on bad news. This is the last-resort circuit breaker:
         # if loss exceeds 2× initial risk per share, close immediately regardless of stop status.

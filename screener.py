@@ -395,7 +395,9 @@ class TrendResult:
     weinstein_stage: int      = 2      # 1=base, 2=uptrend, 3=top, 4=downtrend (Weinstein)
     fail_reason: str          = ""
     pead_hold: bool           = False  # in 5-20d PEAD window with >=5% positive surprise
+    eps_surprise_pct: float   = 0.0   # most recent EPS surprise magnitude (e.g. 0.18 = 18%)
     options_liquid: bool      = True   # has liquid near-term options (OI >= 100)
+    unusual_options: bool     = False  # OTM call volume unusually high (>3× OI or >80% of calls)
     rs_delta_4w: float        = 0.0   # RS rating change vs 4 weeks ago (+ve = accelerating)
     df: pd.DataFrame          = field(default=None, repr=False)
 
@@ -1090,6 +1092,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         # ── PEAD: Post-Earnings Announcement Drift ─────────────────────────────
         # Uses data_provider for yfinance→FMP fallback
         _pead = False
+        _pead_surprise = 0.0
         try:
             from data_provider import get_latest_surprise as _get_surprise
             _rep_date, _surprise = _get_surprise(symbol)
@@ -1098,12 +1101,14 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 _today_n  = pd.Timestamp.now().normalize()
                 _days_since = int(np.busday_count(_rep_ts.date(), _today_n.date()))
                 if 5 <= _days_since <= 20:
-                    _pead = True
+                    _pead         = True
+                    _pead_surprise = _surprise
                     _log.info("[screen] %s PEAD window: %dd post-report, +%.1f%% surprise",
                               symbol, _days_since, _surprise * 100)
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
-        result.pead_hold = _pead
+        result.pead_hold        = _pead
+        result.eps_surprise_pct = round(_pead_surprise, 4)
 
         # ── Options liquidity filter ─────────────────────────────────────────
         # Uses data_provider for yfinance→FMP fallback
@@ -1120,6 +1125,34 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         if not _opts_ok:
             result.fail_reason = "options_illiquid"
             return result
+
+        # ── Options flow: unusual OTM call activity → institutional signal ──
+        try:
+            import yfinance as _yf_opts
+            _ot  = _yf_opts.Ticker(symbol)
+            _exp = _ot.options   # list of expiry dates, nearest first
+            if _exp:
+                _chain   = _ot.option_chain(_exp[0])
+                _calls   = _chain.calls
+                if not _calls.empty:
+                    _all_call_vol  = int(_calls["volume"].fillna(0).sum())
+                    # OTM = strike slightly above current price
+                    _otm_calls     = _calls[_calls["strike"] > price * 1.02]
+                    _otm_vol       = int(_otm_calls["volume"].fillna(0).sum())
+                    _otm_oi        = int(_otm_calls["openInterest"].fillna(0).sum())
+                    _unusual = False
+                    # Signal 1: OTM call vol > 3× OTM OI (fresh buying, not rolling) AND vol > 500
+                    if _otm_oi > 0 and _otm_vol > 3 * _otm_oi and _otm_vol > 500:
+                        _unusual = True
+                    # Signal 2: OTM calls dominate total (>80%) with meaningful volume (>1000)
+                    elif _all_call_vol > 1000 and _otm_vol > 0.80 * _all_call_vol:
+                        _unusual = True
+                    result.unusual_options = _unusual
+                    if _unusual:
+                        _log.info("[screen] %s UNUSUAL OPTIONS: OTM vol=%d OI=%d total=%d",
+                                  symbol, _otm_vol, _otm_oi, _all_call_vol)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
 
         result.passed = True
         return result

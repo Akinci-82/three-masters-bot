@@ -1556,14 +1556,21 @@ def _simons_score(trend) -> float:
     si_mo_pts = float(getattr(trend, "short_mo_pts", 0.0))
     # Analyst PT gap: consensus >25% above price = substantial institutional expected upside
     apt_pts = 0.25 if getattr(trend, "analyst_pt_upside", False) else 0.0
-    pead_pts = 0.5 if getattr(trend, "pead_hold", False) else 0.0  # PEAD: post-earnings drift bonus
+    # PEAD v2: magnitude-scaled bonus — >15% EPS surprise = double bonus, <5% = none
+    _pead_sup = getattr(trend, "eps_surprise_pct", 0.0) or 0.0
+    if getattr(trend, "pead_hold", False):
+        pead_pts = 1.0 if _pead_sup >= 0.15 else 0.5
+    else:
+        pead_pts = 0.0
+    # Options flow: unusual OTM call activity → institutional positioning (+0.5p)
+    opts_flow_pts = 0.5 if getattr(trend, "unusual_options", False) else 0.0
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts + rs_delta_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + bage_pts + vq_pts + ath_pts + ws2_pts + wba_pts
                + aug_pts + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
                + insider_pts + indleader_pts + rev_accel_pts
-               + twt2_pts + si_mo_pts + apt_pts + ws_pts + pead_pts, 10.0)
+               + twt2_pts + si_mo_pts + apt_pts + ws_pts + pead_pts + opts_flow_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -2411,6 +2418,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 "three_weeks_tight": getattr(r, "three_weeks_tight", False),
                 "eps_accelerating":  getattr(r, "eps_accelerating", False),
                 "weekly_stage2":   getattr(r, "weekly_stage2", False),
+                "unusual_options": getattr(r, "unusual_options", False),
+                "pead_hold":       getattr(r, "pead_hold", False),
+                "eps_surprise_pct": getattr(r, "eps_surprise_pct", 0.0),
                 "last_candle":     r.last_candle,
                 "sector":          get_sector(r.symbol),
             }
@@ -3109,6 +3119,10 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "c_breakeven":     round(vcp.breakout_level * 1.08, 2),
             "b1_exit":         round(vcp.breakout_level * (1 + _b1_trigger), 2),
             "b1_trigger_pct":  _b1_trigger,
+            "unusual_options": getattr(trend_r, "unusual_options", False) if trend_r else False,
+            "pead_hold":       getattr(trend_r, "pead_hold", False) if trend_r else False,
+            "eps_surprise_pct": getattr(trend_r, "eps_surprise_pct", 0.0) if trend_r else 0.0,
+            "news_positive":   getattr(vcp, "news_positive", False),
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
@@ -3124,7 +3138,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 "three_weeks_tight", "pocket_pivot", "insider_buying", "industry_leader",
                 "eps_revision_up", "accum_weeks_strong", "analyst_pt_upside",
                 "inst_ownership_increasing", "near_ath", "weekly_stage2",
-                "pead_hold",
+                "pead_hold", "unusual_options",
             ]
             _active = [s for s in _sig_names if getattr(trend_r, s, False)]
             for _sig in _active:
@@ -3255,6 +3269,13 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         eps_g = o.get("eps_growth")
         if eps_g is not None and eps_g >= 0.10:
             sigs.append(f"💰 EPS-tillväxt {eps_g*100:.0f}%")
+        if o.get("unusual_options"):
+            sigs.append("🐋 Ovanlig options-aktivitet (institutionell)")
+        if o.get("pead_hold"):
+            _sup = o.get("eps_surprise_pct", 0.0) or 0.0
+            sigs.append(f"📣 PEAD {'(>15% surprise)' if _sup >= 0.15 else '(+5% surprise)'}")
+        if o.get("news_positive"):
+            sigs.append("📰 Positiva nyheter")
         if not sigs:
             sigs.append("Standardsetup (alla grundfilter godkända)")
 
