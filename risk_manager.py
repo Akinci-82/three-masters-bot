@@ -56,12 +56,16 @@ def _save(data: dict):
         _tmp.replace(RISK_FILE)  # atomic on POSIX — prevents half-written state on crash
 
 
-def _kelly_factor() -> float:
+def _kelly_factor(composite_score: float = 0.0) -> float:
     """
     Half-Kelly fraction from trade journal win rate and average R.
     Full Kelly = W - (1-W)/R where W=win_rate, R=avg_win/avg_loss.
     Half-Kelly applied for safety; base clamped [0.5, 1.0]. Returns 1.0 if <10 trades.
     Additional loss-streak multiplier: 3 losses -> 0.65x, 5+ losses -> 0.40x.
+
+    When composite_score > 0, computes Kelly from the matching score bucket:
+      low (<6.5) / mid (6.5–7.5) / high (>=7.5).
+    Falls back to global Kelly if the bucket has fewer than 5 trades.
     """
     import json as _j
     from pathlib import Path as _P
@@ -80,15 +84,30 @@ def _kelly_factor() -> float:
                     trades.append(_j.loads(_ln))
                 except Exception:
                     pass
-            if len(trades) < 10:
+
+            # Segment trades by composite-score bucket when score is provided
+            _use_trades = trades
+            if composite_score > 0 and len(trades) >= 5:
+                if composite_score >= 7.5:
+                    _bucket = [t for t in trades if float(t.get("composite_score", 0) or 0) >= 7.5]
+                elif composite_score >= 6.5:
+                    _bucket = [t for t in trades if 6.5 <= float(t.get("composite_score", 0) or 0) < 7.5]
+                else:
+                    _bucket = [t for t in trades if float(t.get("composite_score", 0) or 0) < 6.5]
+                if len(_bucket) >= 5:
+                    _use_trades = _bucket
+                    _log.debug("[risk] Kelly bucket (cs=%.1f, n=%d bucket / %d total)",
+                               composite_score, len(_bucket), len(trades))
+
+            if len(_use_trades) < 10:
                 base_kelly = 1.0
             else:
-                wins   = [t["r_multiple"] for t in trades if t.get("r_multiple", 0) > 0]
-                losses = [abs(t["r_multiple"]) for t in trades if t.get("r_multiple", 0) < 0]
+                wins   = [t["r_multiple"] for t in _use_trades if t.get("r_multiple", 0) > 0]
+                losses = [abs(t["r_multiple"]) for t in _use_trades if t.get("r_multiple", 0) < 0]
                 if not wins or not losses:
                     base_kelly = 1.0
                 else:
-                    w     = len(wins) / len(trades)
+                    w     = len(wins) / len(_use_trades)
                     r     = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
                     kelly = w - (1 - w) / r
                     base_kelly = float(max(0.5, min(1.0, kelly / 2.0)))
@@ -128,7 +147,8 @@ def _stop_distance_factor(entry_price: float, stop_price: float) -> float:
 
 def position_size(portfolio_value: float, entry_price: float,
                   stop_loss: float, risk_pct: float | None = None,
-                  measured_move_pct: float = 0.0, symbol: str = "") -> dict:
+                  measured_move_pct: float = 0.0, symbol: str = "",
+                  composite_score: float = 0.0) -> dict:
     """
     Calculate Tudor Jones position size.
 
@@ -143,7 +163,7 @@ def position_size(portfolio_value: float, entry_price: float,
 
     risk_pct = min(risk_pct, RISK["max_risk_per_trade_pct"])
 
-    kelly  = _kelly_factor()
+    kelly  = _kelly_factor(composite_score)
     sdf    = _stop_distance_factor(entry_price, stop_loss)
     risk_amount = portfolio_value * risk_pct * kelly * sdf
     risk_per_share = entry_price - stop_loss

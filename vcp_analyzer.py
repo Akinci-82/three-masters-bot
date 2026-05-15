@@ -43,6 +43,7 @@ _TOKEN_LOG  = LOG_DIR / "token_usage.jsonl"
 _VCP_CACHE  = LOG_DIR / "vcp_cache.json"
 
 _VCP_CACHE_LOCK = threading.Lock()
+_spy_weekly_cache: dict = {}  # {"df": pd.DataFrame, "ts": float}
 
 
 def _load_vcp_cache() -> dict:
@@ -420,6 +421,96 @@ def _call_haiku(symbol: str, prompt: str) -> dict:
 
 # ── Tier 2: Sonnet full analysis ──────────────────────────────────────────────
 
+def _get_weekly_context(symbol: str, df: pd.DataFrame) -> str:
+    """
+    Build a concise weekly-chart summary appended to the Sonnet prompt.
+    Resamples the daily df already in memory to weekly bars.
+    SPY weekly is cached at module level with a 4-hour TTL.
+    Returns an empty string on any error (graceful degradation).
+    """
+    import time as _t
+    try:
+        weekly = df.resample("W-FRI").agg({
+            "Open": "first", "High": "max",
+            "Low": "min", "Close": "last", "Volume": "sum",
+        }).dropna()
+        if len(weekly) < 10:
+            return ""
+
+        _now = _t.time()
+        if "df" in _spy_weekly_cache and _now - _spy_weekly_cache.get("ts", 0) < 14400:
+            spy_wk = _spy_weekly_cache["df"]
+        else:
+            try:
+                spy_wk = yf.Ticker("SPY").history(period="6mo", interval="1wk", auto_adjust=True)
+                _spy_weekly_cache["df"] = spy_wk
+                _spy_weekly_cache["ts"] = _now
+            except Exception:
+                spy_wk = pd.DataFrame()
+
+        weekly["ma10w"] = weekly["Close"].rolling(10, min_periods=5).mean()
+        w20 = weekly.tail(20)
+        latest_close = float(w20["Close"].iloc[-1])
+        latest_ma10w = float(w20["ma10w"].iloc[-1]) if not pd.isna(w20["ma10w"].iloc[-1]) else 0.0
+        above_ma10w  = latest_close > latest_ma10w if latest_ma10w > 0 else None
+
+        ma10w_slope = 0.0
+        if len(w20) >= 4 and latest_ma10w > 0:
+            _ma4w = float(w20["ma10w"].iloc[-4])
+            if not pd.isna(_ma4w) and _ma4w > 0:
+                ma10w_slope = (latest_ma10w - _ma4w) / _ma4w * 100
+
+        rs_summary = ""
+        if not spy_wk.empty:
+            common = w20.index.intersection(spy_wk.index)
+            if len(common) >= 5:
+                rs_line = w20["Close"].loc[common] / spy_wk["Close"].loc[common]
+                rs_now  = float(rs_line.iloc[-1])
+                rs_high = float(rs_line.max())
+                pct_from_high = (rs_now - rs_high) / rs_high * 100 if rs_high > 0 else 0.0
+                at_high = pct_from_high >= -3.0
+                rs_summary = (
+                    f"Weekly RS line: {rs_now:.4f} | 20-wk RS high: {rs_high:.4f} | "
+                    + ("AT 20-WEEK HIGH ✓" if at_high else f"{pct_from_high:.1f}% below 20-wk high")
+                )
+
+        vol_avg10 = float(w20["Volume"].tail(10).mean()) if len(w20) >= 10 else 0
+        vol_last  = float(w20["Volume"].iloc[-1])
+        vol_note  = ""
+        if vol_avg10 > 0:
+            if vol_last < vol_avg10 * 0.60:
+                vol_note = "Weekly vol dry-up: last week <60% of 10-wk avg — institutions holding"
+            elif vol_last > vol_avg10 * 1.50:
+                vol_note = "Heavy weekly volume — potential distribution, verify"
+
+        rows = []
+        for _dt, _row in w20.tail(10).iterrows():
+            _ma = f"{_row['ma10w']:.2f}" if not pd.isna(_row["ma10w"]) else "n/a"
+            rows.append(
+                f"  {str(_dt)[:10]}  C={_row['Close']:.2f}  H={_row['High']:.2f}  "
+                f"L={_row['Low']:.2f}  V={int(_row['Volume']/1000)}K  MA10w={_ma}"
+            )
+
+        above_str = ("ABOVE MA10w" if above_ma10w else
+                     "BELOW MA10w" if above_ma10w is not None else "MA10w n/a")
+        lines = [
+            "\n\n## Weekly Context (last 10 of 20 weeks)",
+            f"Stage: {above_str} | MA10w slope (4w): {ma10w_slope:+.1f}%",
+        ]
+        if rs_summary:
+            lines.append(rs_summary)
+        if vol_note:
+            lines.append(vol_note)
+        lines.append("```")
+        lines.append("Week-end     Close   High    Low     Volume    MA10w")
+        lines.extend(rows)
+        lines.append("```")
+        return "\n".join(lines)
+    except Exception as _e:
+        _log.debug("[vcp] weekly context error %s: %s", symbol, _e)
+        return ""
+
+
 def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle: str, fundamentals: dict | None = None) -> str:
     """
     100-day OHLCV prompt with explicit step-by-step Minervini VCP analysis.
@@ -469,6 +560,7 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle
 
     news_headlines = _get_recent_news(symbol, n=4)
     news_ctx = f"\n\n## Recent News (catalyst check)\n{news_headlines}"
+    weekly_ctx = _get_weekly_context(symbol, df)
 
     n_handles = quant.get("n_handles", 1)
     handle_ctx = (
@@ -491,7 +583,7 @@ Date        High    Low     Close   Volume
 - MA50=${ma50:.2f} | MA200=${ma200:.2f} | Current=${float(close.iloc[-1]):.2f}
 - Quant segment ranges (oldest→newest): {seg_str}
 - Depth from pattern high: {quant.get('pattern_depth_pct',0):.1%}
-- Handle range (last 10 bars): {quant.get('tight_rng_pct',0):.1%}{handle_ctx}{vol_ctx}{candle_ctx}{news_ctx}
+- Handle range (last 10 bars): {quant.get('tight_rng_pct',0):.1%}{handle_ctx}{vol_ctx}{candle_ctx}{news_ctx}{weekly_ctx}
 
 ## Analysis Protocol — follow each step:
 
@@ -795,7 +887,18 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
                   symbol, _n_hdl, quality)
     elif _n_hdl == 2 and quality < 5:
         quality = min(5, quality + 0)  # two-handle: no boost but already factored in prompt
-    min_conf    = cfg.get("min_confidence", 0.65)
+    # Adaptive min_confidence: tighten in bear regime, loosen in bull
+    _REGIME_CONF = {"bull": 0.60, "neutral": 0.65, "bear": 0.75}
+    min_conf = cfg.get("min_confidence", 0.65)
+    try:
+        _rs_path = LOG_DIR / "risk_state.json"
+        if _rs_path.exists():
+            _rs_json = json.loads(_rs_path.read_text())
+            _regime  = _rs_json.get("confirmed_regime", "neutral")
+            min_conf = _REGIME_CONF.get(_regime, min_conf)
+            _log.debug("[vcp] %s adaptive min_conf=%.2f (regime=%s)", symbol, min_conf, _regime)
+    except Exception:
+        pass
     min_quality = cfg.get("min_quality_score", 3)
 
     # Reject if Sonnet is not confident enough or quality is too low

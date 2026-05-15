@@ -106,12 +106,33 @@ def _quant_vcp_score(df: pd.DataFrame) -> tuple[bool, float, float, float]:
         return False, 0.0, 0.0, 0.0
 
 
+def _weekly_close_under_ma10w(df_fwd: pd.DataFrame, day_idx: int) -> bool:
+    """True if the most recently completed weekly bar closed below its 10-week MA.
+    Resamples daily bars to weekly to mirror position_monitor Step W logic.
+    """
+    try:
+        hist_slice = df_fwd.iloc[: day_idx + 1]
+        if len(hist_slice) < 15:   # need at least ~3 weeks to form a meaningful MA
+            return False
+        weekly = hist_slice["Close"].resample("W-FRI").last().dropna()
+        if len(weekly) < 12:
+            return False
+        last_completed = float(weekly.iloc[-2])   # -1 may be in-progress week
+        ma10w = float(weekly.iloc[-11:-1].mean())
+        return last_completed < ma10w
+    except Exception:
+        return False
+
+
 def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
     """
     Simulate one trade with actual bot exit rules:
       - 7% trailing stop, breakeven at +8%
-      - Sell 33% at +10%, 33% at +20%
+      - Early pyramid (F): add 25% at +4% if first 5 days (simple proxy for RS check)
+      - Sell 33% at +10% (B1), 33% at +20% (B2)
+      - Pyramid (P): add 30% at +12-20% after B1
       - Tighten trailing to 5% after first partial
+      - Step W: exit if weekly close falls under MA10w
       - Time stop: 15 days and <2% gain
     Returns dict with outcome details.
     """
@@ -120,9 +141,20 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
     partial1_done = False
     partial2_done = False
     breakeven_set = False
+    pyramid_done  = False
+    step_f_done   = False
     shares        = 1.0          # normalised to 1 share
     proceeds      = 0.0
     trail_pct     = INITIAL_STOP_PCT
+    exit_step     = "stop"
+
+    # Resample to weekly for Step W check (done once, not per-bar)
+    _weekly_dates = set()
+    try:
+        _wk = df_fwd["Close"].resample("W-FRI").last().dropna()
+        _weekly_dates = set(_wk.index.normalize())
+    except Exception:
+        pass
 
     for i, (ts, row) in enumerate(df_fwd.iterrows()):
         lo  = float(row["Low"])
@@ -141,20 +173,45 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
             stop_trail = max(stop_trail, entry_price)
             breakeven_set = True
 
-        # Partial exit 1: sell 33% at +10%
-        if not partial1_done and hi >= entry_price * (1 + PARTIAL1_AT):
-            exit1 = entry_price * (1 + PARTIAL1_AT)
-            proceeds    += 0.33 * exit1
-            shares      -= 0.33
-            trail_pct    = TRAIL_TIGHT_PCT
-            partial1_done = True
+        # Step F: early pyramid +25% at +4% (simple proxy: no RS check in backtest)
+        pnl_now = (cls - entry_price) / entry_price
+        if not step_f_done and not partial1_done and 0.04 <= pnl_now < 0.10:
+            shares       += 0.25
+            step_f_done   = True
 
-        # Partial exit 2: sell 33% at +20%
+        # Partial exit 1 (B1): sell 33% at +10%
+        if not partial1_done and hi >= entry_price * (1 + PARTIAL1_AT):
+            exit1          = entry_price * (1 + PARTIAL1_AT)
+            sell_qty       = shares * 0.33 / shares   # normalised: always 1/3 of current
+            proceeds      += shares * 0.33 * exit1
+            shares        -= shares * 0.33
+            trail_pct      = TRAIL_TIGHT_PCT
+            partial1_done  = True
+
+        # Pyramid (P): add 30% of original qty between +12-20% after B1
+        if (partial1_done and not pyramid_done and not partial2_done
+                and entry_price * 1.12 <= cls <= entry_price * 1.20):
+            shares       += 0.30
+            pyramid_done  = True
+
+        # Partial exit 2 (B2): sell 33% at +20%
         if partial1_done and not partial2_done and hi >= entry_price * (1 + PARTIAL2_AT):
-            exit2 = entry_price * (1 + PARTIAL2_AT)
-            proceeds    += 0.33 * exit2
-            shares      -= 0.33
-            partial2_done = True
+            exit2          = entry_price * (1 + PARTIAL2_AT)
+            proceeds      += shares * 0.33 * exit2
+            shares        -= shares * 0.33
+            partial2_done  = True
+
+        # Step W: weekly close under MA10w — check on each Monday (start of new week)
+        _ts_norm = pd.Timestamp(ts).normalize()
+        if (_ts_norm.weekday() == 0       # Monday = start of new completed week
+                and not partial2_done
+                and _weekly_close_under_ma10w(df_fwd, i)):
+            proceeds  += shares * cls
+            total_pnl  = (proceeds - entry_price) / entry_price
+            return {"exit": str(ts.date()), "exit_price": cls,
+                    "pnl_pct": round(total_pnl, 4), "days": i + 1,
+                    "reason": "W_weekly_close",
+                    "partials": int(partial1_done) + int(partial2_done)}
 
         # Stop hit
         if lo <= stop_trail:
@@ -162,17 +219,19 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
             total_pnl = (proceeds - entry_price) / entry_price
             return {"exit": str(ts.date()), "exit_price": stop_trail,
                     "pnl_pct": round(total_pnl, 4), "days": i + 1,
-                    "reason": "stop", "partials": int(partial1_done) + int(partial2_done)}
+                    "reason": "stop",
+                    "partials": int(partial1_done) + int(partial2_done)}
 
         # Time stop: ≥15 days and gain < 2%
-        if i + 1 >= TIME_STOP_DAYS:
+        if i + 1 >= TIME_STOP_DAYS and not partial1_done:
             paper_gain = (cls - entry_price) / entry_price
             if paper_gain < TIME_STOP_MIN_GAIN:
                 proceeds += shares * cls
                 total_pnl = (proceeds - entry_price) / entry_price
                 return {"exit": str(ts.date()), "exit_price": cls,
                         "pnl_pct": round(total_pnl, 4), "days": i + 1,
-                        "reason": "time_stop", "partials": int(partial1_done) + int(partial2_done)}
+                        "reason": "time_stop",
+                        "partials": int(partial1_done) + int(partial2_done)}
 
     # End of data — close at last close
     final = float(df_fwd["Close"].iloc[-1]) if len(df_fwd) > 0 else entry_price
@@ -180,7 +239,8 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
     total_pnl = (proceeds - entry_price) / entry_price
     return {"exit": str(df_fwd.index[-1].date()), "exit_price": final,
             "pnl_pct": round(total_pnl, 4), "days": len(df_fwd),
-            "reason": "data_end", "partials": int(partial1_done) + int(partial2_done)}
+            "reason": "data_end",
+            "partials": int(partial1_done) + int(partial2_done)}
 
 
 def run_backtest(symbols: list[str], start: str, end: str,

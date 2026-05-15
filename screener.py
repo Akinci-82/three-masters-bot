@@ -394,6 +394,9 @@ class TrendResult:
     analyst_pt_upside: bool   = False  # analyst consensus PT > current price × 1.25
     weinstein_stage: int      = 2      # 1=base, 2=uptrend, 3=top, 4=downtrend (Weinstein)
     fail_reason: str          = ""
+    pead_hold: bool           = False  # in 5-20d PEAD window with >=5% positive surprise
+    options_liquid: bool      = True   # has liquid near-term options (OI >= 100)
+    rs_delta_4w: float        = 0.0   # RS rating change vs 4 weeks ago (+ve = accelerating)
     df: pd.DataFrame          = field(default=None, repr=False)
 
     def summary(self) -> str:
@@ -527,6 +530,16 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         rs  = _rs_rating(close, spy_close)
         rsi = _calc_rsi(close, cfg.get("rsi_period", 14))
 
+        # RS momentum delta: compare current RS rating vs 4 weeks ago
+        # Rising delta = acceleration = institutional buying building up
+        _rs_delta_4w = 0.0
+        try:
+            if len(close) > 25 and len(spy_close) > 25:
+                _rs_4w_ago = _rs_rating(close.iloc[:-20], spy_close.iloc[:-20])
+                _rs_delta_4w = round(rs - _rs_4w_ago, 1)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
+
         # Accumulation/Distribution ratio: up-vol vs down-vol last 50 bars
         _n_ad = min(50, len(df))
         _df50 = df.tail(_n_ad)
@@ -559,6 +572,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             ad_ratio=ad_ratio,
             passed=False, df=df,
         )
+        result.rs_delta_4w = _rs_delta_4w
 
         # ── Filter chain ─────────────────────────────────────────────────────
 
@@ -1072,6 +1086,40 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             _log.debug("[screen] %s Weinstein Stage %d", symbol, result.weinstein_stage)
         except Exception:
             result.weinstein_stage = 2
+
+        # ── PEAD: Post-Earnings Announcement Drift ─────────────────────────────
+        # Uses data_provider for yfinance→FMP fallback
+        _pead = False
+        try:
+            from data_provider import get_latest_surprise as _get_surprise
+            _rep_date, _surprise = _get_surprise(symbol)
+            if _rep_date and _surprise >= 0.05:
+                _rep_ts   = pd.Timestamp(_rep_date).tz_localize(None)
+                _today_n  = pd.Timestamp.now().normalize()
+                _days_since = int(np.busday_count(_rep_ts.date(), _today_n.date()))
+                if 5 <= _days_since <= 20:
+                    _pead = True
+                    _log.info("[screen] %s PEAD window: %dd post-report, +%.1f%% surprise",
+                              symbol, _days_since, _surprise * 100)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
+        result.pead_hold = _pead
+
+        # ── Options liquidity filter ─────────────────────────────────────────
+        # Uses data_provider for yfinance→FMP fallback
+        _opts_ok = True
+        try:
+            from data_provider import get_atm_options_oi as _get_oi
+            _oi = _get_oi(symbol, price)
+            if _oi is not None and _oi < 100:
+                _opts_ok = False
+                _log.debug("[screen] %s options OI=%d < 100 — illiquid", symbol, _oi)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
+        result.options_liquid = _opts_ok
+        if not _opts_ok:
+            result.fail_reason = "options_illiquid"
+            return result
 
         result.passed = True
         return result

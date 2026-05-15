@@ -473,6 +473,16 @@ def create_app():
     .sig-n    { color:var(--muted);font-size:10px; }
     .sig-empty{ padding:20px;text-align:center;color:var(--muted);font-size:13px; }
 
+    /* ── Risk state panel ───────────────────────────────────────────── */
+    .risk-grid  { display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;padding:16px 20px; }
+    .risk-tile  { background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 14px; }
+    .risk-tile-lbl { font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:0.7px;color:var(--muted);margin-bottom:6px; }
+    .risk-tile-val { font-size:18px;font-weight:700;letter-spacing:-0.3px; }
+    .risk-tile-bar { margin-top:7px; }
+    .risk-bar-track { height:4px;border-radius:2px;background:var(--border);overflow:hidden;margin-top:4px; }
+    .risk-bar-fill  { height:100%;border-radius:2px;transition:width 0.4s; }
+    .risk-tile-sub  { font-size:11px;color:var(--muted);margin-top:4px; }
+
     /* ── Stop price cell ────────────────────────────────────────────── */
     .stop-raised { font-size:10px;color:var(--green);margin-left:4px; }
 
@@ -535,6 +545,15 @@ def create_app():
       <div class="stat-value" id="s-breadth">—</div>
       <div class="stat-sub" id="s-breadth-sub">% above MA50</div>
     </div>
+  </div>
+
+  <!-- ── Risk State Panel ─────────────────────────────────────────────── -->
+  <div class="table-card" style="margin-bottom:16px">
+    <div class="table-header">
+      <h2>Risk State — Tudor Jones Circuit Breakers</h2>
+      <span id="risk-halt-badge"></span>
+    </div>
+    <div class="risk-grid" id="risk-state-grid"></div>
   </div>
 
   <!-- ── Position Calculator ─────────────────────────────────────────── -->
@@ -990,11 +1009,77 @@ def create_app():
           : `<span class="badge badge-green"><span class="badge-dot"></span>Active</span>`;
         document.getElementById('s-losses').textContent = `Consec. losses: ${d.losses}`;
 
-        // Regime badge
-        const regime = d.regime || 'bull';
+        // Regime badge (prefer confirmed_regime from bot's 2-scan hysteresis)
+        const regime = d.confirmed_regime || d.regime || 'bull';
         const regimeCls = regime === 'bear' ? 'regime-bear' : regime === 'neutral' ? 'regime-neutral' : 'regime-bull';
         const regimeIcon = regime === 'bear' ? '🐻' : regime === 'neutral' ? '⚡' : '🐂';
         document.getElementById('regime-badge').innerHTML = `<span class="${regimeCls}">${regimeIcon} ${regime.toUpperCase()}</span>`;
+
+        // Risk State Panel
+        (function() {
+          const heat     = d.heat_pct   || 0;
+          const dayPnl   = d.day_pnl    || 0;
+          const losses   = d.losses     || 0;
+          const dd       = Math.abs(d.drawdown_pct || 0);
+          const halted   = d.halted;
+          const haltRsn  = d.halt_reason || '';
+
+          function riskBar(val, limit, invert) {
+            const pct = Math.min(100, Math.abs(val / limit) * 100);
+            const c   = pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : 'var(--green)';
+            return `<div class="risk-bar-track"><div class="risk-bar-fill" style="width:${pct.toFixed(0)}%;background:${c}"></div></div>`;
+          }
+
+          let kellyLabel = '<span style="color:var(--green)">Normal (1.0×)</span>';
+          if (losses >= 5)      kellyLabel = '<span style="color:var(--red)">Severe (0.40×)</span>';
+          else if (losses >= 3) kellyLabel = '<span style="color:var(--yellow)">Reduced (0.65×)</span>';
+
+          const pnlColor = dayPnl < -2 ? 'var(--red)' : dayPnl < 0 ? 'var(--yellow)' : 'var(--green)';
+          const ddColor  = dd > 8 ? 'var(--red)' : dd > 4 ? 'var(--yellow)' : 'var(--green)';
+          const heatColor= heat > 6 ? 'var(--red)' : heat > 4 ? 'var(--yellow)' : 'var(--green)';
+
+          document.getElementById('risk-halt-badge').innerHTML = halted
+            ? `<span class="badge badge-red">⛔ HALTED — ${haltRsn}</span>`
+            : '';
+
+          document.getElementById('risk-state-grid').innerHTML = `
+            <div class="risk-tile">
+              <div class="risk-tile-lbl">Market Regime (confirmed)</div>
+              <div class="risk-tile-val"><span class="${regimeCls}">${regimeIcon} ${regime.toUpperCase()}</span></div>
+              <div class="risk-tile-sub">2-scan hysteresis</div>
+            </div>
+            <div class="risk-tile">
+              <div class="risk-tile-lbl">Portfolio Heat</div>
+              <div class="risk-tile-val" style="color:${heatColor}">${heat.toFixed(1)}%</div>
+              <div class="risk-tile-bar">${riskBar(heat, 8)}</div>
+              <div class="risk-tile-sub">Limit: 8% — ${(8-heat).toFixed(1)}% headroom</div>
+            </div>
+            <div class="risk-tile">
+              <div class="risk-tile-lbl">Day P&amp;L</div>
+              <div class="risk-tile-val" style="color:${pnlColor}">${dayPnl>=0?'+':''}${dayPnl.toFixed(2)}%</div>
+              <div class="risk-tile-bar">${riskBar(Math.abs(dayPnl), 4)}</div>
+              <div class="risk-tile-sub">Circuit breaker: −4%</div>
+            </div>
+            <div class="risk-tile">
+              <div class="risk-tile-lbl">Drawdown from ATH</div>
+              <div class="risk-tile-val" style="color:${ddColor}">−${dd.toFixed(1)}%</div>
+              <div class="risk-tile-bar">${riskBar(dd, 12)}</div>
+              <div class="risk-tile-sub">Halt trigger: −12%</div>
+            </div>
+            <div class="risk-tile">
+              <div class="risk-tile-lbl">Consecutive Losses</div>
+              <div class="risk-tile-val" style="color:${losses>=3?'var(--red)':losses>=1?'var(--yellow)':'var(--green)'}">${losses}</div>
+              <div class="risk-tile-bar">${riskBar(losses, 5)}</div>
+              <div class="risk-tile-sub">Kelly: ${kellyLabel}</div>
+            </div>
+            <div class="risk-tile">
+              <div class="risk-tile-lbl">Trading Status</div>
+              <div class="risk-tile-val">${halted?'<span class="badge badge-red">HALTED</span>':'<span class="badge badge-green">ACTIVE</span>'}</div>
+              <div class="risk-tile-sub">${halted?haltRsn:'All circuit breakers clear'}</div>
+            </div>
+          `;
+        })();
+
 
         // Market breadth
         const bEl = document.getElementById('s-breadth');
@@ -1465,6 +1550,8 @@ def _build_state() -> dict:
         "regime":           regime,
         "market_breadth":   market_breadth,
         "signal_accuracy":  signal_accuracy,
+        "confirmed_regime": risk.get("confirmed_regime", regime),
+        "kelly_factor":     round(float(risk.get("open_risk_pct", 0)), 4),  # hint for panel
     }
 
 

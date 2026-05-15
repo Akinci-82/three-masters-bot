@@ -100,19 +100,59 @@ def _cmd_orders() -> str:
 def _cmd_positions() -> str:
     try:
         from broker import get_positions
+        import json as _j, os as _o
         positions = get_positions()
         if not positions:
             return "No open positions."
+
+        # Load monitor state for per-position step info
+        _state_path = _o.path.join(_o.path.dirname(__file__), "logs", "monitor_state.json")
+        _mon_state: dict = {}
+        try:
+            if _o.path.exists(_state_path):
+                _mon_state = _j.loads(open(_state_path).read())
+        except Exception:
+            pass
+
         lines = [f"📈 *Open positions ({len(positions)}):*"]
         for p in positions:
-            sym      = _tg_escape(p["symbol"])
+            sym      = p["symbol"]
             qty      = int(float(p["qty"]))
             avg      = float(p["avg_entry_price"])
             cur      = float(p["current_price"])
             pnl_pct  = (cur - avg) / avg * 100
             pnl_usd  = (cur - avg) * qty
             tag      = "📈" if pnl_pct >= 0 else "📉"
-            lines.append(f"  {tag} *{sym}* {qty}sh  ${cur:.2f}  ({pnl_pct:+.1f}%  ${pnl_usd:+.0f})")
+
+            # Step status from monitor state
+            ms = _mon_state.get(sym, {})
+            _steps = []
+            if ms.get("step_f_done"):   _steps.append("F✓")
+            if ms.get("partial1_done"): _steps.append("B1✓")
+            if ms.get("pyramid_done"):  _steps.append("P✓")
+            if ms.get("step_f2_done"):  _steps.append("F2✓")
+            if ms.get("partial2_done"): _steps.append("B2✓")
+            step_str = " ".join(_steps) if _steps else "–"
+
+            # Stop level
+            _sl = ms.get("stop_loss", 0.0)
+            _sl_str = f"SL${_sl:.2f}" if _sl > 0 else "SL:?"
+            # Days held
+            _ed = ms.get("entry_date", "")
+            _days = ""
+            if _ed:
+                try:
+                    from pandas.tseries.offsets import BDay
+                    import pandas as _pd
+                    _days = f" d{int((_pd.Timestamp.today() - _pd.Timestamp(_ed)) / BDay(1))}"
+                except Exception:
+                    pass
+
+            lines.append(
+                f"  {tag} *{_tg_escape(sym)}* {qty}sh  ${cur:.2f}  "
+                f"({pnl_pct:+.1f}%  ${pnl_usd:+.0f}){_days}\n"
+                f"      {_sl_str}  steps: {step_str}"
+            )
         return "\n".join(lines)
     except Exception as e:
         return f"Error fetching positions: {e}"

@@ -312,11 +312,16 @@ def _send_morning_briefing() -> None:
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Pre-open gap alerts for held positions ─────────────────────────────
+        # Gap >5% down: CRITICAL alert (tighten stop at open).
+        # Gap >10% down: submit market sell at open to limit catastrophic loss.
         if positions:
             try:
                 _pre_alerts = []
+                _critical_gaps = []
                 for _pg_p in positions:
-                    _pg_sym = _pg_p["symbol"]
+                    _pg_sym  = _pg_p["symbol"]
+                    _pg_qty  = int(float(_pg_p["qty"]))
+                    _pg_avg  = float(_pg_p["avg_entry_price"])
                     try:
                         _fi = yf.Ticker(_pg_sym).fast_info
                         _pre_p  = getattr(_fi, "last_price", None) or getattr(_fi, "regularMarketPrice", None)
@@ -325,13 +330,36 @@ def _send_morning_briefing() -> None:
                             _gap = (_pre_p - _prev_c) / _prev_c
                             if abs(_gap) >= 0.03:
                                 _dir = "▲" if _gap > 0 else "▼"
+                                _label = ""
+                                if _gap <= -0.10:
+                                    _label = " 🚨 EXTREME"
+                                    _critical_gaps.append((_pg_sym, _pg_qty, _pre_p, _gap))
+                                elif _gap <= -0.05:
+                                    _label = " ⚠️ CRITICAL"
                                 _pre_alerts.append(
-                                    f"  {_dir} *{_pg_sym}* pre-market ${_pre_p:.2f} ({_gap*100:+.1f}% vs prev close)")
+                                    f"  {_dir} *{_pg_sym}* pre-market ${_pre_p:.2f} "
+                                    f"({_gap*100:+.1f}% vs prev close){_label}")
                     except Exception:
                         _log.debug("[%s] suppressed", __name__, exc_info=True)
                 if _pre_alerts:
                     lines.append("\n*Pre-open gaps (≥3%):*")
                     lines.extend(_pre_alerts)
+
+                # For extreme (≥10%) gap-downs: submit market sell at open
+                for _cg_sym, _cg_qty, _cg_pre, _cg_gap in _critical_gaps:
+                    try:
+                        from broker import cancel_all_orders as _cancel_cg
+                        from position_monitor import _place_market_sell as _pms_cg
+                        _cancel_cg(_cg_sym)
+                        if _pms_cg(_cg_sym, _cg_qty):
+                            lines.append(
+                                f"\n🔴 *Emergency exit submitted* — *{_cg_sym}* "
+                                f"(gap {_cg_gap*100:.1f}%, pre ${_cg_pre:.2f})"
+                            )
+                            _log.warning("[briefing] EMERGENCY EXIT %s: gap %.1f%% — market sell submitted",
+                                         _cg_sym, _cg_gap * 100)
+                    except Exception as _cge:
+                        _log.warning("[briefing] emergency exit %s failed: %s", _cg_sym, _cge)
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── PM12: Pre-market gap + volume screen for last night's scan candidates ──
@@ -1126,6 +1154,9 @@ def _simons_score(trend) -> float:
     # RS momentum: line trending up 4w>8w>12w = institutional accumulation building
     rs_trend  = getattr(trend, "rs_trending", False)
     trend_pts = 0.5 if rs_trend and not rs_leading else 0.0
+    # RS momentum delta: RS rating rising faster than 4 weeks ago = acceleration
+    rs_delta     = getattr(trend, "rs_delta_4w", 0.0)
+    rs_delta_pts = 0.5 if rs_delta > 15 else (0.25 if rs_delta > 7 else 0.0)
     # Accumulation/Distribution: up-vol > down-vol = institutional buying pressure
     ad       = getattr(trend, "ad_ratio", 1.0)
     ad_pts   = 0.5 if ad >= 1.5 else (0.25 if ad >= 1.2 else 0.0)
@@ -1220,13 +1251,14 @@ def _simons_score(trend) -> float:
     si_mo_pts = float(getattr(trend, "short_mo_pts", 0.0))
     # Analyst PT gap: consensus >25% above price = substantial institutional expected upside
     apt_pts = 0.25 if getattr(trend, "analyst_pt_upside", False) else 0.0
-    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts
+    pead_pts = 0.5 if getattr(trend, "pead_hold", False) else 0.0  # PEAD: post-earnings drift bonus
+    return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts + rs_delta_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + bage_pts + vq_pts + ath_pts + ws2_pts + wba_pts
                + aug_pts + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
                + insider_pts + indleader_pts + rev_accel_pts
-               + twt2_pts + si_mo_pts + apt_pts + ws_pts, 10.0)
+               + twt2_pts + si_mo_pts + apt_pts + ws_pts + pead_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:
@@ -1796,6 +1828,15 @@ def _smart_order_management(vcp_passed: list, held_symbols: set) -> set:
         if age_bdays > 3:
             _cancel_sym(sym)
             _log.info("[main] Cancelled GTC zombie: %s (age=%d trading days)", sym, age_bdays)
+            # Write to retry queue so the next scan re-analyzes this setup
+            try:
+                _rq_path = LOG_DIR / "retry_queue.json"
+                _rq = json.loads(_rq_path.read_text()) if _rq_path.exists() else {}
+                _rq[sym] = {"cancelled_at": str(date.today()), "reason": "gtc_zombie",
+                             "age_bdays": age_bdays}
+                _rq_path.write_text(json.dumps(_rq, indent=2))
+            except Exception:
+                pass
             continue
 
         if sym not in new_map:
@@ -1960,6 +2001,8 @@ def _run_daily_impl():
     # Moved here from start-of-run to avoid a race with position_monitor appending
     # to trade_journal.jsonl during an active market session.
     _archive_old_jsonl()
+    _write_obsidian_daily_note(report, portfolio_value)
+    _update_obsidian_performance()
 
 
 def _run_scan(report: dict, today: str, portfolio_value: float,
@@ -1977,8 +2020,39 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         from screener import run as screen_universe, load_universe
         symbols = load_universe()
         _log.info("[simons] Universe: %d symbols", len(symbols))
+
+        # Retry queue: prepend symbols with recently cancelled GTC zombies so they
+        # are guaranteed to be in the scan universe (already there but makes intent clear)
+        _rq_path = LOG_DIR / "retry_queue.json"
+        _rq_syms: list[str] = []
+        try:
+            if _rq_path.exists():
+                _rq_data = json.loads(_rq_path.read_text())
+                _rq_syms = [s for s in _rq_data if s not in symbols]
+                if _rq_syms:
+                    _log.info("[main] Retry queue: %d extra symbols added: %s", len(_rq_syms), _rq_syms)
+                    symbols = list(symbols) + _rq_syms
+        except Exception:
+            pass
+
         screen_results = screen_universe(symbols=symbols)
         trend_passed = [r for r in screen_results if r.passed]
+
+        # Retry queue: move previously-cancelled GTC zombie symbols to front of analysis queue
+        if _rq_syms:
+            _rq_set   = set(_rq_syms)
+            _rq_front = [r for r in trend_passed if r.symbol in _rq_set]
+            _rq_rest  = [r for r in trend_passed if r.symbol not in _rq_set]
+            trend_passed = _rq_front + _rq_rest
+            if _rq_front:
+                _log.info("[main] Retry queue: %d symbols promoted to VCP front: %s",
+                          len(_rq_front), [r.symbol for r in _rq_front])
+            # Clear queue after reading — fresh start next scan
+            try:
+                _rq_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         # RVOL pre-filter: remove dormant (rvol_5d < 0.8) AND distribution (rvol_5d > 2.0)
         # Upper bound: sustained elevated volume during the base = distribution, not dry-up
         _before_rvol = len(trend_passed)
@@ -2063,6 +2137,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # ── Market regime filter ─────────────────────────────────────────────────
     regime, spy_price, spy_ma200, spy_pct = _check_market_regime()
+    report["regime"]    = regime
+    report["spy_price"] = round(spy_price, 2)
+    report["spy_pct"]   = round(spy_pct, 4)
     if regime == "bear":
         _cands_str = ", ".join(r.symbol for r in vcp_passed) or "none"
         _log.warning("[main] BEAR regime — skipping long order placement. %d VCPs found.", len(vcp_passed))
@@ -2095,6 +2172,49 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                                 f"SPY {spy_pct*100:+.1f}% vs MA200 — bear market confirmed")
             except Exception as _sh_e:
                 _log.warning("[main] Bear hedge (SH) failed: %s", _sh_e)
+
+        # ── Sector inverse hedge: buy QID if tech positions held + XLK < MA50 ──
+        # Tudor Jones rule: hedge sector exposure when sector ETF breaks below MA50.
+        # QID = 2x inverse NASDAQ (0.3% risk). Only placed when we hold tech stocks.
+        try:
+            from screener import get_sector as _get_sec
+            _tech_positions = [
+                p for p in positions
+                if _get_sec(p["symbol"]) == "Technology"
+                and p["symbol"] not in ("SH", "PSQ", "QID")
+            ]
+            if _tech_positions:
+                _xlk_df = yf.Ticker("XLK").history(period="3mo", interval="1d", auto_adjust=True)
+                if len(_xlk_df) >= 50:
+                    _xlk_price = float(_xlk_df["Close"].iloc[-1])
+                    _xlk_ma50  = float(_xlk_df["Close"].tail(50).mean())
+                    if _xlk_price < _xlk_ma50:
+                        _qid_held = any(p["symbol"] == "QID" for p in positions)
+                        if not _qid_held:
+                            from broker import place_buy_stop as _pbs_qid
+                            from risk_manager import position_size as _psz_qid, register_trade as _reg_qid
+                            _qid_fi = yf.Ticker("QID").fast_info
+                            _qid_px = float(getattr(_qid_fi, "last_price", None) or
+                                            getattr(_qid_fi, "regularMarketPrice", 0))
+                            if _qid_px > 0:
+                                _qid_stop = round(_qid_px * 0.95, 2)
+                                _qid_sz   = _psz_qid(portfolio_value, _qid_px, _qid_stop, risk_pct=0.003)
+                                if _qid_sz["shares"] >= 1:
+                                    _qid_oid = _pbs_qid("QID", _qid_sz["shares"], _qid_px)
+                                    if _qid_oid:
+                                        _reg_qid("QID", _qid_sz["risk_pct"])
+                                        _tech_syms = ", ".join(p["symbol"] for p in _tech_positions)
+                                        _log.info("[main] SECTOR HEDGE: QID %d sh @ $%.2f "
+                                                  "(XLK $%.1f < MA50 $%.1f, hedging %s)",
+                                                  _qid_sz["shares"], _qid_px,
+                                                  _xlk_price, _xlk_ma50, _tech_syms)
+                                        _tg(f"🐻 *Sector Hedge — QID (Tech)*\n"
+                                            f"{_qid_sz['shares']} shares @ ${_qid_px:.2f} "
+                                            f"(risk ${_qid_sz['risk_amount']:.0f})\n"
+                                            f"XLK ${_xlk_price:.1f} < MA50 ${_xlk_ma50:.1f}\n"
+                                            f"Tech positions hedged: {_tech_syms}")
+        except Exception as _qid_e:
+            _log.warning("[main] Sector hedge (QID) failed: %s", _qid_e)
 
         msg = (f"SPY ${spy_price:.0f} is {abs(spy_pct):.1f}% below MA200 — bear market.\n"
                f"VCP setups found: {_cands_str}\n"
@@ -2233,6 +2353,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # ── Three Masters composite scoring: weight all three layers ─────────────
     _rs_now = _get_rs()
     _current_vix = _fetch_vix()
+    report["vix"]         = round(_current_vix, 1)
+    report["breadth_pct"] = round(_breadth_pct, 3)
     # VIX spike: if VIX jumps >15% in a single session, markets are in sudden distress
     _vix_spike_today = False
     try:
@@ -2353,6 +2475,31 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # Sort by composite descending — Minervini dominates but Simons/Tudor contribute
     vcp_scored.sort(key=lambda x: -x[2])
+
+    # Build candidate list for broker report (all VCP-scored candidates, incl. future rejects)
+    report["vcp_candidates"] = [
+        {
+            "symbol":          v.symbol,
+            "current_price":   v.current_price,
+            "breakout_level":  v.breakout_level,
+            "stop_loss":       v.stop_loss,
+            "measured_move_pct": v.measured_move_pct,
+            "quality_score":   v.quality_score,
+            "confidence":      v.confidence,
+            "composite_score": cs,
+            "rs_rating":       getattr(t, "rs_rating", 0.0) if t else 0.0,
+            "rs_line_high":    getattr(v, "rs_line_at_high", False),
+            "sector":          get_sector(v.symbol),
+            "three_weeks_tight": getattr(t, "three_weeks_tight", False) if t else False,
+            "eps_accelerating": getattr(t, "eps_accelerating", False) if t else False,
+            "rs_delta_4w":     getattr(t, "rs_delta_4w", 0.0) if t else 0.0,
+            "weekly_stage2":   getattr(t, "weekly_stage2", False) if t else False,
+            "eps_growth":      getattr(t, "eps_growth", None) if t else None,
+            "pattern_type":    v.pattern_type,
+            "ai_reasoning":    v.ai_reasoning[:200],
+        }
+        for v, t, cs in vcp_scored
+    ]
 
     # Peer sector confirmation: when >=2 VCPs fire in the same sector, sector has a tailwind
     _sec_vcp_cnt: dict[str, int] = {}
@@ -2541,7 +2688,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
         try:
             sizing = position_size(portfolio_value, vcp.breakout_level, vcp.stop_loss,
-                                   risk_pct, vcp.measured_move_pct, vcp.symbol)
+                                   risk_pct, vcp.measured_move_pct, vcp.symbol, composite)
         except ValueError as e:
             _log.warning("[main] %s sizing error: %s", vcp.symbol, e)
             continue
@@ -2587,6 +2734,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         register_trade(vcp.symbol, sizing["risk_pct"])
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
+        _b1_trigger = 0.15 if composite >= 8.0 else 0.10
         order_rec = {
             "symbol":         vcp.symbol,
             "shares":         sizing["shares"],
@@ -2610,6 +2758,19 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "adaptive_risk":  round(risk_pct, 4),
             "composite_score":   composite,
             "measured_move_pct": round(getattr(vcp, "measured_move_pct", 0.0), 4),
+            # Broker report fields
+            "current_price":   round(vcp.current_price, 2),
+            "notional":        round(sizing["notional"], 0),
+            "ai_reasoning_full": vcp.ai_reasoning,
+            "rs_delta_4w":     round(getattr(trend_r, "rs_delta_4w", 0.0), 1) if trend_r else 0.0,
+            "three_weeks_tight": getattr(trend_r, "three_weeks_tight", False) if trend_r else False,
+            "eps_accelerating": getattr(trend_r, "eps_accelerating", False) if trend_r else False,
+            "weekly_stage2":   getattr(trend_r, "weekly_stage2", False) if trend_r else False,
+            "eps_growth":      getattr(trend_r, "eps_growth", None) if trend_r else None,
+            "pattern_type":    vcp.pattern_type,
+            "c_breakeven":     round(vcp.breakout_level * 1.08, 2),
+            "b1_exit":         round(vcp.breakout_level * (1 + _b1_trigger), 2),
+            "b1_trigger_pct":  _b1_trigger,
         }
         orders_placed.append(order_rec)
         cash -= sizing["notional"]
@@ -2663,62 +2824,187 @@ def _save_report(report: dict):
 
 
 def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float):
+    """
+    Comprehensive broker-style daily signal report sent to Telegram.
+    Message 1: Market overview.
+    Message per order: detailed trade card with entry, stop, sell plan, signals.
+    Final message: watchlist (rejected VCP candidates) + errors.
+    """
     orders   = report.get("orders_placed", [])
     ret_line = _equity_return_str(portfolio)
-    lines    = [
-        f"📈 *Three Masters — {report['date']}*",
-        f"Trend passed: {trend_n} | VCP confirmed: {vcp_n}",
-        f"Orders placed: {len(orders)}",
-        f"Portfolio: ${portfolio:,.0f}",
+    regime   = report.get("regime", "?")
+    spy_pct  = report.get("spy_pct", 0.0)
+    vix      = report.get("vix", 0.0)
+    breadth  = report.get("breadth_pct", 0.5)
+    _regime_emoji = {"bull": "🟢", "neutral": "🟡", "bear": "🔴"}.get(regime, "⚪")
+
+    # ── Meddelande 1: Marknadsöversikt ───────────────────────────────────────
+    ov = [
+        f"📊 *THREE MASTERS — DAGLIG RAPPORT*",
+        f"📅 {report['date']} | Regim: {_regime_emoji} {regime.upper()}",
+        f"",
+        f"*Marknadsdata*",
+        f"  SPY: {spy_pct*100:+.1f}% vs MA200"
+        + (f" | VIX: {vix:.1f}" if vix else ""),
+        f"  Marknadsbredd: {breadth*100:.0f}% ovan MA50",
+        f"  Portfölj: ${portfolio:,.0f}" + (f" | {ret_line}" if ret_line else ""),
+        f"",
+        f"*Pipeline*",
+        f"  Trend Template: {trend_n} godkända",
+        f"  VCP-mönster: {vcp_n} bekräftade",
+        f"  Ordrar lagda: {len(orders)}",
     ]
-    if ret_line:
-        lines.append(ret_line)
-    lines.append("")
-
-    for o in orders:
-        vol_tag  = " 🔥" if o.get("breakout_vol") else ""
-        rs_hi    = " ⭐RS-HIGH" if o.get("rs_line_high") else ""
-        qs_str   = f" Q{o['quality_score']}/5" if o.get("quality_score") else ""
-        rs_str   = f" RS={o['rs_rating']:.0f}" if o.get("rs_rating") else ""
-        cs_str   = f" ⚡{o['composite_score']:.1f}/10" if o.get("composite_score") else ""
-        sect     = f" [{o['sector']}]" if o.get("sector") else ""
-        lines.append(
-            f"  🎯 *{o['symbol']}* {o['shares']}sh @ ${o['buy_stop']:.2f}{vol_tag}{rs_hi}{qs_str}{rs_str}{cs_str}\n"
-            f"     SL=${o['stop_loss']:.2f} | TP=${o['target']:.2f} | "
-            f"Risk=${o['risk_amount']:.0f} ({o['risk_pct']*100:.1f}%) | {o['rr_ratio']:.1f}R{sect}\n"
-            f"     candle={o.get('last_candle','?')} | _{o['vcp_notes'][:80]}_"
-        )
-    if not orders:
-        lines.append("No new orders — conditions not met.")
-
-    _noise = {"already held", "order retained", "price extended past breakout"}
-    _rej   = {sym: rsn for sym, rsn in report.get("reject_reasons", {}).items()
-              if rsn not in _noise}
-    if _rej:
-        lines.append("")
-        lines.append("*Rejected candidates:*")
-        for _rs, _rr in list(_rej.items())[:8]:
-            lines.append(f"  ✗ {_rs} — {_rr}")
-        if len(_rej) > 8:
-            lines.append(f"  … and {len(_rej)-8} more")
-
-    _blocked = report.get("vcp_found_no_orders", [])
-    if _blocked and not orders and not _rej:
+    if not orders and not report.get("vcp_candidates"):
         _summary = report.get("summary", "")
-        _gate = (_summary.replace("macro_blackout_", "Macro blackout: ")
-                         .replace("bear_regime_no_orders", "Bear regime")
-                         .replace("breadth_gate_", "Breadth gate: ").replace("_no_orders", "")
-                         .replace("earnings_cluster_", "Earnings cluster: ").replace("_positions", " positions"))
-        lines.append("")
-        lines.append(f"*Blocked by {_gate}:*")
-        for sym in _blocked[:10]:
-            lines.append(f"  ⏸ {sym}")
-        if len(_blocked) > 10:
-            lines.append(f"  … and {len(_blocked)-10} more")
+        _gate = (_summary
+                 .replace("macro_blackout_", "Makro-stopp: ")
+                 .replace("bear_regime_no_orders", "Björnmarknad — inga långa ordrar")
+                 .replace("breadth_gate_neutral_no_orders", "Breddgate: Neutral regim")
+                 .replace("breadth_gate_bear_no_orders", "Breddgate: Björnmarknad")
+                 .replace("earnings_cluster_", "Earnings-kluster: ").replace("_positions", " positioner"))
+        if _gate:
+            ov.append(f"\n⛔ {_gate}")
+    _tg("\n".join(ov))
 
+    # ── Meddelande per order: Detaljerat handelskort ─────────────────────────
+    for i, o in enumerate(orders, 1):
+        sym     = o["symbol"]
+        entry   = o["buy_stop"]
+        sl      = o["stop_loss"]
+        target  = o["target"]
+        shares  = o["shares"]
+        risk_kr = o["risk_amount"]
+        risk_p  = o["risk_pct"] * 100
+        rr      = o["rr_ratio"]
+        q       = o.get("quality_score", 0)
+        conf    = o.get("vcp_confidence", 0.0)
+        rs      = o.get("rs_rating", 0.0)
+        cs      = o.get("composite_score", 0.0)
+        sect    = o.get("sector", "?")
+        cur_p   = o.get("current_price", 0.0)
+        notional = o.get("notional", shares * entry)
+        rs_delta = o.get("rs_delta_4w", 0.0)
+        mm_pct  = o.get("measured_move_pct", 0.0)
+        c_be    = o.get("c_breakeven", round(entry * 1.08, 2))
+        b1_ex   = o.get("b1_exit", round(entry * 1.10, 2))
+        b1_pct  = o.get("b1_trigger_pct", 0.10)
+        sl_pct  = (entry - sl) / entry * 100 if entry > 0 else 0
+        cur_gap = (cur_p - entry) / entry * 100 if entry > 0 and cur_p > 0 else 0
+        pattern = o.get("pattern_type", "vcp").upper()
+
+        # Signalbadge-lista
+        sigs = []
+        if o.get("rs_line_high"):
+            sigs.append("⭐ RS-linje på 52v-high")
+        if o.get("breakout_vol"):
+            sigs.append("🔥 Volymbekräftad breakout")
+        if o.get("three_weeks_tight"):
+            sigs.append("🔒 3-weeks tight (Minervini)")
+        if o.get("eps_accelerating"):
+            sigs.append("📈 EPS-acceleration Q-o-Q")
+        if rs_delta > 7:
+            sigs.append(f"↗ RS-momentum +{rs_delta:.0f}p (4v)")
+        if o.get("weekly_stage2"):
+            sigs.append("📊 Weekly Stage 2")
+        eps_g = o.get("eps_growth")
+        if eps_g is not None and eps_g >= 0.10:
+            sigs.append(f"💰 EPS-tillväxt {eps_g*100:.0f}%")
+        if not sigs:
+            sigs.append("Standardsetup (alla grundfilter godkända)")
+
+        # AI-analys (max 220 tecken)
+        ai_full = o.get("ai_reasoning_full", "") or o.get("vcp_notes", "")
+        ai_clip = (ai_full[:220] + "…") if len(ai_full) > 220 else ai_full
+
+        card = [
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"🎯 *{sym}* ({i}/{len(orders)}) — {sect}",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"⚡ Score {cs:.1f}/10 | Q{q}/5 | Konf {conf*100:.0f}% | RS {rs:.0f}"
+            + (f" ↗+{rs_delta:.0f}p" if rs_delta > 5 else "") + f" | {pattern}",
+            f"",
+            f"📥 *ENTRY*",
+            f"  Buy-stop: *${entry:.2f}*",
+            f"  Nuvarande: ${cur_p:.2f} ({cur_gap:+.1f}% vs entry)",
+            f"  Ordern triggas automatiskt när ${entry:.2f} bryts uppåt",
+            f"",
+            f"🛡️ *STOP LOSS*",
+            f"  *${sl:.2f}*  (−{sl_pct:.1f}% från entry)",
+            f"  Maxförlust om stop träffas: *${risk_kr:.0f}*",
+            f"",
+            f"💰 *SÄLJPLAN*",
+            f"  C  (+8%)  → ${c_be:.2f}  Flytta stop till breakeven",
+            f"  T1 (+{b1_pct*100:.0f}%) → ${b1_ex:.2f}  Sälj 33% av position",
+            f"  T2 (+12-20%) → Pyramid +30% om stöd på MA20",
+            f"  T3 → *${target:.2f}*  Sälj 33% till (measured move {mm_pct*100:.0f}%)",
+            f"  Trailer: 5% trailing stop på resten efter T3",
+            f"  ⏱ Time stop: Stäng om <+2% efter 15 handelsdagar",
+            f"  📉 Weekly: Stäng om veckoavslut under MA10w",
+            f"",
+            f"📐 *STORLEK & RISK*",
+            f"  {shares} aktier | ~${notional:,.0f} investerat",
+            f"  Risk: ${risk_kr:.0f} ({risk_p:.1f}% portfölj) | R/R: {rr:.1f}:1",
+            f"",
+            f"🔑 *SIGNALER*",
+        ]
+        for s in sigs:
+            card.append(f"  {s}")
+        if ai_clip:
+            card.append(f"")
+            card.append(f"💬 *ANALYS*")
+            card.append(f"  _{ai_clip}_")
+        card.append(f"")
+        card.append(f"🕯 Stearinljus: {o.get('last_candle','?')} | Sektor: {sect}")
+        _tg("\n".join(card))
+
+    if not orders:
+        _tg("*Inga ordrar idag* — villkoren för att handla är inte uppfyllda.")
+
+    # ── Watchlist: VCP-kandidater som avvisades av riskfiltren ───────────────
+    _noise   = {"already held", "order retained", "price extended past breakout"}
+    _rej_map = {sym: rsn for sym, rsn in report.get("reject_reasons", {}).items()
+                if rsn not in _noise}
+    _candidates = report.get("vcp_candidates", [])
+    _watchlist  = [c for c in _candidates
+                   if c["symbol"] not in {o["symbol"] for o in orders}]
+
+    if _watchlist or _rej_map:
+        wl_lines = [f"📋 *WATCHLIST — Avvisade VCP-kandidater*", ""]
+        _shown = set()
+        for c in _watchlist[:8]:
+            sym = c["symbol"]
+            _shown.add(sym)
+            rej = _rej_map.get(sym, "risk/marknads-filter")
+            entry  = c.get("breakout_level", 0.0)
+            sl     = c.get("stop_loss", 0.0)
+            target_mm = round(entry * (1 + c.get("measured_move_pct", 0.15)), 2) if entry > 0 else 0
+            sigs2 = []
+            if c.get("rs_line_high"):   sigs2.append("⭐RS-high")
+            if c.get("three_weeks_tight"): sigs2.append("🔒3wt")
+            if c.get("eps_accelerating"): sigs2.append("📈EPS-accel")
+            rd = c.get("rs_delta_4w", 0.0)
+            if rd > 5: sigs2.append(f"↗+{rd:.0f}p")
+            sig_str = " | ".join(sigs2) if sigs2 else ""
+            wl_lines.append(
+                f"🔸 *{sym}* (Score {c['composite_score']:.1f} | Q{c['quality_score']}/5 | RS {c['rs_rating']:.0f})\n"
+                f"   Entry: ${entry:.2f} | SL: ${sl:.2f} | Mål: ${target_mm:.2f}\n"
+                f"   Avvisad: _{rej}_"
+                + (f"\n   {sig_str}" if sig_str else "")
+            )
+        for sym, rsn in list(_rej_map.items())[:6]:
+            if sym not in _shown:
+                wl_lines.append(f"✗ {sym} — {rsn}")
+        _blocked = report.get("vcp_found_no_orders", [])
+        if _blocked:
+            wl_lines.append("")
+            wl_lines.append("*Blockerade av marknadsgaten:*")
+            for sym in _blocked[:6]:
+                wl_lines.append(f"  ⏸ {sym}")
+        _tg("\n".join(wl_lines))
+
+    # ── Fel ──────────────────────────────────────────────────────────────────
     if report.get("errors"):
-        lines.append(f"\n⚠️ Errors: {'; '.join(report['errors'])}")
-    _tg("\n".join(lines))
+        _tg(f"⚠️ *Fel under scan*\n" + "\n".join(f"  • {e}" for e in report["errors"]))
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -3035,6 +3321,175 @@ def main():
             _tg(f"❌ Three Masters — daily run crashed: {e}")
 
     _log.info("[main] Shutdown complete.")
+
+
+# ── Obsidian vault integration ────────────────────────────────────────────────
+_VAULT_DIR = Path("/home/habil/Three Masters")
+
+
+def _write_obsidian_daily_note(report: dict, portfolio_value: float) -> None:
+    """Write today's scan summary as a daily note to the Obsidian vault."""
+    try:
+        import subprocess
+        notes_dir = _VAULT_DIR / "Daily Notes"
+        notes_dir.mkdir(parents=True, exist_ok=True)
+
+        today     = report.get("date", str(date.today()))
+        orders    = report.get("orders_placed", [])
+        errors    = report.get("errors", [])
+        trend_n   = len(report.get("trend_passed", []))
+        vcp_n     = len(report.get("vcp_passed", []))
+        ret_line  = _equity_return_str(portfolio_value)
+
+        lines = [
+            f"---",
+            f"tags: [daily-scan, trading]",
+            f"date: {today}",
+            f"---",
+            f"",
+            f"# Scan {today}",
+            f"",
+            f"## Portfolio",
+            f"- Värde: ${portfolio_value:,.0f}",
+        ]
+        if ret_line:
+            lines.append(f"- Avkastning: {ret_line}")
+
+        lines += [
+            f"",
+            f"## Scan-resultat",
+            f"- Trend Template godkände: {trend_n} aktier",
+            f"- VCP bekräftade: {vcp_n} aktier",
+            f"- Ordrar lagda: {len(orders)}",
+        ]
+
+        if orders:
+            lines += ["", "## Placerade ordrar", ""]
+            lines.append("| Symbol | Buy-stop | Stop-loss | Composite | Sektor |")
+            lines.append("|--------|----------|-----------|-----------|--------|")
+            for o in orders:
+                sym  = o.get("symbol", "?")
+                bs   = o.get("buy_stop", o.get("breakout_level", 0))
+                sl   = o.get("stop_loss", 0)
+                cs   = o.get("composite_score", 0)
+                sec  = o.get("sector", "?")
+                lines.append(f"| {sym} | ${bs:.2f} | ${sl:.2f} | {cs:.1f} | {sec} |")
+
+        if errors:
+            lines += ["", "## Fel", ""]
+            for e in errors:
+                lines.append(f"- {e}")
+
+        note_path = notes_dir / f"{today}.md"
+        note_path.write_text("\n".join(lines))
+        _log.info("[obsidian] Daily note written: %s", note_path)
+
+        _obsidian_git_commit(f"bot: daily scan {today}")
+    except Exception:
+        _log.debug("[obsidian] daily note failed", exc_info=True)
+
+
+def _update_obsidian_performance() -> None:
+    """Update Performance Stats note in vault from feedback_state.json + trade_journal."""
+    try:
+        import subprocess
+        fb_path = LOG_DIR / "feedback_state.json"
+        if not fb_path.exists():
+            return
+        fb = json.loads(fb_path.read_text())
+
+        today    = str(date.today())
+        total    = fb.get("total_trades", 0)
+        wr       = fb.get("win_rate", 0)
+        avg_w    = fb.get("avg_win_r", 0)
+        avg_l    = fb.get("avg_loss_r", 0)
+        exp      = fb.get("expectancy", 0)
+        buckets  = fb.get("score_buckets", {})
+
+        lines = [
+            f"---",
+            f"tags: [performance, stats]",
+            f"updated: {today}",
+            f"---",
+            f"",
+            f"# Three Masters — Performance Stats",
+            f"",
+            f"*Uppdateras automatiskt efter varje daglig scan.*",
+            f"",
+            f"## Statistik ({total} avslutade trades)",
+            f"",
+            f"| Metric | Värde |",
+            f"|--------|-------|",
+            f"| Win rate | {wr:.0%} |",
+            f"| Avg win | {avg_w:+.2f}R |",
+            f"| Avg loss | {avg_l:+.2f}R |",
+            f"| Expectancy | {exp:+.2f}R per trade |",
+            f"",
+            f"## Score-bucket breakdown",
+            f"",
+            f"| Score | Trades | Avg R | Win rate |",
+            f"|-------|--------|-------|----------|",
+        ]
+        for bkt, bdata in buckets.items():
+            cnt = bdata.get("count", 0)
+            if cnt:
+                lines.append(
+                    f"| {bkt} | {cnt} | {bdata.get('avg_r', 0):+.2f}R "
+                    f"| {bdata.get('win_rate', 0):.0%} |"
+                )
+
+        # Last 15 trades
+        journal = LOG_DIR / "trade_journal.jsonl"
+        if journal.exists():
+            trades = []
+            for line in journal.read_text().splitlines():
+                try:
+                    trades.append(json.loads(line))
+                except Exception:
+                    pass
+            trades = sorted(trades, key=lambda t: t.get("ts", ""), reverse=True)[:15]
+            if trades:
+                lines += [
+                    f"",
+                    f"## Senaste 15 trades",
+                    f"",
+                    f"| Datum | Symbol | R | P&L% | Score |",
+                    f"|-------|--------|---|------|-------|",
+                ]
+                for t in trades:
+                    icon = "✅" if t.get("r_multiple", 0) > 0 else "❌"
+                    lines.append(
+                        f"| {t.get('ts','?')[:10]} "
+                        f"| {icon} {t.get('symbol','?')} "
+                        f"| {t.get('r_multiple',0):+.2f}R "
+                        f"| {t.get('pnl_pct',0):+.1f}% "
+                        f"| {t.get('composite_score') or '—'} |"
+                    )
+
+        perf_path = _VAULT_DIR / "Three Masters" / "Performance Stats.md"
+        perf_path.write_text("\n".join(lines))
+        _log.info("[obsidian] Performance Stats updated")
+    except Exception:
+        _log.debug("[obsidian] performance update failed", exc_info=True)
+
+
+def _obsidian_git_commit(message: str) -> None:
+    """Commit all vault changes to git so Mac can pull updates."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "-C", str(_VAULT_DIR), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10
+        )
+        if not result.stdout.strip():
+            return  # nothing to commit
+        subprocess.run(["git", "-C", str(_VAULT_DIR), "add", "-A"],
+                       capture_output=True, timeout=10)
+        subprocess.run(["git", "-C", str(_VAULT_DIR), "commit", "-m", message],
+                       capture_output=True, timeout=10)
+        _log.info("[obsidian] git commit: %s", message)
+    except Exception:
+        _log.debug("[obsidian] git commit failed", exc_info=True)
 
 
 if __name__ == "__main__":

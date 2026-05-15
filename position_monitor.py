@@ -295,6 +295,23 @@ def _stop_order_alive(order_id: str) -> bool:
 
 # ── Core monitoring logic ─────────────────────────────────────────────────────
 
+def _infer_exit_step(sym_data: dict) -> str:
+    """Infer primary exit step from state flags — avoids scattered exit_step assignments."""
+    if sym_data.get("max_loss_exited"):       return "max_loss_cap"
+    if sym_data.get("weekly_close_exited"):   return "W_weekly_close"
+    if sym_data.get("earnings_closed"):       return "earnings_close"
+    if sym_data.get("iv_crush_exited"):       return "IV_crush"
+    if sym_data.get("failed_breakout_done"):  return "Z_failed_breakout"
+    if sym_data.get("lhll_stopped"):          return "LHLL_reversal"
+    if sym_data.get("climax_exit_done"):      return "V_climax"
+    if sym_data.get("time_stopped"):          return "D_time_stop"
+    if sym_data.get("max_hold_exited"):       return "max_hold"
+    if sym_data.get("gap_harvest_done"):      return "G_gap_harvest"
+    if sym_data.get("partial2_done"):         return "B2_partial"
+    if sym_data.get("partial1_done"):         return "B1_partial"
+    return "stop"
+
+
 def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value: float) -> None:
     """Append completed trade record to logs/trade_journal.jsonl."""
     import json as _json
@@ -304,10 +321,16 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
     partial_qty = sym_data.get("partial_qty", 0)
     exit_qty    = initial_qty - partial_qty
     pnl_dollar  = (last_price - avg_cost) * exit_qty if avg_cost > 0 else 0.0
-    # R-multiple uses actual VCP stop_loss from order report (falls back to 7% approx)
     stop_loss      = sym_data.get("stop_loss", 0.0)
     risk_per_share = (avg_cost - stop_loss) if stop_loss > 0 else avg_cost * 0.07
     r_multiple = (last_price - avg_cost) / risk_per_share if risk_per_share > 0 else 0.0
+    buy_stop     = sym_data.get("buy_stop", 0.0)
+    slippage_pct = round((avg_cost - buy_stop) / buy_stop * 100, 2) if buy_stop > 0 else 0.0
+    _add = []
+    if sym_data.get("step_f_done"):  _add.append("F")
+    if sym_data.get("step_f2_done"): _add.append("F2")
+    if sym_data.get("pyramid_done"): _add.append("P")
+    days_held = _trading_days_held(sym_data.get("entry_date", ""))
 
     entry = {
         "ts":              datetime.now().isoformat(),
@@ -325,6 +348,10 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
         "mae_pct":         round(float(sym_data.get("mae_pct", 0.0) or 0.0) * 100, 2),
         "mfe_pct":         round(float(sym_data.get("mfe_pct", 0.0) or 0.0) * 100, 2),
         "portfolio_after": round(portfolio_value, 2),
+        "exit_step":       _infer_exit_step(sym_data),
+        "add_steps":       ",".join(_add),
+        "slippage_pct":    slippage_pct,
+        "days_held":       days_held,
     }
     journal = os.path.join(os.path.dirname(__file__), "logs", "trade_journal.jsonl")
     try:
@@ -335,6 +362,70 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
                   symbol, pnl_pct * 100, r_multiple)
     except Exception as e:
         _log.warning("[monitor] Journal write failed: %s", e)
+
+
+def _run_postmortem(symbol: str, sym_data: dict, pnl_pct: float) -> None:
+    """Call Haiku for a 2-sentence post-trade analysis. Updates the last journal entry."""
+    try:
+        import anthropic as _ant
+        from config import ANTHROPIC_API_KEY as _ant_key, CLAUDE_MODEL as _haiku_model
+        _client = _ant.Anthropic(api_key=_ant_key, timeout=15.0)
+
+        _hist = yf.Ticker(symbol).history(period="30d", interval="1d", auto_adjust=True)
+        if _hist.empty:
+            return
+
+        avg_cost   = float(sym_data.get("avg_cost", 0) or 0)
+        entry_date = sym_data.get("entry_date", "")
+        exit_step  = _infer_exit_step(sym_data)
+        days_held  = _trading_days_held(entry_date)
+        mfe_pct    = round(float(sym_data.get("mfe_pct", 0) or 0) * 100, 1)
+        mae_pct    = round(float(sym_data.get("mae_pct", 0) or 0) * 100, 1)
+        _add = []
+        if sym_data.get("step_f_done"):  _add.append("F")
+        if sym_data.get("step_f2_done"): _add.append("F2")
+        if sym_data.get("pyramid_done"): _add.append("P")
+
+        _rows = []
+        for _dt, _row in _hist.tail(15).iterrows():
+            _rows.append(f"{str(_dt)[:10]}  C={_row['Close']:.2f}  V={int(_row['Volume']/1000)}K")
+
+        _prompt = (
+            f"Trade post-mortem: {symbol}\n"
+            f"Entry avg: ${avg_cost:.2f} | Entry: {entry_date} | Days held: {days_held}\n"
+            f"P&L: {pnl_pct*100:+.1f}% | MFE: +{mfe_pct}% | MAE: {mae_pct}%\n"
+            f"Exit reason: {exit_step} | Add-ons: {','.join(_add) or 'none'}\n\n"
+            f"Last 15 daily closes:\n" + "\n".join(_rows) + "\n\n"
+            f"In exactly 2 sentences: (1) what went right or wrong with this trade, "
+            f"(2) what could have been managed better. Be specific and actionable."
+        )
+        _resp = _client.messages.create(
+            model=_haiku_model,
+            max_tokens=200,
+            messages=[{"role": "user", "content": _prompt}],
+        )
+        postmortem = _resp.content[0].text.strip()
+
+        _jpath = os.path.join(os.path.dirname(__file__), "logs", "trade_journal.jsonl")
+        if os.path.exists(_jpath):
+            with open(_jpath, "r") as _jf:
+                _lines = _jf.readlines()
+            for _i in range(len(_lines) - 1, -1, -1):
+                try:
+                    _entry = json.loads(_lines[_i])
+                    if _entry.get("symbol") == symbol:
+                        _entry["ai_postmortem"] = postmortem
+                        _lines[_i] = json.dumps(_entry) + "\n"
+                        break
+                except Exception:
+                    continue
+            _tmp = _jpath + ".tmp"
+            with open(_tmp, "w") as _jf:
+                _jf.writelines(_lines)
+            os.replace(_tmp, _jpath)
+            _log.info("[monitor] Post-mortem %s: %s", symbol, postmortem[:80])
+    except Exception as _e:
+        _log.debug("[monitor] postmortem failed %s: %s", symbol, _e)
 
 
 def _trading_days_held(entry_date_str: str) -> int:
@@ -354,6 +445,7 @@ def _trading_days_held(entry_date_str: str) -> int:
 
 from config import SECTOR_ETF_MAP as _SECTOR_ETF_PM
 _sector_etf_cache: dict[str, tuple[bool, float]] = {}
+_weekly_cache: dict = {}  # sym → (df, fetch_timestamp)
 
 
 def _sector_etf_below_ma50(symbol: str) -> bool:
@@ -401,6 +493,22 @@ def _get_cached_regime() -> str:
         _log.debug("[%s] suppressed", __name__, exc_info=True)
     _regime_ts_pm = _time_r.time()
     return _cached_regime_pm
+
+
+def _get_weekly_hist(sym: str):
+    """Return weekly OHLCV for sym (6-month history), cached per symbol with 4-hour TTL."""
+    import time as _tw
+    global _weekly_cache
+    _now = _tw.time()
+    if sym in _weekly_cache and _now - _weekly_cache[sym][1] < 14400:
+        return _weekly_cache[sym][0]
+    try:
+        _df = yf.Ticker(sym).history(period="6mo", interval="1wk", auto_adjust=True)
+        _weekly_cache[sym] = (_df, _now)
+        return _df
+    except Exception:
+        import pandas as _pdw
+        return _pdw.DataFrame()
 
 
 def _lookup_position_metadata(symbol: str) -> dict:
@@ -887,6 +995,58 @@ def check_positions() -> None:
         sym["mae_pct"] = min(sym.get("mae_pct", pnl_pct), pnl_pct)
         sym["mfe_pct"] = max(sym.get("mfe_pct", pnl_pct), pnl_pct)
 
+        # ── PM-VWAP: Intraday VWAP weakness — tighten stop 11-14 ET ─────────────
+        # If price falls below intraday VWAP with rising volume during 11-14 ET =
+        # institutional selling pressure. Tighten trailing stop one step (to 97% of entry).
+        # Only fires once per day and only on profitable positions (> +2%).
+        _vwap_now   = datetime.now(_ET)
+        _vwap_today = _vwap_now.strftime("%Y-%m-%d")
+        if (11 <= _vwap_now.hour < 14
+                and sym.get("_vwap_check_date") != _vwap_today
+                and pnl_pct > 0.02
+                and sym.get("stop_loss", 0) > 0
+                and not sym.get("time_stopped")
+                and not sym.get("max_loss_exited")):
+            sym["_vwap_check_date"] = _vwap_today
+            try:
+                _dfin = yf.Ticker(symbol).history(period="1d", interval="5m", auto_adjust=True)
+                if len(_dfin) >= 10:
+                    _tp_in   = (_dfin["High"] + _dfin["Low"] + _dfin["Close"]) / 3
+                    _cum_vol = _dfin["Volume"].cumsum()
+                    _vwap_in = (float((_tp_in * _dfin["Volume"]).cumsum().iloc[-1] / _cum_vol.iloc[-1])
+                                if float(_cum_vol.iloc[-1]) > 0 else cur_price)
+                    _vol_3   = float(_dfin["Volume"].tail(3).mean())
+                    _vol_pre = float(_dfin["Volume"].iloc[:-3].mean()) if len(_dfin) > 3 else _vol_3
+                    _vol_rising = _vol_pre > 0 and _vol_3 > _vol_pre * 1.2
+                    if cur_price < _vwap_in * 0.999 and _vol_rising:
+                        _old_sl  = sym["stop_loss"]
+                        _new_sl  = round(max(_old_sl, avg_cost * 0.97), 2)
+                        if _new_sl > _old_sl:
+                            sym["stop_loss"] = _new_sl
+                            sym["vwap_tightened"] = True
+                            changed = True
+                            _log.info(
+                                "[monitor] %s VWAP weakness (price $%.2f < VWAP $%.2f + rising vol) "
+                                "— stop tightened $%.2f → $%.2f",
+                                symbol, cur_price, _vwap_in, _old_sl, _new_sl)
+                            try:
+                                import requests as _rqvw, os as _osvw
+                                _tvw = _osvw.getenv("TELEGRAM_BOT_TOKEN", "")
+                                _cvw = _osvw.getenv("TELEGRAM_CHAT_ID", "")
+                                if _tvw and _cvw:
+                                    _rqvw.post(
+                                        f"https://api.telegram.org/bot{_tvw}/sendMessage",
+                                        json={"chat_id": _cvw, "parse_mode": "Markdown",
+                                              "text": (f"⚠️ *VWAP Weakness — {symbol}*\n"
+                                                       f"Price ${cur_price:.2f} < VWAP ${_vwap_in:.2f} "
+                                                       f"+ rising volume (11-14 ET)\n"
+                                                       f"Stop tightened: ${_old_sl:.2f} → ${_new_sl:.2f}")},
+                                        timeout=8)
+                            except Exception:
+                                _log.debug("[%s] suppressed", __name__, exc_info=True)
+            except Exception:
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
+
         # ── PM8: Max loss per trade cap — hard 2R floor (Tudor Jones) ──────────────
         # GTC stops can be gapped through on bad news. This is the last-resort circuit breaker:
         # if loss exceeds 2× initial risk per share, close immediately regardless of stop status.
@@ -1066,6 +1226,72 @@ def check_positions() -> None:
                                         _log.debug("[%s] suppressed", __name__, exc_info=True)
                 except Exception as _ive:
                     _log.debug("[monitor] iv_crush %s: %s", symbol, _ive)
+
+        # ── Ex-dividend guard ─────────────────────────────────────────────────────
+        # Stock gaps down by the dividend amount on ex-date (typically 0.5–3%).
+        # If ex-date is ≤ 2 calendar days away: profitable → breakeven; flat/loss → close.
+        # Checked once per trading day to avoid repeated stop moves.
+        _exdiv_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (not sym.get("exdiv_guarded")
+                and sym.get("_exdiv_check_date") != _exdiv_today
+                and not sym.get("time_stopped")
+                and not sym.get("max_loss_exited")):
+            sym["_exdiv_check_date"] = _exdiv_today
+            try:
+                import pandas as _pd_ex
+                _cal = yf.Ticker(symbol).calendar
+                _exdiv_days = None
+                if _cal is not None and not _cal.empty:
+                    for _fld in ("Ex-Dividend Date", "Dividend Date"):
+                        _row = None
+                        if _fld in _cal.index:
+                            _row = _cal.loc[_fld].iloc[0]
+                        elif _fld in _cal.columns:
+                            _row = _cal[_fld].iloc[0]
+                        if _row is not None and not _pd_ex.isna(_row):
+                            _ex = _pd_ex.Timestamp(_row).date()
+                            _delta = (_ex - datetime.now(_ET).date()).days
+                            if 0 <= _delta <= 2:
+                                _exdiv_days = _delta
+                            break
+                if _exdiv_days is not None:
+                    _rem_ex = qty - sym.get("partial_qty", 0)
+                    if pnl_pct >= 0.03 and _rem_ex > 0 and not sym.get("breakeven_done"):
+                        _cancel_stop_orders(symbol)
+                        _ex_oid = _place_stop(symbol, _rem_ex, round(avg_cost, 2))
+                        if _ex_oid:
+                            sym["breakeven_done"] = True
+                            sym["stop_order_id"]  = _ex_oid
+                            sym["exdiv_guarded"]  = True
+                            changed = True
+                            _log.warning("[monitor] %s EX-DIV GUARD: %dd to ex-date — "
+                                         "stop moved to breakeven $%.2f",
+                                         symbol, _exdiv_days, avg_cost)
+                    elif pnl_pct < 0.01 and _rem_ex > 0:
+                        _cancel_stop_orders(symbol)
+                        if _place_market_sell(symbol, _rem_ex):
+                            sym["exdiv_guarded"] = True
+                            changed = True
+                            _log.warning("[monitor] %s EX-DIV CLOSE: %dd to ex-date, "
+                                         "pnl=%.1f%% — closing pre-dividend",
+                                         symbol, _exdiv_days, pnl_pct * 100)
+                    try:
+                        import requests as _rqex, os as _osex
+                        _tokex = _osex.getenv("TELEGRAM_BOT_TOKEN", "")
+                        _cidex = _osex.getenv("TELEGRAM_CHAT_ID", "")
+                        if _tokex and _cidex and sym.get("exdiv_guarded"):
+                            _action = "stop → breakeven" if pnl_pct >= 0.03 else "position closed"
+                            _rqex.post(
+                                f"https://api.telegram.org/bot{_tokex}/sendMessage",
+                                json={"chat_id": _cidex, "parse_mode": "Markdown",
+                                      "text": (f"📅 *Ex-Div Guard — {symbol}*\n"
+                                               f"{_exdiv_days} day(s) to ex-dividend\n"
+                                               f"Action: {_action} (P&L {pnl_pct*100:+.1f}%)")},
+                                timeout=8)
+                    except Exception:
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+            except Exception as _exe:
+                _log.debug("[monitor] exdiv_guard %s: %s", symbol, _exe)
 
         # ── Step A: Initial stop (placed once when position first seen) ──────────
         # Use HARD STOP at VCP pivot low if we have the planned stop from the order.
@@ -1372,6 +1598,110 @@ def check_positions() -> None:
                     _log.info("[monitor] %s stop moved to breakeven $%.2f (+%.1f%%)",
                               symbol, breakeven, pnl_pct * 100)
 
+        # ── Step F: Early pyramid at +4% when RS line near high ──────────────────
+        # Add 25% of initial qty when position has +4% AND RS line confirms strength
+        # by sitting at/near its 90-day high. Fires before B1 (+10%) — reserved for
+        # the strongest setups where relative strength leads from the start.
+        # Guard: P not yet triggered (each pyramid step fires at most once).
+        if (not sym.get("step_f_done")
+                and not sym.get("pyramid_done")
+                and not sym.get("partial1_done")
+                and 0.04 <= pnl_pct < 0.10):
+            _f_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_f_check_date") != _f_today:
+                sym["_f_check_date"] = _f_today
+                _rs_f_near_high = False
+                try:
+                    _df_f  = _get_hist(symbol)
+                    _spy_f = yf.Ticker("SPY").history(
+                        period="90d", interval="1d", auto_adjust=True)["Close"]
+                    if len(_df_f) >= 22 and len(_spy_f) >= 22:
+                        _c_f  = _df_f["Close"]
+                        _rs_f = (_c_f / _spy_f.reindex(_c_f.index, method="nearest")).dropna()
+                        if len(_rs_f) >= 10:
+                            _rs_f_high      = float(_rs_f.max())
+                            _rs_f_now       = float(_rs_f.iloc[-1])
+                            _rs_f_near_high = _rs_f_high > 0 and _rs_f_now >= _rs_f_high * 0.98
+                except Exception as _fe:
+                    _log.debug("[monitor] step_f rs %s: %s", symbol, _fe)
+                if _rs_f_near_high:
+                    _f_qty = max(1, round(sym.get("initial_qty", qty) * 0.25))
+                    if _place_market_buy(symbol, _f_qty):
+                        sym["step_f_done"]  = True
+                        sym["step_f_qty"]   = _f_qty
+                        sym["step_f_price"] = cur_price
+                        changed = True
+                        _log.info("[monitor] ✓ %s STEP-F early pyramid: +%d sh @ $%.2f "
+                                  "(+%.1f%%, RS at 90d high)",
+                                  symbol, _f_qty, cur_price, pnl_pct * 100)
+                        try:
+                            import requests as _rqf, os as _osf
+                            _tokf = _osf.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _cidf = _osf.getenv("TELEGRAM_CHAT_ID", "")
+                            if _tokf and _cidf:
+                                _rqf.post(
+                                    f"https://api.telegram.org/bot{_tokf}/sendMessage",
+                                    json={"chat_id": _cidf, "parse_mode": "Markdown",
+                                          "text": (f"📈 *Step F — Early Pyramid — {symbol}*\n"
+                                                   f"Added {_f_qty} sh @ ${cur_price:.2f} "
+                                                   f"(+{pnl_pct*100:.1f}%)\n"
+                                                   f"RS line at 90-day high — leading strength")},
+                                    timeout=8)
+                        except Exception:
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+
+        # ── Step F2: Follow-on add at MA10w pullback with volume dry-up ───────────
+        # When an active profitable position pulls back to the 10-week MA with
+        # drying volume, add 25% — classic Minervini re-entry on a proven winner.
+        # MFE guard (≥8%): ensures stock genuinely rallied first before pulling back.
+        # Volume dry-up: 5-day avg < 60% of 50-day avg (mirrors VCP Tier 0 logic).
+        if (not sym.get("step_f2_done")
+                and not sym.get("partial2_done")
+                and pnl_pct > 0.04
+                and sym.get("mfe_pct", 0) >= 0.08):
+            _f2_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_f2_check_date") != _f2_today:
+                sym["_f2_check_date"] = _f2_today
+                _f2_triggered = False
+                try:
+                    _dfw2 = _get_weekly_hist(symbol)
+                    _dfd2 = _get_hist(symbol)
+                    if len(_dfw2) >= 12 and len(_dfd2) >= 51:
+                        _wc2      = _dfw2["Close"]
+                        _ma10w_f2 = float(_wc2.iloc[-11:-1].mean())  # 10 completed weekly closes
+                        _near_ma10w = _ma10w_f2 * 0.98 <= cur_price <= _ma10w_f2 * 1.03
+                        _vol5_f2    = float(_dfd2["Volume"].tail(5).mean())
+                        _vol50_f2   = float(_dfd2["Volume"].tail(51).iloc[:-1].mean())
+                        _vol_dry_f2 = _vol50_f2 > 0 and _vol5_f2 < _vol50_f2 * 0.60
+                        _f2_triggered = _near_ma10w and _vol_dry_f2
+                except Exception as _f2e:
+                    _log.debug("[monitor] step_f2 %s: %s", symbol, _f2e)
+                if _f2_triggered:
+                    _f2_qty = max(1, round(sym.get("initial_qty", qty) * 0.25))
+                    if _place_market_buy(symbol, _f2_qty):
+                        sym["step_f2_done"]  = True
+                        sym["step_f2_qty"]   = _f2_qty
+                        sym["step_f2_price"] = cur_price
+                        changed = True
+                        _log.info("[monitor] ✓ %s STEP-F2 follow-on: +%d sh @ $%.2f "
+                                  "(+%.1f%%, MA10w pull + vol dry)",
+                                  symbol, _f2_qty, cur_price, pnl_pct * 100)
+                        try:
+                            import requests as _rqf2, os as _osf2
+                            _tokf2 = _osf2.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _cidf2 = _osf2.getenv("TELEGRAM_CHAT_ID", "")
+                            if _tokf2 and _cidf2:
+                                _rqf2.post(
+                                    f"https://api.telegram.org/bot{_tokf2}/sendMessage",
+                                    json={"chat_id": _cidf2, "parse_mode": "Markdown",
+                                          "text": (f"📈 *Step F2 — Follow-on — {symbol}*\n"
+                                                   f"Added {_f2_qty} sh @ ${cur_price:.2f} "
+                                                   f"(+{pnl_pct*100:.1f}%)\n"
+                                                   f"MA10w pull with vol dry-up — re-entry")},
+                                    timeout=8)
+                        except Exception:
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+
         # ── Step C2: Sector ETF < MA50 — force breakeven on sector weakness ─────
         # If the broader sector is losing leadership, tighten before the position turns.
         # Runs once per day per position (ETF data cached 1h).
@@ -1644,6 +1974,51 @@ def check_positions() -> None:
             except Exception as _rsd_e:
                 _log.debug("[monitor] rs_divergence %s: %s", symbol, _rsd_e)
 
+        # ── Step W: Weekly close under MA10w — exit on trend breakdown ─────────────
+        # O'Neil / Minervini rule: a full week closing below the 10-week moving average
+        # signals that the intermediate uptrend is broken — position should be closed.
+        # Checked once per trading day; always acts on the last COMPLETED weekly bar
+        # (iloc[-2]) so an in-progress week never triggers a premature exit.
+        _w_today = datetime.now(_ET).strftime("%Y-%m-%d")
+        if (not sym.get("weekly_close_exited")
+                and not sym.get("time_stopped")
+                and not sym.get("max_loss_exited")
+                and sym.get("_w_check_date") != _w_today):
+            sym["_w_check_date"] = _w_today
+            try:
+                _dfw = _get_weekly_hist(symbol)
+                if len(_dfw) >= 12:
+                    _wc         = _dfw["Close"]
+                    # MA10w at the last completed bar: average of that bar + 9 preceding bars
+                    _last_wk_close = float(_wc.iloc[-2])
+                    _ma10w_w       = float(_wc.iloc[-11:-1].mean())
+                    if _last_wk_close < _ma10w_w:
+                        _rem_w = qty - sym.get("partial_qty", 0)
+                        _log.warning(
+                            "[monitor] %s STEP-W: last weekly close $%.2f < MA10w $%.2f — closing",
+                            symbol, _last_wk_close, _ma10w_w)
+                        _cancel_stop_orders(symbol)
+                        if _rem_w > 0 and _place_market_sell(symbol, _rem_w):
+                            sym["weekly_close_exited"] = True
+                            changed = True
+                            try:
+                                import requests as _rqw, os as _osw
+                                _tokw = _osw.getenv("TELEGRAM_BOT_TOKEN", "")
+                                _cidw = _osw.getenv("TELEGRAM_CHAT_ID", "")
+                                if _tokw and _cidw:
+                                    _rqw.post(
+                                        f"https://api.telegram.org/bot{_tokw}/sendMessage",
+                                        json={"chat_id": _cidw, "parse_mode": "Markdown",
+                                              "text": (f"📉 *Step W — Weekly Close Exit — {symbol}*\n"
+                                                       f"Last weekly close ${_last_wk_close:.2f} "
+                                                       f"< MA10w ${_ma10w_w:.2f}\n"
+                                                       f"Trend breakdown confirmed — position closed")},
+                                        timeout=8)
+                            except Exception:
+                                _log.debug("[%s] suppressed", __name__, exc_info=True)
+            except Exception as _we:
+                _log.debug("[monitor] step_w %s: %s", symbol, _we)
+
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
         entry_date_str = sym.get("entry_date", "")
@@ -1651,6 +2026,35 @@ def check_positions() -> None:
             sym.get("pead_hold")
             and _trading_days_held(sym.get("pead_date", "")) < 60
         )
+
+        if (entry_date_str
+                and not sym.get("partial_done")
+                and not sym.get("time_stopped")
+                and not sym.get("max_loss_exited")
+                and not _pead_active):
+            _td_d = _trading_days_held(entry_date_str)
+            if _td_d >= time_stop_days and pnl_pct < time_stop_gain:
+                _rem_d = qty - sym.get("partial_qty", 0)
+                _log.warning("[monitor] %s TIME STOP: day %d pnl=%.1f%% (< %.0f%%) — closing",
+                             symbol, _td_d, pnl_pct * 100, time_stop_gain * 100)
+                _cancel_stop_orders(symbol)
+                if _rem_d > 0 and _place_market_sell(symbol, _rem_d):
+                    sym["time_stopped"] = True
+                    changed = True
+                    try:
+                        import requests as _rqd, os as _osd
+                        _tokd = _osd.getenv("TELEGRAM_BOT_TOKEN", "")
+                        _cidd = _osd.getenv("TELEGRAM_CHAT_ID", "")
+                        if _tokd and _cidd:
+                            _rqd.post(
+                                f"https://api.telegram.org/bot{_tokd}/sendMessage",
+                                json={"chat_id": _cidd, "parse_mode": "Markdown",
+                                      "text": (f"⏳ *Time Stop — {symbol}*\n"
+                                               f"Held {_td_d} days | P&L {pnl_pct*100:+.1f}%\n"
+                                               f"No momentum — Minervini time rule")},
+                                timeout=8)
+                    except Exception:
+                        _log.debug("[%s] suppressed", __name__, exc_info=True)
 
         # ── Hard absolute max holding period: 60 trading days ──────────────────────
         # Prevents positions from becoming indefinite anchors. Winners get a tight
@@ -1756,6 +2160,14 @@ def check_positions() -> None:
                 portfolio_value = get_account()["portfolio_value"]
                 close_trade(sym, pnl_pct, portfolio_value)   # start_value read from risk_state
                 _journal_trade(sym, sym_data, pnl_pct, portfolio_value)
+
+                # Post-trade AI post-mortem via Haiku (background thread, non-blocking)
+                threading.Thread(
+                    target=_run_postmortem,
+                    args=(sym, dict(sym_data), pnl_pct),
+                    daemon=True,
+                    name=f"postmortem-{sym}",
+                ).start()
 
                 # OP1: Update signal accuracy on trade close
                 try:
