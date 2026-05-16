@@ -109,7 +109,7 @@ def place_buy_stop(symbol: str, qty: int, stop_price: float) -> dict | None:
     Placed after close (22:30 CEST) — triggers during the NEXT trading day if price breaks out.
     """
     try:
-        _limit = round(stop_price * 1.005, 2)
+        _limit = round(stop_price * 1.008, 2)  # 0.8% above stop — wider than default to survive volatile gap-up fills
         order = _retry(
             get_api().submit_order,
             StopLimitOrderRequest(

@@ -202,8 +202,8 @@ def _place_market_buy(symbol: str, qty: int) -> bool:
         return False
 
 
-def _place_limit_sell(symbol: str, qty: int, limit_price: float) -> bool:
-    """Limit sell for partial exits — captures slightly better fills than market."""
+def _place_limit_sell(symbol: str, qty: int, limit_price: float) -> str | None:
+    """Limit sell for partial exits. Returns Alpaca order ID, 'market' if fell back, or None on failure."""
     try:
         body = {
             "symbol": symbol,
@@ -218,11 +218,12 @@ def _place_limit_sell(symbol: str, qty: int, limit_price: float) -> bool:
             json=body, headers=_alpaca_headers(), timeout=10
         )
         r.raise_for_status()
-        _log.info("[monitor] Limit sell %d × %s @ $%.2f submitted", qty, symbol, limit_price)
-        return True
+        order_id = r.json().get("id", "")
+        _log.info("[monitor] Limit sell %d × %s @ $%.2f submitted id=%s", qty, symbol, limit_price, order_id)
+        return order_id or "limit_unknown"
     except Exception as e:
         _log.warning("[monitor] limit_sell(%s, %d) error: %s — falling back to market", symbol, qty, e)
-        return _place_market_sell(symbol, qty)
+        return "market" if _place_market_sell(symbol, qty) else None
 
 
 def _place_stop(symbol: str, qty: int, stop_price: float) -> str | None:
@@ -1624,21 +1625,40 @@ def check_positions() -> None:
         mm_pct = sym.get("measured_move_pct", 0.0) or 0.0
         partial2_trigger = max(mm_pct, 0.20) if mm_pct > 0.05 else 0.20
 
+        # ── Confirm pending B1 fill: check if limit order has left open orders ─────
+        # B1 sets _b1_fill_pending=True when a limit sell is placed but not yet
+        # confirmed. Once the order disappears from Alpaca open orders it has filled
+        # (or expired). Only then is partial1 fully confirmed — this prevents B2 from
+        # triggering against an unconfirmed B1.
+        if sym.get("_b1_fill_pending") and sym.get("_b1_order_id"):
+            _open_oids = {o.get("id", "") for o in _get_open_orders(symbol)}
+            if sym["_b1_order_id"] not in _open_oids:
+                sym.pop("_b1_fill_pending", None)
+                sym.pop("_b1_order_id", None)
+                changed = True
+                _log.info("[monitor] %s B1 fill confirmed (order left open list)", symbol)
+
         _skip_b1_8w = sym.get("fast_mover") and _trading_days_held(sym.get("entry_date", "")) < 40
         if pnl_pct >= partial1_trigger and not sym.get("partial1_done") and not _skip_b1_8w:
             sell_qty = max(1, round(initial_qty / 3))
             _lim1 = round(cur_price * 0.999, 2)  # 0.1% below market — fast fill, better price
-            if _place_limit_sell(symbol, sell_qty, _lim1):
-                sym["partial1_done"] = True
-                sym["partial_done"]  = True   # backward-compat for time stop check
-                sym["partial_qty"]   = sell_qty
+            _b1_oid = _place_limit_sell(symbol, sell_qty, _lim1)
+            if _b1_oid is not None:
+                sym["partial1_done"]  = True
+                sym["partial_done"]   = True   # backward-compat for time stop check
+                sym["partial_qty"]    = sell_qty
                 sym["partial1_price"] = cur_price
+                # Track fill confirmation unless it was a market-sell fallback (instant fill)
+                if _b1_oid not in ("market", ""):
+                    sym["_b1_order_id"]    = _b1_oid
+                    sym["_b1_fill_pending"] = True
                 changed = True
                 _log.info("[monitor] ✓ %s PARTIAL-1 (33%%): sold %d sh @ $%.2f (+%.1f%%)",
                           symbol, sell_qty, cur_price, pnl_pct * 100)
 
         # ── Step B2: Second partial at measured move or +20% — sell 33%, tighten ─
         elif (sym.get("partial1_done") and
+              not sym.get("_b1_fill_pending") and   # don't fire B2 until B1 confirmed filled
               pnl_pct >= partial2_trigger and
               not sym.get("partial2_done")):
             already_sold = sym.get("partial_qty", 0)
@@ -1741,7 +1761,7 @@ def check_positions() -> None:
                         period="90d", interval="1d", auto_adjust=True)["Close"]
                     if len(_df_f) >= 22 and len(_spy_f) >= 22:
                         _c_f  = _df_f["Close"]
-                        _rs_f = (_c_f / _spy_f.reindex(_c_f.index, method="nearest")).dropna()
+                        _rs_f = (_c_f / _spy_f.reindex(_c_f.index, method="ffill")).dropna()
                         if len(_rs_f) >= 10:
                             _rs_f_high      = float(_rs_f.max())
                             _rs_f_now       = float(_rs_f.iloc[-1])

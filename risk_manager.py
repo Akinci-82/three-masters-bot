@@ -115,8 +115,11 @@ def _kelly_factor(composite_score: float = 0.0) -> float:
         base_kelly = 1.0
 
     # Loss-streak dampener: reduce sizing after consecutive losses
+    # _RISK_LOCK is held inside _load() (RLock — re-entrant), but we also wrap here
+    # so the read + comparison is atomic versus _update_streak() from the monitor thread.
     try:
-        streak = _load().get("consecutive_losses", 0)
+        with _RISK_LOCK:
+            streak = _load().get("consecutive_losses", 0)
         if streak >= 5:
             streak_mult = 0.40   # 5+ losses in a row — severe size reduction
         elif streak >= 3:

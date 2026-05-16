@@ -517,19 +517,25 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         if price * avg_vol < cfg.get("min_dollar_volume", 5_000_000):
             return TrendResult(symbol=symbol, passed=False, price=price, fail_reason="dollar_volume_too_low")
 
-        ma20  = float(close.rolling(20).mean().iloc[-1])
-        ma50  = float(close.rolling(50).mean().iloc[-1])
-        ma150 = float(close.rolling(150).mean().iloc[-1])
-        ma200 = float(close.rolling(200).mean().iloc[-1])
+        def _lv(s: pd.Series) -> float | None:
+            v = s.dropna()
+            return float(v.iloc[-1]) if len(v) else None
 
-        ma200_series  = close.rolling(200).mean()
-        ma200_20d_ago = float(ma200_series.iloc[-20]) if len(ma200_series) >= 220 else ma200
-        ma200_slope   = (ma200 - ma200_20d_ago) / ma200_20d_ago
+        ma20  = _lv(close.rolling(20).mean())
+        ma50  = _lv(close.rolling(50).mean())
+        ma150 = _lv(close.rolling(150).mean())
+        ma200 = _lv(close.rolling(200).mean())
+        if None in (ma20, ma50, ma150, ma200):
+            return TrendResult(symbol=symbol, passed=False, price=price, fail_reason="insufficient_data")
 
-        high_52w     = float(close.tail(252).max())
-        low_52w      = float(close.tail(252).min())
-        pct_from_high = (price - high_52w) / high_52w
-        pct_from_low  = (price - low_52w) / low_52w
+        ma200_series  = close.rolling(200).mean().dropna()
+        ma200_20d_ago = float(ma200_series.iloc[-20]) if len(ma200_series) >= 20 else ma200
+        ma200_slope   = (ma200 - ma200_20d_ago) / ma200_20d_ago if ma200_20d_ago != 0 else 0.0
+
+        high_52w      = float(close.tail(252).max())
+        low_52w       = float(close.tail(252).min())
+        pct_from_high = (price - high_52w) / high_52w if high_52w != 0 else 0.0
+        pct_from_low  = (price - low_52w)  / low_52w  if low_52w  != 0 else 0.0
 
         rs  = _rs_rating(close, spy_close)
         rsi = _calc_rsi(close, cfg.get("rsi_period", 14))
@@ -734,24 +740,6 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                         _log.info("[screen] %s RS weekly CONFIRMED — daily+weekly at 52w high", symbol)
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
-        # 3-weeks tight: price H-L range <=1.5% across 3 consecutive weeks
-        # Minervini's strongest compression signal — coiled spring before explosive move
-        _three_wt = False
-        try:
-            _wk = ticker.history(period="4mo", interval="1wk", auto_adjust=True)
-            if len(_wk) >= 4:
-                for _wi in range(len(_wk) - 1, max(len(_wk) - 7, 1), -1):
-                    _w3 = _wk.iloc[max(_wi - 2, 0):_wi + 1]
-                    if len(_w3) == 3:
-                        _rng = (_w3["High"].max() - _w3["Low"].min()) / float(_w3["Low"].min())
-                        if _rng <= 0.015:
-                            _three_wt = True
-                            break
-        except Exception:
-            _log.debug("[%s] suppressed", __name__, exc_info=True)
-        result.three_weeks_tight = _three_wt
-        if _three_wt:
-            _log.info("[screen] %s 3-WEEKS TIGHT — elite Minervini compression", symbol)
 
         # OBV: On-Balance Volume at/near 52-week high = institutional buying in base
         _obv_nh = False
@@ -1057,6 +1045,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.three_weeks_tight = _twt
+        if _twt:
+            _log.info("[screen] %s 3-WEEKS TIGHT — elite O'Neil close compression", symbol)
 
         # Short interest monthly change: rapid build = bearish, rapid cover = squeeze fuel
         _si_pts = 0.0
