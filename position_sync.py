@@ -55,7 +55,9 @@ def _load_risk() -> dict:
 
 def _save_risk(data: dict) -> None:
     _RISK_FILE.parent.mkdir(exist_ok=True)
-    _RISK_FILE.write_text(json.dumps(data, indent=2, default=str))
+    _tmp = _RISK_FILE.with_suffix(".json.tmp")
+    _tmp.write_text(json.dumps(data, indent=2, default=str))
+    _tmp.replace(_RISK_FILE)
 
 
 def _load_monitor() -> dict:
@@ -69,7 +71,9 @@ def _load_monitor() -> dict:
 
 def _save_monitor(data: dict) -> None:
     _MONITOR_STATE.parent.mkdir(exist_ok=True)
-    _MONITOR_STATE.write_text(json.dumps(data, indent=2, default=str))
+    _tmp = _MONITOR_STATE.with_suffix(".json.tmp")
+    _tmp.write_text(json.dumps(data, indent=2, default=str))
+    _tmp.replace(_MONITOR_STATE)
 
 
 def _audit(entry: dict) -> None:

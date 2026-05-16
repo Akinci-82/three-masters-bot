@@ -146,7 +146,7 @@ def load_universe() -> list[str]:
     symbols.update(_QUALITY_CORE)
 
     symbols -= _BAD_SYMBOLS
-    result = sorted(s for s in symbols if s and s.isalpha() or "-" in s)
+    result = sorted(s for s in symbols if s and (s.isalpha() or "-" in s))
     _log.info("[screen] Final universe: %d symbols", len(result))
     _save_universe_cache(result)
     return result

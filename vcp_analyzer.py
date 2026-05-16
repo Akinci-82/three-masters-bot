@@ -44,6 +44,7 @@ _VCP_CACHE  = LOG_DIR / "vcp_cache.json"
 
 _VCP_CACHE_LOCK = threading.Lock()
 _spy_weekly_cache: dict = {}  # {"df": pd.DataFrame, "ts": float}
+_SPY_WEEKLY_CACHE_LOCK = threading.Lock()
 
 
 def _load_vcp_cache() -> dict:
@@ -100,7 +101,7 @@ def _deserialize_result(d: dict):
         typ = str(fld.type)
         try:
             if "bool" in typ:
-                kwargs[name] = bool(raw)
+                kwargs[name] = raw is True or (isinstance(raw, str) and raw.lower() == "true")
             elif "int" in typ:
                 kwargs[name] = int(raw)
             elif "float" in typ:
@@ -440,15 +441,16 @@ def _get_weekly_context(symbol: str, df: pd.DataFrame) -> str:
             return ""
 
         _now = _t.time()
-        if "df" in _spy_weekly_cache and _now - _spy_weekly_cache.get("ts", 0) < 14400:
-            spy_wk = _spy_weekly_cache["df"]
-        else:
-            try:
-                spy_wk = yf.Ticker("SPY").history(period="6mo", interval="1wk", auto_adjust=True)
-                _spy_weekly_cache["df"] = spy_wk
-                _spy_weekly_cache["ts"] = _now
-            except Exception:
-                spy_wk = pd.DataFrame()
+        with _SPY_WEEKLY_CACHE_LOCK:
+            if "df" in _spy_weekly_cache and _now - _spy_weekly_cache.get("ts", 0) < 14400:
+                spy_wk = _spy_weekly_cache["df"]
+            else:
+                try:
+                    spy_wk = yf.Ticker("SPY").history(period="6mo", interval="1wk", auto_adjust=True)
+                    _spy_weekly_cache["df"] = spy_wk
+                    _spy_weekly_cache["ts"] = _now
+                except Exception:
+                    spy_wk = pd.DataFrame()
 
         weekly["ma10w"] = weekly["Close"].rolling(10, min_periods=5).mean()
         w20 = weekly.tail(20)

@@ -110,7 +110,8 @@ def _cmd_positions() -> str:
         _mon_state: dict = {}
         try:
             if _o.path.exists(_state_path):
-                _mon_state = _j.loads(open(_state_path).read())
+                with open(_state_path) as _f:
+                    _mon_state = _j.loads(_f.read())
         except Exception:
             pass
 
@@ -120,7 +121,7 @@ def _cmd_positions() -> str:
             qty      = int(float(p["qty"]))
             avg      = float(p["avg_entry_price"])
             cur      = float(p["current_price"])
-            pnl_pct  = (cur - avg) / avg * 100
+            pnl_pct  = (cur - avg) / avg * 100 if avg != 0 else 0.0
             pnl_usd  = (cur - avg) * qty
             tag      = "📈" if pnl_pct >= 0 else "📉"
 

@@ -280,11 +280,17 @@ def run_backtest(symbols: list[str], start: str, end: str,
             if len(fwd) < 2:
                 continue
 
-            # Entry: buy-stop at breakout level or next-day open if already above
-            entry_candidate = bl if bl > 0 else float(fwd.iloc[0]["Open"])
-            entry_price = max(float(fwd.iloc[0]["Open"]), entry_candidate)
+            # Entry: buy-stop at breakout level or next-day open if already above.
+            # Lookahead guard: if bl > open, the stop order only fills when high >= bl.
+            # Without this check we'd simulate a fill that never happened.
+            _fwd0_open = float(fwd.iloc[0]["Open"])
+            _fwd0_high = float(fwd.iloc[0]["High"])
+            entry_candidate = bl if bl > 0 else _fwd0_open
+            entry_price = max(_fwd0_open, entry_candidate)
             if entry_price <= 0:
                 continue
+            if entry_price > _fwd0_open and _fwd0_high < entry_price:
+                continue  # buy-stop never triggered on entry day
 
             result = _sim_trade(fwd.iloc[1:], entry_price)
             result.update({

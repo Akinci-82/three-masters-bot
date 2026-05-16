@@ -1252,7 +1252,7 @@ def check_positions() -> None:
                 if _days_earn is not None:
                     sym["days_to_earnings"] = _days_earn
                     if _days_earn <= 5:
-                        _remaining = qty - sym.get("partial_qty", 0) - sym.get("partial2_qty", 0)
+                        _remaining = qty - sym.get("partial_qty", 0)  # partial_qty is cumulative (B1+B2)
                         if pnl_pct >= 0.03 and not sym.get("breakeven_done"):
                             # Profitable → protect with breakeven stop
                             _cancel_stop_orders(symbol)
