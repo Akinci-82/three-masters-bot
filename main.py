@@ -138,6 +138,9 @@ def _heartbeat() -> None:
         _log.warning("[heartbeat] Failed: %s", e)
 
 
+# ── Scan phase tracker (for crash reports) ────────────────────────────────────
+_scan_phase: str = "idle"
+
 # ── Equity baseline tracking ──────────────────────────────────────────────────
 _BASELINE_FILE = LOG_DIR / "equity_baseline.json"
 
@@ -174,6 +177,91 @@ def _equity_return_str(current: float) -> str:
     pct   = (current - start) / start * 100
     arrow = "📈" if pct >= 0 else "📉"
     return f"{arrow} Return since {baseline['start_date']}: {pct:+.1f}% (${current - start:+,.0f})"
+
+
+# ── Portfolio drawdown early-warning ─────────────────────────────────────────
+_last_dd_warn_date: str = ""
+
+
+def _check_portfolio_drawdown_warning(portfolio_value: float) -> None:
+    """Send Telegram warning if portfolio is >5% below equity-history peak. Once per day."""
+    global _last_dd_warn_date
+    _today_str = str(date.today())
+    if _last_dd_warn_date == _today_str:
+        return
+    try:
+        _eq_path = LOG_DIR / "equity_history.jsonl"
+        if not _eq_path.exists():
+            return
+        _history = []
+        with open(_eq_path) as _ef:
+            for _line in _ef:
+                _line = _line.strip()
+                if _line:
+                    try:
+                        _history.append(json.loads(_line))
+                    except Exception:
+                        pass
+        if not _history:
+            return
+        _peak = max(h["value"] for h in _history if h.get("value", 0) > 0)
+        if _peak <= 0:
+            return
+        _dd = (portfolio_value - _peak) / _peak
+        if _dd <= -0.05:
+            _last_dd_warn_date = _today_str
+            _tg(
+                f"⚠️ *Portfolio Drawdown Warning*\n"
+                f"Portfölj ${portfolio_value:,.0f} — {_dd*100:.1f}% från peak ${_peak:,.0f}\n"
+                f"Handel fortsätter — men överväg att minska risken."
+            )
+    except Exception as _dde:
+        _log.debug("[main] dd_warn: %s", _dde)
+
+
+# ── Bot idle alert ─────────────────────────────────────────────────────────────
+_last_idle_check_date: str = ""
+
+
+def _check_bot_idle_alert() -> None:
+    """Alert if no new trade journal entries in >10 trading days. Once per day."""
+    global _last_idle_check_date
+    _today_str = str(date.today())
+    if _last_idle_check_date == _today_str:
+        return
+    _last_idle_check_date = _today_str
+    try:
+        import pandas as _pd_idle
+        _journal = LOG_DIR / "trade_journal.jsonl"
+        if not _journal.exists():
+            return
+        _last_ts = None
+        with open(_journal) as _jf:
+            for _jl in _jf:
+                _jl = _jl.strip()
+                if not _jl:
+                    continue
+                try:
+                    _je = json.loads(_jl)
+                    _ts = _je.get("ts", "")
+                    if _ts:
+                        _last_ts = _ts
+                except Exception:
+                    pass
+        if not _last_ts:
+            return
+        _last_dt = _pd_idle.Timestamp(_last_ts)
+        _now_dt  = _pd_idle.Timestamp.now()
+        _bdays   = max(0, len(_pd_idle.bdate_range(_last_dt.normalize(), _now_dt.normalize())) - 1)
+        if _bdays >= 10:
+            _tg(
+                f"ℹ️ *Bot inaktiv — {_bdays} handelsdagar utan trade*\n"
+                f"Senaste trade: {_last_dt.strftime('%Y-%m-%d')}\n"
+                f"Möjliga orsaker: bear-läge, högt min\\_confidence, inga VCP-mönster,"
+                f" eller för strikta screener-filter."
+            )
+    except Exception as _idle_e:
+        _log.debug("[main] idle_alert: %s", _idle_e)
 
 
 # ── Morning briefing (15:15 CEST = 09:15 ET, 15 min before US open) ──────────
@@ -2292,6 +2380,8 @@ def _run_daily_impl():
     }
 
     # ── Account check ─────────────────────────────────────────────────────────
+    global _scan_phase
+    _scan_phase = "account"
     try:
         from broker import get_account, get_positions, get_open_orders
         acct = get_account()
@@ -2303,6 +2393,8 @@ def _run_daily_impl():
 
         _save_equity_baseline(portfolio_value)
         ret_line = _equity_return_str(portfolio_value)
+        _check_portfolio_drawdown_warning(portfolio_value)
+        _check_bot_idle_alert()
 
         _tg(f"🎯 *Three Masters* — Daily scan starting\n"
             f"Portfolio: ${portfolio_value:,.0f} | Cash: ${cash:,.0f} | "
@@ -2319,6 +2411,7 @@ def _run_daily_impl():
     # ── Position sync — MUST succeed before any trading is allowed ───────────
     # SyncError means Alpaca is unreachable — abort the scan entirely.
     # Never proceed with unverified state, especially with real money.
+    _scan_phase = "sync"
     from position_sync import sync_all as _sync_all, log_full_state, SyncError
     try:
         _sync_all()
@@ -2332,11 +2425,13 @@ def _run_daily_impl():
         return
 
     # ── Risk state ────────────────────────────────────────────────────────────
+    _scan_phase = "risk_init"
     from risk_manager import check_can_trade, daily_reset, get_state
     daily_reset(portfolio_value)   # stores day_start_equity for close_trade P&L tracking
     risk_state = get_state()
 
     # ── Hard timeout ceiling: 20 min for the entire scan ─────────────────────
+    _scan_phase = "screener"
     signal.alarm(_SCAN_TIMEOUT_SEC)
     try:
         _run_scan(report, today, portfolio_value, cash, positions)
@@ -2496,6 +2591,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _heartbeat()   # Layer 1 done — screener can take 10-20 min
 
     # ── Layer 2: Minervini — VCP Analysis ────────────────────────────────────
+    _scan_phase = "vcp"
     _log.info("\n[LAYER 2 — MINERVINI] VCP pattern analysis...")
     try:
         from vcp_analyzer import batch_analyze
@@ -3770,10 +3866,19 @@ def main():
             break
 
         try:
+            _scan_phase = "idle"
             run_daily()
         except Exception as e:
+            import traceback as _tb_mod
+            _tb_lines = _tb_mod.format_exc().splitlines()
+            _tb_short = "\n".join(_tb_lines[-8:])
             _log.exception("[main] Daily run crashed: %s", e)
-            _tg(f"❌ Three Masters — daily run crashed: {e}")
+            _tg(
+                f"❌ *Three Masters — scan kraschade*\n"
+                f"Fas: `{_scan_phase}`\n"
+                f"Fel: `{str(e)[:200]}`\n"
+                f"```\n{_tb_short[:500]}\n```"
+            )
 
     _log.info("[main] Shutdown complete.")
 

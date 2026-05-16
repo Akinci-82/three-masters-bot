@@ -177,15 +177,203 @@ def _cmd_cancel(symbol: str) -> str:
         return f"Error cancelling {symbol}: {e}"
 
 
+def _cmd_watchlist() -> str:
+    """Show Stage 2 radar candidates from latest scan (trend_candidates without VCP)."""
+    try:
+        import json as _j, glob as _g, os as _o
+        _rdir = _o.path.join(_o.path.dirname(__file__), "reports")
+        _files = sorted(_g.glob(_o.path.join(_rdir, "*.json")), reverse=True)
+        if not _files:
+            return "📡 Ingen scan-rapport hittad ännu."
+        with open(_files[0]) as _f:
+            _rpt = _j.load(_f)
+        _cands = _rpt.get("trend_candidates", [])
+        _date  = _rpt.get("date", "?")
+        if not _cands:
+            return f"📡 Inga Stage 2-kandidater i senaste scan ({_date})."
+        _lines = [
+            f"📡 *Watchlist — Stage 2 radar ({_date})*",
+            f"_{len(_cands)} aktier i uptrend utan VCP-mönster ännu_",
+        ]
+        for _c in _cands[:15]:
+            _sym  = _tg_escape(_c.get("symbol", "?"))
+            _rs   = _c.get("rs_rating", 0)
+            _pfh  = abs(_c.get("pct_from_high", 0)) * 100
+            _sect = _c.get("sector", "")[:12]
+            _bd   = []
+            if _c.get("three_weeks_tight"): _bd.append("3WT")
+            if _c.get("rs_line_leading"):   _bd.append("RS↑")
+            if _c.get("unusual_options"):   _bd.append("🐋")
+            if _c.get("pead_hold"):         _bd.append("PEAD")
+            if _c.get("eps_accelerating"):  _bd.append("EPS↑")
+            _b = " ".join(_bd)
+            _lines.append(f"  *{_sym}* RS={_rs:.0f} {_pfh:.1f}%↓  {_sect}  {_b}".rstrip())
+        return "\n".join(_lines)
+    except Exception as _e:
+        return f"Fel vid hämtning av watchlist: {_e}"
+
+
+def _cmd_briefing() -> str:
+    """Trigger morning briefing immediately in background thread."""
+    try:
+        import main as _m, threading as _thr
+        def _bg():
+            try:
+                _m._send_morning_briefing()
+            except Exception as _be:
+                _send(f"❌ Briefing-fel: {_be}")
+        _thr.Thread(target=_bg, daemon=True, name="tg-briefing").start()
+        return "🌅 Kör morning briefing… (levereras om några sekunder)"
+    except Exception as _e:
+        return f"Fel vid triggning av briefing: {_e}"
+
+
+def _cmd_size(arg: str) -> str:
+    """Position size calculator: /size SYMBOL BUY_PRICE STOP_PRICE"""
+    _parts = arg.strip().split()
+    if len(_parts) < 3:
+        return (
+            "📐 *Positionsstorlek-kalkylator*\n"
+            "Användning: `/size SYMBOL BUY STOP`\n"
+            "Exempel: `/size NVDA 500 475`"
+        )
+    try:
+        _sym = _tg_escape(_parts[0].upper())
+        _buy = float(_parts[1])
+        _sl  = float(_parts[2])
+        if _sl >= _buy:
+            return "❌ Stop loss måste vara under köp-priset."
+        from broker import get_account
+        _acct      = get_account()
+        _portfolio = float(_acct["portfolio_value"])
+        # 1.5% basrisk (standard), 1.75% för score≥7
+        _risk_base  = _portfolio * 0.015
+        _risk_mid   = _portfolio * 0.0175
+        _risk_hi    = _portfolio * 0.02
+        _rps        = _buy - _sl
+        _sh_base    = max(1, round(_risk_base / _rps))
+        _sh_mid     = max(1, round(_risk_mid  / _rps))
+        _sh_hi      = max(1, round(_risk_hi   / _rps))
+        return (
+            f"📐 *Size — {_sym}*\n"
+            f"Portfolio: ${_portfolio:,.0f}\n"
+            f"Köp ${_buy:.2f} | Stop ${_sl:.2f} | Risk/sh ${_rps:.2f}\n"
+            f"\n"
+            f"1.5% risk  → *{_sh_base} sh*  (${_sh_base*_buy:,.0f} notional)\n"
+            f"1.75% risk → *{_sh_mid} sh*  (${_sh_mid*_buy:,.0f} notional)\n"
+            f"2.0% risk  → *{_sh_hi} sh*  (${_sh_hi*_buy:,.0f} notional)"
+        )
+    except ValueError:
+        return "❌ Ogiltiga siffror. Exempel: `/size NVDA 500 475`"
+    except Exception as _e:
+        return f"Fel: {_e}"
+
+
+def _cmd_report() -> str:
+    """Show summary of latest daily scan report."""
+    try:
+        import json as _j, glob as _g, os as _o
+        _rdir  = _o.path.join(_o.path.dirname(__file__), "reports")
+        _files = sorted(_g.glob(_o.path.join(_rdir, "*.json")), reverse=True)
+        if not _files:
+            return "📋 Ingen scan-rapport hittad ännu."
+        with open(_files[0]) as _f:
+            _rpt = _j.load(_f)
+        _date    = _rpt.get("date", "?")
+        _regime  = _rpt.get("regime", "?")
+        _vix     = _rpt.get("vix", 0)
+        _spy_pct = _rpt.get("spy_pct", 0) * 100
+        _n_trend = len(_rpt.get("trend_passed", []))
+        _n_vcp   = len(_rpt.get("vcp_passed", []))
+        _orders  = _rpt.get("orders_placed", [])
+        _summary = _rpt.get("summary", "")
+        _errors  = _rpt.get("errors", [])
+        _rem     = {"bull": "🟢", "neutral": "🟡", "bear": "🔴"}
+        _emo     = _rem.get(_regime, "⚪")
+        _lines   = [
+            f"📋 *Scan-rapport — {_date}*",
+            f"{_emo} {_regime}  SPY {_spy_pct:+.1f}%  VIX {_vix:.1f}",
+            f"Trend: {_n_trend}  VCP: {_n_vcp}  Ordrar: {len(_orders)}",
+        ]
+        if _summary:
+            _lines.append(f"Status: `{_summary}`")
+        if _orders:
+            _lines.append("\n*Lagda ordrar:*")
+            for _o_r in _orders[:5]:
+                _s  = _tg_escape(_o_r.get("symbol", "?"))
+                _sc = _o_r.get("composite_score", 0)
+                _en = _o_r.get("buy_stop", 0)
+                _st = _o_r.get("stop_loss", 0)
+                _lines.append(f"  *{_s}*  score {_sc:.1f}  entry ${_en:.2f}  SL ${_st:.2f}")
+        _cands = _rpt.get("trend_candidates", [])[:5]
+        if _cands:
+            _lines.append("\n*Radar (Stage 2, ej VCP):*")
+            for _c in _cands:
+                _cs = _tg_escape(_c.get("symbol", "?"))
+                _cr = _c.get("rs_rating", 0)
+                _lines.append(f"  {_cs}  RS={_cr:.0f}")
+        if _errors:
+            _lines.append(f"\n⚠️ Fel: {', '.join(str(_e) for _e in _errors[:3])}")
+        return "\n".join(_lines)
+    except Exception as _e:
+        return f"Fel vid hämtning av rapport: {_e}"
+
+
+def _cmd_risk() -> str:
+    """Quick risk state: heat, drawdown, streak, next scan time."""
+    try:
+        import datetime as _dt
+        from risk_manager import get_state
+        _s      = get_state()
+        _heat   = _s.get("open_risk_pct", 0) * 100
+        _dpnl   = _s.get("daily_pnl_pct", 0) * 100
+        _losses = _s.get("consecutive_losses", 0)
+        _wins   = _s.get("consecutive_wins", 0)
+        _halted = _s.get("trading_halted", False)
+        _halt_r = _s.get("halt_reason", "")
+        _regime = _s.get("confirmed_regime", _s.get("regime", "?"))
+        _emo    = {"bull": "🟢", "neutral": "🟡", "bear": "🔴"}.get(_regime, "⚪")
+        # Next scan at 22:30 local time
+        _now  = _dt.datetime.now()
+        _next = _now.replace(hour=22, minute=30, second=0, microsecond=0)
+        if _now >= _next:
+            _next += _dt.timedelta(days=1)
+        _mins = int((_next - _now).total_seconds() / 60)
+        _streak_str = (f"📉 {_losses} förluster i rad" if _losses > 0
+                       else (f"📈 {_wins} vinster i rad" if _wins > 0 else "Ingen svit"))
+        _halt_str = f"\n⛔ *HALT*: {_halt_r}" if _halted else ""
+        return (
+            f"⚡ *Risk State*\n"
+            f"{_emo} Regim: *{_regime}*\n"
+            f"Heat: {_heat:.1f}% / 8%  |  Dag P&L: {_dpnl:+.1f}%\n"
+            f"{_streak_str}\n"
+            f"Nästa scan: om {_mins // 60}h {_mins % 60}m"
+            f"{_halt_str}"
+        )
+    except Exception as _e:
+        return f"Fel vid hämtning av risk-state: {_e}"
+
+
 def _cmd_help() -> str:
     return (
-        "🤖 *Three Masters Bot Commands*\n"
+        "🤖 *Three Masters Bot — Kommandon*\n"
+        "\n"
+        "*Övervakning:*\n"
         "/status — equity, heat, P&L\n"
-        "/orders — pending buy-stop orders\n"
-        "/positions — open positions with P&L\n"
-        "/cancel SYMBOL — cancel buy-stop for a symbol\n"
-        "/scan — run today's VCP scan now\n"
-        "/help — this message"
+        "/risk — snabb riskstatus (heat, drawdown, streak)\n"
+        "/report — senaste scan-rapport (regime, VCP, ordrar)\n"
+        "/watchlist — Stage 2-radar utan VCP-mönster ännu\n"
+        "\n"
+        "*Positioner & ordrar:*\n"
+        "/positions — öppna positioner med P&L och steg\n"
+        "/orders — väntande buy-stop-ordrar\n"
+        "/cancel SYMBOL — avboka köp-stop för symbol\n"
+        "/size SYMBOL BUY STOP — positionsstorlek-kalkylator\n"
+        "\n"
+        "*Åtgärder:*\n"
+        "/scan — kör dagens VCP-scan manuellt\n"
+        "/briefing — utlös morning briefing nu\n"
+        "/help — denna lista"
     )
 
 
@@ -207,36 +395,46 @@ def _handle_update(update: dict) -> None:
 
     if cmd == "/status":
         _send(_cmd_status())
+    elif cmd == "/risk":
+        _send(_cmd_risk())
+    elif cmd == "/report":
+        _send(_cmd_report())
+    elif cmd == "/watchlist":
+        _send(_cmd_watchlist())
     elif cmd == "/orders":
         _send(_cmd_orders())
     elif cmd == "/positions":
         _send(_cmd_positions())
     elif cmd == "/cancel":
         if not arg:
-            _send("Usage: /cancel SYMBOL  (e.g. /cancel BG)")
+            _send("Anv\u00e4ndning: /cancel SYMBOL  (t.ex. /cancel NVDA)")
         else:
             _send(_cmd_cancel(arg))
+    elif cmd == "/size":
+        _send(_cmd_size(arg))
+    elif cmd == "/briefing":
+        _send(_cmd_briefing())
     elif cmd == "/scan":
         try:
             import main as _main_mod
             if not _main_mod._SCAN_LOCK.acquire(blocking=False):
-                _send("\u23f3 A scan is already running \u2014 results will come when it finishes.")
+                _send("\u23f3 En scan k\u00f6rs redan \u2014 resultaten kommer n\u00e4r den \u00e4r klar.")
             else:
                 _main_mod._SCAN_LOCK.release()
-                _send("\ud83d\udd0d Running manual scan\u2026 (2\u20135 min)")
+                _send("\ud83d\udd0d K\u00f6r manuell scan\u2026 (2\u20135 min)")
                 import threading as _thr
                 def _bg_scan(_send_fn=_send, _m=_main_mod):
                     try:
                         _m.run_daily()
                     except Exception as _e:
-                        _send_fn(f"\u274c Scan error: {_e}")
+                        _send_fn(f"\u274c Scan-fel: {_e}")
                 _thr.Thread(target=_bg_scan, daemon=True, name="tg-manual-scan").start()
         except Exception as _scan_ex:
-            _send(f"\u274c Could not start scan: {_scan_ex}")
+            _send(f"\u274c Kunde inte starta scan: {_scan_ex}")
     elif cmd == "/help":
         _send(_cmd_help())
     else:
-        _send(f"Unknown command: {cmd}\nTry /help")
+        _send(f"Ok\u00e4nt kommando: {cmd}\nPr\u00f6va /help")
 
 
 def _poll_loop(stop_event: threading.Event) -> None:
