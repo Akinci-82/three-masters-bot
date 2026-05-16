@@ -604,10 +604,11 @@ def _opening_range_check() -> None:
                 _vwap_ok = True
                 try:
                     if not df1.empty and len(df1) >= 2:
-                        _tp   = (df1["High"] + df1["Low"] + df1["Close"]) / 3
-                        _vwap = float((_tp * df1["Volume"]).cumsum().iloc[-1]
-                                      / df1["Volume"].cumsum().iloc[-1])
-                        _vwap_ok = cur_price >= _vwap * 0.995
+                        _tp      = (df1["High"] + df1["Low"] + df1["Close"]) / 3
+                        _cum_vol = float(df1["Volume"].cumsum().iloc[-1])
+                        if _cum_vol > 0:
+                            _vwap = float((_tp * df1["Volume"]).cumsum().iloc[-1] / _cum_vol)
+                            _vwap_ok = cur_price >= _vwap * 0.995
                         if not _vwap_ok:
                             _log.info("[or_check] %s price $%.2f below VWAP $%.2f",
                                       sym, cur_price, _vwap)

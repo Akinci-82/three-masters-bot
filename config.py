@@ -196,5 +196,16 @@ def _validate_config() -> None:
     _chk(bool(ALPACA_API_KEY), "ALPACA_API_KEY is not set")
     _chk(bool(ALPACA_SECRET_KEY), "ALPACA_SECRET_KEY is not set")
 
+    # Sector cap must not exceed total position cap
+    _chk(r.get("max_positions_per_sector", 1) <= r["max_positions"],
+         f"max_positions_per_sector ({r.get('max_positions_per_sector')}) > max_positions ({r['max_positions']})")
+
+    # Refuse to proceed if URL is not a paper endpoint — hard guard against live-account accidents
+    _chk("paper" in ALPACA_BASE_URL.lower(),
+         f"ALPACA_BASE_URL '{ALPACA_BASE_URL}' does not contain 'paper' — refusing to run against live account")
+
     if errors:
         raise ValueError("Config validation failed:\n" + "\n".join(f"  • {e}" for e in errors))
+
+
+_validate_config()

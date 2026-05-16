@@ -91,7 +91,7 @@ def _cmd_orders() -> str:
             return "No pending buy-stop orders."
         lines = [f"⏳ *Pending buy-stops ({len(orders)}):*"]
         for o in orders:
-            lines.append(f"  *{_tg_escape(o['symbol'])}* {int(o['qty'])}sh @ ${o['stop_price']:.2f}")
+            lines.append(f"  *{_tg_escape(o.get('symbol', '?'))}* {int(float(o.get('qty', 0)))}sh @ ${float(o.get('stop_price', 0)):.2f}")
         return "\n".join(lines)
     except Exception as e:
         return f"Error fetching orders: {e}"

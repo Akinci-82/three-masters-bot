@@ -1697,7 +1697,7 @@ def check_positions() -> None:
                 and 0.12 <= pnl_pct < partial2_trigger):
             _pyr_days = _trading_days_held(sym.get("entry_date", ""))
             if _pyr_days >= 3:
-                _pyr_qty = max(1, round(sym.get("initial_qty", qty) * 0.30))
+                _pyr_qty = max(1, round(qty * 0.30))
                 _pyr_above_ma20 = False
                 try:
                     _df_pyr = _get_hist(symbol)
@@ -2377,7 +2377,13 @@ def check_positions() -> None:
             _cid_st = _ost.getenv("TELEGRAM_CHAT_ID", "")
             if _tok_st and _cid_st:
                 _cur_p   = next((p for p in positions if p["symbol"] == _sym_st), None)
-                _pnl_st  = float(_cur_p.get("unrealized_plpc", 0)) * 100 if _cur_p else 0.0
+                if _cur_p:
+                    _raw_plpc = float(_cur_p.get("unrealized_plpc", 0))
+                    if not (-1.0 <= _raw_plpc <= 5.0):
+                        _log.warning("[monitor] %s unrealized_plpc=%.4f outside expected [-1, 5] — check Alpaca API format", _sym_st, _raw_plpc)
+                    _pnl_st = _raw_plpc * 100
+                else:
+                    _pnl_st = 0.0
                 _days_st = _trading_days_held(_ed_st)
                 _rqst.post(
                     f"https://api.telegram.org/bot{_tok_st}/sendMessage",

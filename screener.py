@@ -66,10 +66,12 @@ def _save_universe_cache(symbols: list[str]) -> None:
     try:
         import json
         _UNIVERSE_CACHE.parent.mkdir(exist_ok=True)
-        _UNIVERSE_CACHE.write_text(json.dumps({
+        _tmp = _UNIVERSE_CACHE.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps({
             "saved_at": datetime.now().isoformat(),
             "symbols": symbols,
         }))
+        _tmp.replace(_UNIVERSE_CACHE)
     except Exception as e:
         _log.warning("[screen] Universe cache save failed: %s", e)
 
@@ -438,6 +440,7 @@ def _get_fundamentals(ticker) -> tuple:
             float(inst_raw) if inst_raw is not None else None,
         )
     except Exception:
+        _log.debug("[screen] %s fundamentals fetch failed", getattr(ticker, "ticker", "?"), exc_info=True)
         return None, None, None, None, None, None, None, None
 
 
@@ -1197,6 +1200,8 @@ def get_sector(symbol: str) -> str:
     except Exception:
         sector = "Unknown"
     _sector_mem[symbol] = sector
+    if len(_sector_mem) > 512:
+        _sector_mem.pop(next(iter(_sector_mem)))
     try:
         _SECTOR_CACHE_FILE.parent.mkdir(exist_ok=True)
         _SECTOR_CACHE_FILE.write_text(_json.dumps(_sector_mem, indent=2))

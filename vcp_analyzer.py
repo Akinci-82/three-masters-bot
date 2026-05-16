@@ -403,6 +403,7 @@ def _call_haiku(symbol: str, prompt: str) -> dict:
         resp = _get_client().messages.create(
             model=_HAIKU_MODEL,
             max_tokens=150,
+            system="Respond with raw JSON only, no markdown fences.",
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
@@ -700,6 +701,11 @@ def _build_opus_prompt(symbol: str, df: pd.DataFrame, sonnet: dict,
 
     prev_analysis = json.dumps(sonnet, indent=2)
 
+    _bl = sonnet.get("breakout_level", 0)
+    _sl_v = sonnet.get("stop_loss", 0)
+    _bl_disp = f"${_bl:.2f}" if _bl else "N/A"
+    _sl_disp = f"${_sl_v:.2f}" if _sl_v else "N/A"
+
     return f"""You are an experienced VCP analyst trained by Mark Minervini. A junior analyst (Sonnet) flagged {symbol} as a potential high-quality VCP setup. Your job: weigh the evidence and give a balanced verdict — trade, watch, or skip. When the risk/reward is favourable and the pattern is mostly sound, lean toward trade or watch rather than skip.
 
 ## Price Data (last {len(recent)} trading days, vol avg={vol_avg:,})
@@ -717,9 +723,9 @@ MA50=${ma50:.2f} | MA200=${ma200:.2f} | Entry candle: {last_candle}
 ## Your Validation Checklist
 1. Do the contraction percentages actually shrink each time? Check the raw bar data.
 2. Is the handle truly low-volume compared to the prior contractions?
-3. Is the proposed breakout level (${ sonnet.get('breakout_level', '?')}) the correct pivot high — or is there a better level?
-4. Is the stop loss (${ sonnet.get('stop_loss', '?')}) logical — just below the handle low, not too wide?
-5. Weigh risk/reward: entry ${sonnet.get('breakout_level','?')} → projected +20-25% move. If the setup is 70%+ sound, prefer "trade" or "watch" over "skip".
+3. Is the proposed breakout level ({_bl_disp}) the correct pivot high — or is there a better level?
+4. Is the stop loss ({_sl_disp}) logical — just below the handle low, not too wide?
+5. Weigh risk/reward: entry {_bl_disp} → projected +20-25% move. If the setup is 70%+ sound, prefer "trade" or "watch" over "skip".
 6. Use "skip" only when a clear disqualifying flaw exists (broken pattern, wrong volume structure, stop too wide).
 
 ## Response (JSON ONLY)

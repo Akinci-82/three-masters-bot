@@ -207,7 +207,7 @@ def position_size(portfolio_value: float, entry_price: float,
                               measured_move, _atr_cap, _atr_pct * 100)
                     measured_move = _atr_cap
     except Exception:
-        _log.debug("[%s] suppressed", __name__, exc_info=True)
+        _log.warning("[risk] ATR fetch failed for %s — measured_move not capped", symbol, exc_info=True)
     rr_ratio = measured_move / risk_per_share
 
     return {

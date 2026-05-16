@@ -30,7 +30,7 @@ def _retry(fn, *args, _retries: int = 3, _backoff: float = 2.0, **kwargs):
     Does not retry on 4xx HTTP errors (client logic errors, not transient).
     """
     import time as _t
-    delay = 1.0
+    delay = 2.0
     for _attempt in range(_retries):
         try:
             return fn(*args, **kwargs)
@@ -198,9 +198,14 @@ def cancel_all_orders(symbol: str | None = None) -> int:
                 get_api().get_orders,
                 GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]),
             )
+            success_count = 0
             for o in orders:
-                _retry(get_api().cancel_order_by_id, str(o.id))
-            return len(orders)
+                try:
+                    _retry(get_api().cancel_order_by_id, str(o.id))
+                    success_count += 1
+                except Exception as _ce:
+                    _log.warning("[broker] cancel_order_by_id %s failed: %s", o.id, _ce)
+            return success_count
         else:
             result = _retry(get_api().cancel_orders)
             return len(result) if result else 0

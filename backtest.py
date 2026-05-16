@@ -190,7 +190,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
 
         # Pyramid (P): add 30% of original qty between +12-20% after B1
         if (partial1_done and not pyramid_done and not partial2_done
-                and entry_price * 1.12 <= cls <= entry_price * 1.20):
+                and entry_price * 1.12 <= hi <= entry_price * 1.20):
             shares       += 0.30
             pyramid_done  = True
 
@@ -368,6 +368,9 @@ def main():
     else:
         print("Loading universe...")
         symbols = load_universe()
+
+    if not symbols:
+        raise ValueError("Universe är tomt — kontrollera universe.txt eller network connectivity")
 
     print(f"Backtest: {len(symbols)} symbols | {start} → {end} | min_score={args.min_score}")
     results = run_backtest(symbols, start, end, min_score=args.min_score)
