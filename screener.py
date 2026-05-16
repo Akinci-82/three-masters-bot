@@ -379,6 +379,8 @@ class TrendResult:
     near_ath: bool            = False  # price within 2% of 3-year high (no major overhead supply)
     weekly_stage2: bool       = False  # MA10w > MA30w AND MA30w slope rising (multi-TF Stage 2)
     rvol_5d: float            = 0.0   # 5d avg vol / 60d avg vol (>1.5 = stock is in play)
+    rvol_10d: float           = 0.0   # today vol / 10d avg (>1.5 = unusual single-day demand)
+    n_accel_quarters: int     = 0     # consecutive quarters of accelerating EPS growth
     weekly_breakout_aligned: bool = False  # daily breakout aligns with weekly 5-week high
     analyst_upgrades: bool    = False  # net analyst upgrades > downgrades in last 60 days
     inst_ownership_increasing: bool = False  # ≥3 institutional holders filed 13F within 90 days
@@ -826,6 +828,18 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.rvol_5d = _rvol_5d
 
+        # RVOL 10-day: today's volume vs 10-day average — single-session demand signal
+        _rvol_10d = 0.0
+        try:
+            if len(df) >= 11:
+                _today_vol  = float(df["Volume"].iloc[-1])
+                _avg10_vol  = float(df["Volume"].iloc[-11:-1].mean())
+                if _avg10_vol > 0:
+                    _rvol_10d = round(_today_vol / _avg10_vol, 2)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
+        result.rvol_10d = _rvol_10d
+
         # Near ATH + weekly Stage 2 + weekly breakout alignment: single 3-year weekly fetch
         _near_ath = False
         _wk_s2    = False
@@ -918,6 +932,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         # Earnings acceleration: EPS growth rate increasing Q-over-Q = core Minervini SEPA criterion
         # Accelerating growth (e.g. +20%,+35%,+50%) signals institutional conviction; decelerating = danger
         _eps_accel = False
+        _n_accel   = 0
         try:
             _qe = ticker.quarterly_earnings
             if _qe is not None and not _qe.empty and len(_qe) >= 4:
@@ -931,9 +946,16 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 if len(_growths) >= 3:
                     _eps_accel = (_growths[-1] > _growths[-2] > _growths[-3]
                                   and _growths[-1] > 0 and _growths[-2] > 0)
+                # Count consecutive accelerating quarters walking backward
+                for _qi_n in range(len(_growths) - 1, 0, -1):
+                    if _growths[_qi_n] > _growths[_qi_n - 1] and _growths[_qi_n] > 0:
+                        _n_accel += 1
+                    else:
+                        break
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
-        result.eps_accelerating = _eps_accel
+        result.eps_accelerating  = _eps_accel
+        result.n_accel_quarters  = _n_accel
 
         # 13-week accumulation score: O'Neil up/down volume weeks ratio
         # ≥8 of last 13 weeks closed up on positive volume = sustained institutional buying

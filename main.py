@@ -1425,6 +1425,37 @@ def _fetch_pcr() -> float:
     return 0.7
 
 
+# ── Sector rotation cache ─────────────────────────────────────────────────────
+_SECTOR_ROT_CACHE: dict = {"ts": 0.0, "ranks": {}}
+
+
+def _get_sector_rotation_ranks() -> dict:
+    """30d ETF momentum → dict[sector_name → rank (1=best)]. Refreshed once/day."""
+    import time as _time_sr
+    if _time_sr.time() - _SECTOR_ROT_CACHE["ts"] < 86400 and _SECTOR_ROT_CACHE["ranks"]:
+        return _SECTOR_ROT_CACHE["ranks"]
+    try:
+        from config import SECTOR_ETF_MAP as _etf_map
+        _etf_rets: dict = {}
+        for _sect, _etf in _etf_map.items():
+            try:
+                _h = yf.Ticker(_etf).history(period="1mo", interval="1d", auto_adjust=True)
+                if len(_h) >= 5:
+                    _etf_rets[_sect] = float(_h["Close"].iloc[-1] / _h["Close"].iloc[0] - 1)
+            except Exception:
+                continue
+        if _etf_rets:
+            _sorted = sorted(_etf_rets, key=_etf_rets.get, reverse=True)
+            _ranks  = {s: i + 1 for i, s in enumerate(_sorted)}
+            _SECTOR_ROT_CACHE["ts"]    = _time_sr.time()
+            _SECTOR_ROT_CACHE["ranks"] = _ranks
+            _log.info("[main] sector rotation ranks: %s", _ranks)
+            return _ranks
+    except Exception as _sre:
+        _log.debug("[main] sector_rotation_ranks: %s", _sre)
+    return _SECTOR_ROT_CACHE.get("ranks", {})
+
+
 def _simons_score(trend) -> float:
     """
     0–10, weight 30%. Trend quality, RS strength, fundamentals (Simons layer).
@@ -1564,13 +1595,32 @@ def _simons_score(trend) -> float:
         pead_pts = 0.0
     # Options flow: unusual OTM call activity → institutional positioning (+0.5p)
     opts_flow_pts = 0.5 if getattr(trend, "unusual_options", False) else 0.0
+    # Multi-quarter EPS acceleration: 3+ consecutive accelerating quarters = highest conviction
+    _n_accel     = getattr(trend, "n_accel_quarters", 0)
+    naccel_pts   = 0.75 if _n_accel >= 3 else (0.25 if _n_accel >= 2 else 0.0)
+    # RVOL10d: today's volume vs 10-day avg >1.5 = unusual single-session demand
+    _rvol10      = getattr(trend, "rvol_10d", 0.0)
+    rvol10_pts   = 0.25 if _rvol10 >= 1.5 else 0.0
+    # Sector rotation: top-2 ETF sectors by 30d momentum get +0.5p; bottom-2 get -0.5p
+    try:
+        from screener import get_sector as _gs
+        _sym_sect = _gs(trend.symbol)
+    except Exception:
+        _sym_sect = ""
+    _sect_ranks  = _get_sector_rotation_ranks()
+    _n_sects     = len(_sect_ranks)
+    _sect_rank   = _sect_ranks.get(_sym_sect, 0)
+    sect_rot_pts = (0.5 if 0 < _sect_rank <= 2
+                    else (-0.5 if _n_sects > 0 and _sect_rank >= _n_sects - 1
+                          else 0.0))
     return min(rs_pts + rs_sig + rsi_pts + hi_pts + sl_pts + eps_pts + trend_pts + rs_delta_pts
                + ad_pts + short_pts + earn_pts + monthly_pts + rev_pts + sec_rs_pts + roe_pts
                + adx_pts + fr_pts + inst_pts + beat_pts + rev_beat_pts + at_52w_pts + accum_pts
                + twt_pts + obv_pts + base_pts + bage_pts + vq_pts + ath_pts + ws2_pts + wba_pts
                + aug_pts + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
                + insider_pts + indleader_pts + rev_accel_pts
-               + twt2_pts + si_mo_pts + apt_pts + ws_pts + pead_pts + opts_flow_pts, 10.0)
+               + twt2_pts + si_mo_pts + apt_pts + ws_pts + pead_pts + opts_flow_pts
+               + naccel_pts + rvol10_pts + sect_rot_pts, 10.0)
 
 
 def _market_follow_through_confirmed() -> bool:

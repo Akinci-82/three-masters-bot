@@ -360,6 +360,23 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
             jf.write(_json.dumps(entry) + "\n")
         _log.info("[monitor] Trade journaled: %s pnl=%.1f%% (%.1fR)",
                   symbol, pnl_pct * 100, r_multiple)
+        try:
+            import requests as _rqjt, os as _osjt
+            _tjt = _osjt.getenv("TELEGRAM_BOT_TOKEN", "")
+            _cjt = _osjt.getenv("TELEGRAM_CHAT_ID", "")
+            if _tjt and _cjt:
+                _sign_jt = "✅" if r_multiple >= 0 else "❌"
+                _rqjt.post(
+                    f"https://api.telegram.org/bot{_tjt}/sendMessage",
+                    json={"chat_id": _cjt, "parse_mode": "Markdown",
+                          "text": (
+                              f"{_sign_jt} *{symbol}* {pnl_pct*100:+.1f}%"
+                              f" ({r_multiple:+.1f}R) via {entry['exit_step']}"
+                              f" | {entry['days_held']}d"
+                          )},
+                    timeout=8)
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
     except Exception as e:
         _log.warning("[monitor] Journal write failed: %s", e)
 
@@ -994,6 +1011,51 @@ def check_positions() -> None:
         # MAE/MFE: track worst (most adverse) and best (most favorable) excursion per position
         sym["mae_pct"] = min(sym.get("mae_pct", pnl_pct), pnl_pct)
         sym["mfe_pct"] = max(sym.get("mfe_pct", pnl_pct), pnl_pct)
+
+        # ── PM-HWM: High-water-mark stop — tighten when >8% pulled back from MFE peak ──
+        # If MFE reached >12% but price has since dropped >8% from that peak (yet pnl >3%),
+        # ratchet stop up to avg_cost × 1.05 to lock in at least 5% profit.
+        _hwm_mfe = sym.get("mfe_pct", 0.0)
+        if (_hwm_mfe > 0.12
+                and pnl_pct > 0.03
+                and pnl_pct < _hwm_mfe - 0.08
+                and not sym.get("hwm_tightened")
+                and sym.get("stop_loss", 0) > 0
+                and not sym.get("max_loss_exited")
+                and not sym.get("time_stopped")):
+            _hwm_stop = round(avg_cost * 1.05, 2)
+            _hwm_old  = sym["stop_loss"]
+            if _hwm_stop > _hwm_old and _hwm_stop < cur_price * 0.99:
+                _runner_hwm = qty - sym.get("partial_qty", 0)
+                if _runner_hwm > 0:
+                    _cancel_stop_orders(symbol)
+                    _hwm_oid = _place_stop(symbol, _runner_hwm, _hwm_stop)
+                    if _hwm_oid:
+                        sym["hwm_tightened"] = True
+                        sym["stop_loss"]      = _hwm_stop
+                        sym["stop_order_id"]  = _hwm_oid
+                        changed = True
+                        _log.info(
+                            "[monitor] %s HWM-STOP: MFE %.1f%% → now %.1f%% "
+                            "(>8%% drawdown from peak) — stop $%.2f → $%.2f",
+                            symbol, _hwm_mfe * 100, pnl_pct * 100, _hwm_old, _hwm_stop)
+                        try:
+                            import requests as _rqhwm, os as _oshwm
+                            _thwm = _oshwm.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _chwm = _oshwm.getenv("TELEGRAM_CHAT_ID", "")
+                            if _thwm and _chwm:
+                                _rqhwm.post(
+                                    f"https://api.telegram.org/bot{_thwm}/sendMessage",
+                                    json={"chat_id": _chwm, "parse_mode": "Markdown",
+                                          "text": (
+                                              f"📉 *HWM Stop — {symbol}*\n"
+                                              f"MFE {_hwm_mfe*100:.1f}% → now {pnl_pct*100:.1f}%"
+                                              f" (>8% drawdown from peak)\n"
+                                              f"Stop: ${_hwm_old:.2f} → ${_hwm_stop:.2f} (+5%)"
+                                          )},
+                                    timeout=8)
+                        except Exception:
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
 
         # ── PM-VWAP: Intraday VWAP weakness — tighten stop 11-14 ET ─────────────
         # If price falls below intraday VWAP with rising volume during 11-14 ET =
@@ -1764,6 +1826,61 @@ def check_positions() -> None:
                         except Exception:
                             _log.debug("[%s] suppressed", __name__, exc_info=True)
 
+        # ── Step E: 21-EMA pullback scale-in (+15% shares) ───────────────────────
+        # Minervini: add to winners on tight pullbacks to the 21-EMA with low volume.
+        # Only fires once per position, requires pnl >5%, vol < 60% of 50d avg,
+        # and MFE ahead of current pnl (not extended past the peak).
+        if (not sym.get("step_e_done")
+                and not sym.get("partial2_done")
+                and pnl_pct > 0.05
+                and sym.get("mfe_pct", 0) > pnl_pct + 0.03):
+            _e_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_step_e_check_date") != _e_today:
+                sym["_step_e_check_date"] = _e_today
+                _e_triggered = False
+                try:
+                    _dfe = _get_hist(symbol)
+                    if len(_dfe) >= 22:
+                        _ce = _dfe["Close"].values
+                        _alpha_e = 2.0 / (21 + 1)
+                        _ema21 = float(_ce[-21])
+                        for _v_e in _ce[-20:]:
+                            _ema21 = _alpha_e * float(_v_e) + (1 - _alpha_e) * _ema21
+                        _near_ema21 = abs(cur_price - _ema21) / _ema21 <= 0.02
+                        _vol5_e  = float(_dfe["Volume"].tail(5).mean())
+                        _vol50_e = float(_dfe["Volume"].tail(51).iloc[:-1].mean())
+                        _vol_dry_e = _vol50_e > 0 and _vol5_e < _vol50_e * 0.60
+                        _e_triggered = _near_ema21 and _vol_dry_e
+                except Exception as _ee:
+                    _log.debug("[monitor] step_e %s: %s", symbol, _ee)
+                if _e_triggered:
+                    _e_qty = max(1, round(sym.get("initial_qty", qty) * 0.15))
+                    if _place_market_buy(symbol, _e_qty):
+                        sym["step_e_done"]  = True
+                        sym["step_e_qty"]   = _e_qty
+                        sym["step_e_price"] = cur_price
+                        changed = True
+                        _log.info("[monitor] ✓ %s STEP-E 21-EMA scale-in: +%d sh @ $%.2f "
+                                  "(+%.1f%%, EMA21 pull + vol dry)",
+                                  symbol, _e_qty, cur_price, pnl_pct * 100)
+                        try:
+                            import requests as _rqe, os as _ose
+                            _toke = _ose.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _cide = _ose.getenv("TELEGRAM_CHAT_ID", "")
+                            if _toke and _cide:
+                                _rqe.post(
+                                    f"https://api.telegram.org/bot{_toke}/sendMessage",
+                                    json={"chat_id": _cide, "parse_mode": "Markdown",
+                                          "text": (
+                                              f"📊 *Step E — 21-EMA Scale-in — {symbol}*\n"
+                                              f"Added {_e_qty} sh @ ${cur_price:.2f}"
+                                              f" (+{pnl_pct*100:.1f}%)\n"
+                                              f"21-EMA pull with vol dry-up"
+                                          )},
+                                    timeout=8)
+                        except Exception:
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+
         # ── Step C2: Sector ETF < MA50 — force breakeven on sector weakness ─────
         # If the broader sector is losing leadership, tighten before the position turns.
         # Runs once per day per position (ETF data cached 1h).
@@ -1925,6 +2042,52 @@ def check_positions() -> None:
                                 changed = True
             except Exception as _lle:
                 _log.debug("[monitor] LH/LL %s: %s", symbol, _lle)
+
+        # ── Step PAR: Parabolic gain protection — sell 25% on blow-off day ────────
+        # If today's intraday gain >8% AND total pnl >15%, the stock is in a parabolic
+        # extension. Sell 25% to lock gains before the vertical drop.
+        if (not sym.get("parabolic_done")
+                and pnl_pct > 0.15):
+            _par_today = datetime.now(_ET).strftime("%Y-%m-%d")
+            if sym.get("_par_check_date") != _par_today:
+                sym["_par_check_date"] = _par_today
+                try:
+                    _dfpar = _get_hist(symbol)
+                    if len(_dfpar) >= 1:
+                        _open_par = float(_dfpar["Open"].iloc[-1])
+                        _day_gain = (cur_price - _open_par) / _open_par if _open_par > 0 else 0.0
+                        if _day_gain > 0.08:
+                            _par_qty = max(1, round(qty * 0.25))
+                            _log.warning(
+                                "[monitor] %s PARABOLIC: day gain +%.1f%%, pnl +%.1f%% — "
+                                "selling 25%% (%d sh) at $%.2f",
+                                symbol, _day_gain * 100, pnl_pct * 100, _par_qty, cur_price)
+                            if _place_market_sell(symbol, _par_qty):
+                                sym["parabolic_done"] = True
+                                if not sym.get("partial1_done"):
+                                    sym["partial1_done"] = True
+                                    sym["partial_done"]  = True
+                                sym["partial_qty"] = sym.get("partial_qty", 0) + _par_qty
+                                changed = True
+                                try:
+                                    import requests as _rqpar, os as _ospar
+                                    _tpar = _ospar.getenv("TELEGRAM_BOT_TOKEN", "")
+                                    _cpar = _ospar.getenv("TELEGRAM_CHAT_ID", "")
+                                    if _tpar and _cpar:
+                                        _rqpar.post(
+                                            f"https://api.telegram.org/bot{_tpar}/sendMessage",
+                                            json={"chat_id": _cpar, "parse_mode": "Markdown",
+                                                  "text": (
+                                                      f"🚀 *Parabolic Protection — {symbol}*\n"
+                                                      f"Day gain +{_day_gain*100:.1f}%,"
+                                                      f" total +{pnl_pct*100:.1f}%\n"
+                                                      f"Sold 25% ({_par_qty} sh) — locking gains"
+                                                  )},
+                                            timeout=8)
+                                except Exception:
+                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                except Exception as _pare:
+                    _log.debug("[monitor] parabolic %s: %s", symbol, _pare)
 
         # ── PM10: PEAD — Post-Earnings Announcement Drift (60-day time-stop hold) ────
         # Academic finding: stocks that beat EPS estimates by ≥5% drift up ~60 trading days.
