@@ -332,18 +332,50 @@ def run_backtest(symbols: list[str], start: str, end: str,
     # Exit reason breakdown
     exit_reasons = df_t["reason"].value_counts().to_dict()
 
+    # Per-exit-step P&L analysis
+    exit_step_stats: dict = {}
+    for reason, grp in df_t.groupby("reason"):
+        _wr = grp[grp["pnl_pct"] > 0]
+        exit_step_stats[str(reason)] = {
+            "count":       len(grp),
+            "win_rate":    round(len(_wr) / len(grp), 3),
+            "avg_pnl_pct": round(grp["pnl_pct"].mean() * 100, 2),
+        }
+
+    # SPY benchmark return for same period
+    spy_period_return = 0.0
+    try:
+        _spy = yf.download("SPY", start=start, end=end, interval="1d",
+                           auto_adjust=True, progress=False)
+        if _spy is not None and len(_spy) >= 2:
+            _spy.columns = [c[0] if isinstance(c, tuple) else c for c in _spy.columns]
+            _spy_start = float(_spy["Close"].iloc[0])
+            _spy_end   = float(_spy["Close"].iloc[-1])
+            spy_period_return = (_spy_end - _spy_start) / _spy_start if _spy_start > 0 else 0.0
+    except Exception as e:
+        _log.debug("SPY benchmark fetch failed: %s", e)
+
+    avg_hold  = df_t["days"].mean()
+    _td_total = max(len(pd.bdate_range(start=start, end=end)), 1)
+    _spy_per_trade = spy_period_return * (avg_hold / _td_total)
+    _avg_pnl_dec   = df_t["pnl_pct"].mean()
+    _alpha_per_trade = round((_avg_pnl_dec - _spy_per_trade) * 100, 2)
+
     stats = {
-        "total_trades":    len(df_t),
-        "win_rate":        round(len(wins) / len(df_t), 3),
-        "avg_pnl_pct":     round(df_t["pnl_pct"].mean() * 100, 2),
-        "avg_win_pct":     round(wins["pnl_pct"].mean() * 100, 2) if len(wins) else 0,
-        "avg_loss_pct":    round(losses["pnl_pct"].mean() * 100, 2) if len(losses) else 0,
-        "avg_hold_days":   round(df_t["days"].mean(), 1),
-        "max_dd_pct":      round(df_t["pnl_pct"].min() * 100, 2),
-        "signals_found":   signals,
-        "scan_checks":     scanned,
-        "signal_rate":     round(signals / max(scanned, 1), 4),
-        "exit_reasons":    exit_reasons,
+        "total_trades":      len(df_t),
+        "win_rate":          round(len(wins) / len(df_t), 3),
+        "avg_pnl_pct":       round(_avg_pnl_dec * 100, 2),
+        "avg_win_pct":       round(wins["pnl_pct"].mean() * 100, 2) if len(wins) else 0,
+        "avg_loss_pct":      round(losses["pnl_pct"].mean() * 100, 2) if len(losses) else 0,
+        "avg_hold_days":     round(avg_hold, 1),
+        "max_dd_pct":        round(df_t["pnl_pct"].min() * 100, 2),
+        "signals_found":     signals,
+        "scan_checks":       scanned,
+        "signal_rate":       round(signals / max(scanned, 1), 4),
+        "exit_reasons":      exit_reasons,
+        "exit_step_stats":   exit_step_stats,
+        "spy_period_return_pct": round(spy_period_return * 100, 2),
+        "alpha_per_trade_pct":   _alpha_per_trade,
     }
     return {"trades": trades, "stats": stats, "score_buckets": bucket_stats}
 
@@ -357,7 +389,9 @@ def main():
     parser.add_argument("--start",     default="")
     parser.add_argument("--min-score", type=float, default=0.0,
                         help="Minimum quant VCP score (0-10, default: no filter)")
-    parser.add_argument("--out",       default="")
+    parser.add_argument("--out",          default="")
+    parser.add_argument("--walk-forward", action="store_true",
+                        help="Run 4 rolling windows and check for overfitting")
     args = parser.parse_args()
 
     end   = datetime.today().strftime("%Y-%m-%d")
@@ -373,6 +407,28 @@ def main():
         raise ValueError("Universe är tomt — kontrollera universe.txt eller network connectivity")
 
     print(f"Backtest: {len(symbols)} symbols | {start} → {end} | min_score={args.min_score}")
+
+    # ── Walk-forward validering ────────────────────────────────────────────────
+    if args.walk_forward:
+        print("\n── Walk-Forward Validering (4 fönster) ──")
+        _total_days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
+        _win_days   = _total_days // 4
+        _wf_rates: list[float] = []
+        for _wi in range(4):
+            _ws = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=_wi * _win_days)).strftime("%Y-%m-%d")
+            _we = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=(_wi + 1) * _win_days)).strftime("%Y-%m-%d")
+            _wr = run_backtest(symbols, _ws, _we, min_score=args.min_score)
+            _ws_stats = _wr.get("stats", {})
+            _wf_wr    = _ws_stats.get("win_rate", 0.0)
+            _wf_n     = _ws_stats.get("total_trades", 0)
+            _wf_rates.append(_wf_wr)
+            print(f"  Fönster {_wi+1}: {_ws} → {_we}  |  n={_wf_n}  WR={_wf_wr:.1%}  avg={_ws_stats.get('avg_pnl_pct', 0):+.1f}%")
+        if len(_wf_rates) >= 2:
+            _wr_spread = max(_wf_rates) - min(_wf_rates)
+            _overfit_warn = " ⚠️  ÖVERANPASSNING — WR varierar >15% mellan fönster" if _wr_spread > 0.15 else " ✓ stabilt"
+            print(f"  WR-spridning: {_wr_spread:.1%}{_overfit_warn}")
+        print()
+
     results = run_backtest(symbols, start, end, min_score=args.min_score)
     stats   = results.get("stats", {})
     buckets = results.get("score_buckets", {})
@@ -392,9 +448,14 @@ Avg win:         {stats.get('avg_win_pct', 0):+.2f}%
 Avg loss:        {stats.get('avg_loss_pct', 0):+.2f}%
 Avg hold:        {stats.get('avg_hold_days', 0):.1f} days
 Max single loss: {stats.get('max_dd_pct', 0):+.2f}%
+SPY period ret:  {stats.get('spy_period_return_pct', 0):+.2f}%  (buy-and-hold benchmark)
+Alpha/trade:     {stats.get('alpha_per_trade_pct', 0):+.2f}%  (vs SPY per holding period)
 Exit reasons:    {stats.get('exit_reasons', {})}
 
-Score buckets (quant VCP score):""")
+Per-exit-steg:""")
+    for _step, _sv in sorted(stats.get("exit_step_stats", {}).items()):
+        print(f"  {_step:<16} n={_sv['count']:<4} WR={_sv['win_rate']:.0%}  avg={_sv['avg_pnl_pct']:+.1f}%")
+    print("\nScore buckets (quant VCP score):")
     for bkt in sorted(buckets.keys()):
         b = buckets[bkt]
         print(f"  [{bkt}]  n={b['count']}  WR={b['win_rate']:.0%}  avg_R={b['avg_r']:+.2f}")

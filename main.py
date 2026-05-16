@@ -1303,6 +1303,27 @@ def _fetch_vix() -> float:
     return 20.0
 
 
+def _fetch_vix3m() -> float:
+    """Fetch VIX3M (3-month VIX). Returns 20.0 on failure."""
+    try:
+        v3m = yf.Ticker("^VIX3M").history(period="5d", interval="1d")
+        if not v3m.empty:
+            return float(v3m["Close"].iloc[-1])
+    except Exception:
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
+    return 20.0
+
+
+def _vix_term_factor(vix: float, vix3m: float) -> float:
+    """VIX term structure: VIX > VIX3M = backwardation = acute stress → reduce size 20%.
+    Normal contango (VIX < VIX3M) = no additional penalty.
+    """
+    if vix > vix3m:
+        _log.info("[tudor] VIX term backwardation: VIX=%.1f > VIX3M=%.1f — size ×0.80", vix, vix3m)
+        return 0.80
+    return 1.00
+
+
 def _vix_size_factor(vix: float) -> float:
     """Tudor Jones: scale down position sizes when volatility spikes.
     VIX < 15  → full size (1.00)
@@ -2847,8 +2868,11 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     # ── Three Masters composite scoring: weight all three layers ─────────────
     _rs_now = _get_rs()
-    _current_vix = _fetch_vix()
+    _current_vix  = _fetch_vix()
+    _current_vix3m = _fetch_vix3m()
+    _vix_tf        = _vix_term_factor(_current_vix, _current_vix3m)
     report["vix"]         = round(_current_vix, 1)
+    report["vix3m"]       = round(_current_vix3m, 1)
     report["breadth_pct"] = round(_breadth_pct, 3)
     # VIX spike: if VIX jumps >15% in a single session, markets are in sudden distress
     _vix_spike_today = False
@@ -3172,7 +3196,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         risk_pct  = (_adaptive_risk_pct(composite, base_risk, _current_vix)
                      * regime_size_factor * loss_factor * win_factor
                      * _atr_f * _sym_beta_f * _extended_factor * _qqq_factor
-                     * _cs_factor * _gap_up_f * _beta_f * _dxy_f)
+                     * _cs_factor * _gap_up_f * _beta_f * _dxy_f * _vix_tf)
 
         can, reason = check_can_trade(portfolio_value, risk_pct)
         if not can:

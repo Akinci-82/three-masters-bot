@@ -136,44 +136,59 @@ def get_earnings_surprise(symbol: str) -> list[dict]:
     """
     Return [{date, actual, estimate, surprise_pct}, ...] newest-first.
     Chain: FMP (primary) → yfinance → Alpha Vantage (last resort)
-    FMP leads: more reliable structured historical EPS data than yfinance.
+    Cross-validates FMP vs yfinance: if most recent quarter differs >20%, uses yfinance.
     """
     # 1. FMP — primary source for earnings history
+    fmp_rows: list[dict] = []
     data = _fmp(f"earnings-surprises/{symbol}")
     if data and isinstance(data, list):
-        rows = []
         for item in sorted(data, key=lambda x: x.get("date", ""), reverse=True):
             actual   = float(item.get("actualEarningResult", 0) or 0)
             estimate = float(item.get("estimatedEarning",    0) or 0)
             sp = ((actual - estimate) / abs(estimate)) if estimate else 0.0
-            rows.append({
+            fmp_rows.append({
                 "date":         item.get("date", "")[:10],
                 "actual":       actual,
                 "estimate":     estimate,
                 "surprise_pct": round(sp, 4),
             })
-        if rows:
-            _log.debug("[data] %s earnings via FMP", symbol)
-            return rows
 
-    # 2. yfinance
+    # 2. yfinance — always fetch for cross-validation when FMP returned data
+    yf_rows: list[dict] = []
     try:
-        import yfinance as yf
-        eh = yf.Ticker(symbol).earnings_history
+        import yfinance as _yf_ep
+        eh = _yf_ep.Ticker(symbol).earnings_history
         if eh is not None and not eh.empty:
-            rows = []
             for dt, row in eh.sort_index(ascending=False).iterrows():
-                rows.append({
+                yf_rows.append({
                     "date":         str(dt)[:10],
                     "actual":       float(row.get("epsActual",    0) or 0),
                     "estimate":     float(row.get("epsEstimate",  0) or 0),
                     "surprise_pct": float(row.get("surprisePercent", 0) or 0),
                 })
-            if rows:
-                _log.debug("[data] %s earnings via yfinance", symbol)
-                return rows
     except Exception:
         _log.debug("[data] %s yfinance earnings_history failed", symbol)
+
+    # Cross-validate: if both sources have data and most recent quarter disagrees >20%
+    if fmp_rows and yf_rows:
+        _fmp_sp = fmp_rows[0]["surprise_pct"]
+        _yf_sp  = yf_rows[0]["surprise_pct"]
+        if abs(_fmp_sp - _yf_sp) > 0.20:
+            _log.warning(
+                "[data] %s EPS-surprise discrepancy: FMP=%.1f%% yfinance=%.1f%% (diff=%.1f%%) "
+                "— using yfinance (conservative)",
+                symbol, _fmp_sp * 100, _yf_sp * 100, abs(_fmp_sp - _yf_sp) * 100,
+            )
+            return yf_rows
+        _log.debug("[data] %s earnings via FMP (cross-validated OK)", symbol)
+        return fmp_rows
+
+    if fmp_rows:
+        _log.debug("[data] %s earnings via FMP", symbol)
+        return fmp_rows
+    if yf_rows:
+        _log.debug("[data] %s earnings via yfinance", symbol)
+        return yf_rows
 
     # 3. Alpha Vantage (last resort — 25 req/day)
     data = _av({"function": "EARNINGS", "symbol": symbol})
