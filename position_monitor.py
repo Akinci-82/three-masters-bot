@@ -1435,9 +1435,8 @@ def check_positions() -> None:
 
         if needs_stop:
             _cancel_stop_orders(symbol)
-            _stop_qty = max(1, qty - sym.get("partial_qty", 0))
             if use_hard_stop:
-                oid = _place_stop(symbol, _stop_qty, stop_loss_level)
+                oid = _place_stop(symbol, qty, stop_loss_level)
                 if oid:
                     sym["trailing_stop_placed"] = True
                     sym["stop_order_id"] = oid
@@ -1447,7 +1446,7 @@ def check_positions() -> None:
                               symbol, stop_loss_level)
             else:
                 _eff_trail = sym.get("atr_trail_pct", trail_pct)
-                oid = _place_trailing_stop(symbol, _stop_qty, _eff_trail)
+                oid = _place_trailing_stop(symbol, qty, _eff_trail)
                 if oid:
                     sym["trailing_stop_placed"] = True
                     sym["stop_order_id"] = oid
