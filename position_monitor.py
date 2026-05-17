@@ -1653,7 +1653,7 @@ def check_positions() -> None:
                 changed = True
                 _log.info("[monitor] %s B2 fill confirmed (order left open list)", symbol)
 
-        _skip_b1_8w = sym.get("fast_mover") and _trading_days_held(sym.get("entry_date", "")) < 40
+        _skip_b1_8w = sym.get("fast_mover") and _trading_days_held(sym.get("entry_date", "")) < 40 and pnl_pct > 0.05
         if pnl_pct >= partial1_trigger and not sym.get("partial1_done") and not _skip_b1_8w:
             sell_qty = max(1, round(initial_qty / 3))
             _lim1 = round(cur_price * 0.999, 2)  # 0.1% below market — fast fill, better price
@@ -2474,7 +2474,11 @@ def check_positions() -> None:
                                     _sa2[_sig2]["losses"] += 1
                                 _sa2[_sig2]["total_r"] = round(
                                     _sa2[_sig2].get("total_r", 0.0) + _r_val, 3)
-                        open(_sa_path, "w").write(_jsa2.dumps(_sa2, indent=2))
+                        _sa_content = _jsa2.dumps(_sa2, indent=2)
+                        _sa_tmp = _sa_path + ".tmp"
+                        with open(_sa_tmp, "w") as _f_sa_tmp:
+                            _f_sa_tmp.write(_sa_content)
+                        _osa2.replace(_sa_tmp, _sa_path)
                 except Exception:
                     _log.debug("[%s] suppressed", __name__, exc_info=True)
                 # Re-entry cooldown: shorter if pyramid was added (shakeout of add-on

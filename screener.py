@@ -379,7 +379,6 @@ class TrendResult:
     eps_beat_count: int       = 0      # consecutive EPS beats in last 3 quarters
     at_52w_high: bool         = False  # price within 2% of 52w high (no overhead supply)
     accum_ratio: float        = 0.0   # accum days on above-avg vol / total up-days (base quality)
-    three_weeks_tight: bool   = False  # price in <=1.5% range for 3+ consecutive weeks (Minervini)
     obv_new_high: bool        = False  # OBV at 52w high = institutional accumulation in base
     base_count: int           = 1      # prior VCP bases last 18mo (1-2=fresh, 3+=late stage)
     base_age_days: int        = 0      # trading days since 52w high peak (current base start)
@@ -541,8 +540,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         ma200_20d_ago = float(ma200_series.iloc[-20]) if len(ma200_series) >= 20 else ma200
         ma200_slope   = (ma200 - ma200_20d_ago) / ma200_20d_ago if ma200_20d_ago != 0 else 0.0
 
-        high_52w      = float(close.tail(252).max())
-        low_52w       = float(close.tail(252).min())
+        high_52w      = float(close.iloc[-252:].max()) if len(close) >= 252 else float(close.max())
+        low_52w       = float(close.iloc[-252:].min()) if len(close) >= 252 else float(close.min())
         pct_from_high = (price - high_52w) / high_52w if high_52w != 0 else 0.0
         pct_from_low  = (price - low_52w)  / low_52w  if low_52w  != 0 else 0.0
 
@@ -907,8 +906,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         # in the prior 10 sessions — O'Neil/Morales early-entry confirmation signal
         _pp = False
         try:
-            if len(df) >= 12:
-                _df_pp = df.tail(11).reset_index(drop=True)
+            if len(df) >= 13:
+                _df_pp = df.tail(12).reset_index(drop=True)
                 _down_vols = [
                     float(_df_pp["Volume"].iloc[_i])
                     for _i in range(1, len(_df_pp) - 1)
@@ -1182,6 +1181,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
 
 _SECTOR_CACHE_FILE = LOG_DIR / "sector_cache.json"
 _sector_mem: dict[str, str] = {}
+_SECTOR_CACHE_LOCK = threading.Lock()
 
 
 def get_sector(symbol: str) -> str:
@@ -1201,14 +1201,15 @@ def get_sector(symbol: str) -> str:
         sector = info.get("sector") or "Unknown"
     except Exception:
         sector = "Unknown"
-    _sector_mem[symbol] = sector
-    if len(_sector_mem) > 512:
-        _sector_mem.pop(next(iter(_sector_mem)))
-    try:
-        _SECTOR_CACHE_FILE.parent.mkdir(exist_ok=True)
-        _SECTOR_CACHE_FILE.write_text(_json.dumps(_sector_mem, indent=2))
-    except Exception:
-        _log.debug("[%s] suppressed", __name__, exc_info=True)
+    with _SECTOR_CACHE_LOCK:
+        _sector_mem[symbol] = sector
+        if len(_sector_mem) > 512:
+            _sector_mem.pop(next(iter(_sector_mem)))
+        try:
+            _SECTOR_CACHE_FILE.parent.mkdir(exist_ok=True)
+            _SECTOR_CACHE_FILE.write_text(_json.dumps(_sector_mem, indent=2))
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
     _log.debug("[screen] %s sector: %s", symbol, sector)
     return sector
 

@@ -338,42 +338,43 @@ def check_reentry_cooldown(symbol: str, current_price: float = 0.0) -> bool:
     """True if symbol is still in re-entry cooldown (5 trading days since stop-out).
     Also blocks re-entry if price has not recovered above the prior breakout level.
     """
-    state = _load()
-    entry = state.get("stop_out_cooldown", {}).get(symbol)
-    if not entry:
-        return False
-    # Support both old format (plain date string) and new format (dict)
-    if isinstance(entry, str):
-        stop_date_str   = entry
-        prior_breakout  = 0.0
-        _cd_days        = 5
-    else:
-        stop_date_str   = entry.get("date", "")
-        prior_breakout  = float(entry.get("breakout_level", 0.0))
-        _cd_days        = int(entry.get("cooldown_days", 5))
-    if not stop_date_str:
-        return False
-    try:
-        from pandas.tseries.offsets import BDay
-        import pandas as _pd
-        stop_dt      = _pd.Timestamp(stop_date_str)
-        cooldown_end = stop_dt + BDay(_cd_days)
-        in_cooldown  = _pd.Timestamp.today() < cooldown_end
-        if not in_cooldown:
-            # Time cooldown expired — also check pivot recovery
-            if prior_breakout > 0 and current_price > 0:
-                if current_price < prior_breakout * 1.00:
-                    # Price still below or at prior failed pivot — not recovered
-                    _log.debug("[risk] %s re-entry blocked: price $%.2f below failed pivot $%.2f",
-                               symbol, current_price, prior_breakout)
-                    return True
-            cooldowns = state.get("stop_out_cooldown", {})
-            cooldowns.pop(symbol, None)
-            _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        entry = state.get("stop_out_cooldown", {}).get(symbol)
+        if not entry:
             return False
-        return True
-    except Exception:
-        return False
+        # Support both old format (plain date string) and new format (dict)
+        if isinstance(entry, str):
+            stop_date_str   = entry
+            prior_breakout  = 0.0
+            _cd_days        = 5
+        else:
+            stop_date_str   = entry.get("date", "")
+            prior_breakout  = float(entry.get("breakout_level", 0.0))
+            _cd_days        = int(entry.get("cooldown_days", 5))
+        if not stop_date_str:
+            return False
+        try:
+            from pandas.tseries.offsets import BDay
+            import pandas as _pd
+            stop_dt      = _pd.Timestamp(stop_date_str)
+            cooldown_end = stop_dt + BDay(_cd_days)
+            in_cooldown  = _pd.Timestamp.today() < cooldown_end
+            if not in_cooldown:
+                # Time cooldown expired — also check pivot recovery
+                if prior_breakout > 0 and current_price > 0:
+                    if current_price < prior_breakout * 1.00:
+                        # Price still below or at prior failed pivot — not recovered
+                        _log.debug("[risk] %s re-entry blocked: price $%.2f below failed pivot $%.2f",
+                                   symbol, current_price, prior_breakout)
+                        return True
+                cooldowns = state.get("stop_out_cooldown", {})
+                cooldowns.pop(symbol, None)
+                _save(state)
+                return False
+            return True
+        except Exception:
+            return False
 
 
 

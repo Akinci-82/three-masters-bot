@@ -149,7 +149,7 @@ def _cmd_positions() -> str:
                 try:
                     from pandas.tseries.offsets import BDay
                     import pandas as _pd
-                    _days = f" d{int((_pd.Timestamp.today() - _pd.Timestamp(_ed)) / BDay(1))}"
+                    _days = f" d{int((_pd.Timestamp.now().normalize() - _pd.Timestamp(_ed).normalize()) / BDay(1))}"
                 except Exception:
                     pass
 
@@ -381,6 +381,7 @@ def _cmd_live_orders() -> str:
                     active[sym] = o
             except Exception:
                 active[sym] = o
+        pending_file.write_text(json.dumps(active, indent=2))
         if not active:
             return "✅ Inga väntande live-ordrar (alla har löpt ut)."
         lines = ["📋 *Väntande live-ordrar* — bekräfta med /confirm\\_live:\n"]

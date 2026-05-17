@@ -317,8 +317,9 @@ def run_backtest(symbols: list[str], start: str, end: str,
     buckets = {"0-4": [], "4-6": [], "6-8": [], "8-10": []}
     for _, row in df_t.iterrows():
         s = row["quant_score"]
-        r = row["pnl_pct"] / max(abs(row.get("stop_lvl", row["entry_price"] * 0.07) /
-                                      row["entry_price"]), 0.01)
+        _sl   = row.get("stop_lvl", 0)
+        _risk = abs(_sl / row["entry_price"]) if row["entry_price"] > 0 and _sl > 0 else 0.07
+        r = 0.0 if _risk < 0.001 else row["pnl_pct"] / _risk
         bkt = ("8-10" if s >= 8 else "6-8" if s >= 6 else "4-6" if s >= 4 else "0-4")
         buckets[bkt].append(r)
 

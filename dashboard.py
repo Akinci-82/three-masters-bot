@@ -165,7 +165,13 @@ def _append_equity_snapshot(equity: float):
         if existing and existing[-1].get("date") == today:
             lines = path.read_text().strip().splitlines()
             lines[-1] = json.dumps({"date": today, "value": equity})
-            path.write_text("\n".join(lines) + "\n")
+            import os as _os_eq, tempfile as _tf_eq
+            _content = "\n".join(lines) + "\n"
+            _dir = str(path.parent)
+            with _tf_eq.NamedTemporaryFile("w", dir=_dir, delete=False, suffix=".tmp") as _tmp:
+                _tmp.write(_content)
+                _tmp_path = _tmp.name
+            _os_eq.replace(_tmp_path, str(path))
         else:
             with open(path, "a") as f:
                 f.write(json.dumps({"date": today, "value": equity}) + "\n")
@@ -1569,7 +1575,7 @@ def _build_state() -> dict:
                 "qty":             int(float(o["qty"])),
                 "stop":            round(stop,2),
                 "current":         round(cur_p,2),
-                "gap_pct":         round((stop-cur_p)/cur_p*100,2),
+                "gap_pct":         round((stop-cur_p)/cur_p*100,2) if cur_p else 0.0,
                 "breakout_vol":    rpt_o.get("breakout_vol", False),
                 "vcp_notes":       rpt_o.get("vcp_notes", ""),
                 "quality_score":   rpt_o.get("quality_score", 0),

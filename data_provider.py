@@ -145,7 +145,7 @@ def get_earnings_surprise(symbol: str) -> list[dict]:
         for item in sorted(data, key=lambda x: x.get("date", ""), reverse=True):
             actual   = float(item.get("actualEarningResult", 0) or 0)
             estimate = float(item.get("estimatedEarning",    0) or 0)
-            sp = ((actual - estimate) / abs(estimate)) if estimate else 0.0
+            sp = ((actual - estimate) / abs(estimate) * 100) if estimate else 0.0
             fmp_rows.append({
                 "date":         item.get("date", "")[:10],
                 "actual":       actual,
@@ -177,7 +177,7 @@ def get_earnings_surprise(symbol: str) -> list[dict]:
             _log.warning(
                 "[data] %s EPS-surprise discrepancy: FMP=%.1f%% yfinance=%.1f%% (diff=%.1f%%) "
                 "— using yfinance (conservative)",
-                symbol, _fmp_sp * 100, _yf_sp * 100, abs(_fmp_sp - _yf_sp) * 100,
+                symbol, _fmp_sp, _yf_sp, abs(_fmp_sp - _yf_sp),
             )
             return yf_rows
         _log.debug("[data] %s earnings via FMP (cross-validated OK)", symbol)
@@ -240,6 +240,8 @@ def get_days_to_earnings(symbol: str) -> int | None:
             ed = cal["Earnings Date"]
             if isinstance(ed, list):
                 ed = ed[0]
+            import pandas as _pd_cal
+            ed = _pd_cal.Timestamp(ed).date()
             days = (ed - today).days
             if days >= 0:
                 return days

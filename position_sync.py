@@ -187,6 +187,7 @@ def sync_all() -> dict:
     # Happens if bot crashed between place_buy_stop() and register_trade().
     # Without this, risk budget is under-counted → over-trading possible.
     orphan_orders = buy_syms - tracked - held_syms
+    orphan_orders -= orphan_pos
     if orphan_orders:
         _log.warning("[sync] ORPHAN buy-orders added to risk_state: %s", orphan_orders)
         for sym in orphan_orders:

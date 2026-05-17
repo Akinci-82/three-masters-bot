@@ -972,14 +972,14 @@ def _send_weekly_report(portfolio_value: float) -> None:
 
         # ── Avg hold time: days-to-exit per trade ─────────────────────────────
         if total_trades >= 3 and _all_trades:
-            import numpy as _np_ht
             _hold_days = []
             for _ht in _all_trades:
                 try:
                     _ent = _ht.get("entry_date") or _ht.get("ts", "")[:10]
                     _ext = _ht.get("ts", "")[:10]
                     if _ent and _ext and len(_ent) == 10 and len(_ext) == 10:
-                        _hd = int(_np_ht.busday_count(_ent, _ext))
+                        import pandas as _pd_ht
+                        _hd = max(0, len(_pd_ht.bdate_range(_ent, _ext)) - 1)
                         if 0 < _hd < 120:
                             _hold_days.append(_hd)
                 except Exception:
@@ -1656,33 +1656,35 @@ def _fetch_pcr() -> float:
 
 # ── Sector rotation cache ─────────────────────────────────────────────────────
 _SECTOR_ROT_CACHE: dict = {"ts": 0.0, "ranks": {}}
+_SECTOR_ROT_CACHE_LOCK = threading.Lock()
 
 
 def _get_sector_rotation_ranks() -> dict:
     """30d ETF momentum → dict[sector_name → rank (1=best)]. Refreshed once/day."""
     import time as _time_sr
-    if _time_sr.time() - _SECTOR_ROT_CACHE["ts"] < 86400 and _SECTOR_ROT_CACHE["ranks"]:
-        return _SECTOR_ROT_CACHE["ranks"]
-    try:
-        from config import SECTOR_ETF_MAP as _etf_map
-        _etf_rets: dict = {}
-        for _sect, _etf in _etf_map.items():
-            try:
-                _h = yf.Ticker(_etf).history(period="1mo", interval="1d", auto_adjust=True)
-                if len(_h) >= 5:
-                    _etf_rets[_sect] = float(_h["Close"].iloc[-1] / _h["Close"].iloc[0] - 1)
-            except Exception:
-                continue
-        if _etf_rets:
-            _sorted = sorted(_etf_rets, key=_etf_rets.get, reverse=True)
-            _ranks  = {s: i + 1 for i, s in enumerate(_sorted)}
-            _SECTOR_ROT_CACHE["ts"]    = _time_sr.time()
-            _SECTOR_ROT_CACHE["ranks"] = _ranks
-            _log.info("[main] sector rotation ranks: %s", _ranks)
-            return _ranks
-    except Exception as _sre:
-        _log.debug("[main] sector_rotation_ranks: %s", _sre)
-    return _SECTOR_ROT_CACHE.get("ranks", {})
+    with _SECTOR_ROT_CACHE_LOCK:
+        if _time_sr.time() - _SECTOR_ROT_CACHE["ts"] < 86400 and _SECTOR_ROT_CACHE["ranks"]:
+            return _SECTOR_ROT_CACHE["ranks"]
+        try:
+            from config import SECTOR_ETF_MAP as _etf_map
+            _etf_rets: dict = {}
+            for _sect, _etf in _etf_map.items():
+                try:
+                    _h = yf.Ticker(_etf).history(period="1mo", interval="1d", auto_adjust=True)
+                    if len(_h) >= 5:
+                        _etf_rets[_sect] = float(_h["Close"].iloc[-1] / _h["Close"].iloc[0] - 1)
+                except Exception:
+                    continue
+            if _etf_rets:
+                _sorted = sorted(_etf_rets, key=_etf_rets.get, reverse=True)
+                _ranks  = {s: i + 1 for i, s in enumerate(_sorted)}
+                _SECTOR_ROT_CACHE["ts"]    = _time_sr.time()
+                _SECTOR_ROT_CACHE["ranks"] = _ranks
+                _log.info("[main] sector rotation ranks: %s", _ranks)
+                return _ranks
+        except Exception as _sre:
+            _log.debug("[main] sector_rotation_ranks: %s", _sre)
+        return _SECTOR_ROT_CACHE.get("ranks", {})
 
 
 def _simons_score(trend) -> float:
@@ -1810,8 +1812,6 @@ def _simons_score(trend) -> float:
     indleader_pts = 0.25 if getattr(trend, "industry_leader", False) else 0.0
     # Revenue acceleration: quarterly revenue growth accelerating Q-over-Q (double SEPA confirmation)
     rev_accel_pts = 0.5 if getattr(trend, "rev_accelerating", False) else 0.0
-    # 3-weeks tight: consecutive weekly closes within 1.5% = institutional hold, no distribution
-    twt2_pts = 0.25 if getattr(trend, "three_weeks_tight", False) else 0.0
     # Short interest monthly change: covering = squeeze fuel (+0.25), building = warning (-0.25)
     si_mo_pts = float(getattr(trend, "short_mo_pts", 0.0))
     # Analyst PT gap: consensus >25% above price = substantial institutional expected upside
@@ -1848,7 +1848,7 @@ def _simons_score(trend) -> float:
                + twt_pts + obv_pts + base_pts + bage_pts + vq_pts + ath_pts + ws2_pts + wba_pts
                + aug_pts + inst_trend_pts + rev_up_pts + pp_pts + accel_pts + aw_pts
                + insider_pts + indleader_pts + rev_accel_pts
-               + twt2_pts + si_mo_pts + apt_pts + ws_pts + pead_pts + opts_flow_pts
+               + si_mo_pts + apt_pts + ws_pts + pead_pts + opts_flow_pts
                + naccel_pts + rvol10_pts + sect_rot_pts, 10.0)
 
 
@@ -2094,9 +2094,9 @@ def _compute_ad_divergence(breadth_pct: float) -> bool:
             return False
         with open(_bh_path) as _f_ad:
             _bh = _json_ad.load(_f_ad)
-        if len(_bh) < 10:
+        if len(_bh) < 11:
             return False
-        _breadth_chg = breadth_pct - float(_bh[-10])  # negative = breadth shrinking
+        _breadth_chg = breadth_pct - float(_bh[-11])  # negative = breadth shrinking
         if _breadth_chg >= -0.03:                       # need ≥3pp breadth decline
             return False
         _spy_hist = yf.Ticker("SPY").history(period="20d", interval="1d", auto_adjust=True)["Close"]

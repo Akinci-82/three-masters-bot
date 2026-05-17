@@ -56,7 +56,7 @@ def _retry(fn, *args, _retries: int = 3, _backoff: float = 2.0, **kwargs):
     Does not retry on 4xx HTTP errors (client logic errors, not transient).
     """
     import time as _t
-    delay = 2.0
+    delay = _backoff
     for _attempt in range(_retries):
         try:
             return fn(*args, **kwargs)
@@ -281,7 +281,7 @@ def get_paper_comparison_equity() -> float | None:
         return None
     try:
         _paper_api = TradingClient(ALPACA_PAPER_COMPARE_KEY, ALPACA_PAPER_COMPARE_SECRET, paper=True)
-        acct = _paper_api.get_account()
+        acct = _retry(_paper_api.get_account)
         return float(acct.portfolio_value)
     except Exception as e:
         _log.debug("[broker] Paper comparison equity fetch failed: %s", e)

@@ -34,6 +34,7 @@ from config import VCP, CLAUDE_MODEL, CLAUDE_MODEL_DEEP, CLAUDE_MODEL_ULTRA, ANT
 
 _log = logging.getLogger(__name__)
 _client: anthropic.Anthropic | None = None
+_CLIENT_LOCK = threading.Lock()
 
 _HAIKU_MODEL  = CLAUDE_MODEL        # haiku-4-5-20251001
 _SONNET_MODEL = CLAUDE_MODEL_DEEP   # sonnet-4-6
@@ -115,9 +116,10 @@ def _deserialize_result(d: dict):
 
 def _get_client() -> anthropic.Anthropic:
     global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=20.0)
-    return _client
+    with _CLIENT_LOCK:
+        if _client is None:
+            _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=20.0)
+        return _client
 
 
 def _log_tokens(symbol: str, tier: str, model: str,
@@ -469,6 +471,23 @@ def _get_weekly_context(symbol: str, df: pd.DataFrame) -> str:
 
         rs_summary = ""
         if not spy_wk.empty:
+            # Normalize both to UTC to avoid tz-mismatch empty intersection
+            try:
+                if w20.index.tz is not None:
+                    w20 = w20.copy()
+                    w20.index = w20.index.tz_convert("UTC")
+                elif w20.index.tz is None:
+                    w20 = w20.copy()
+                    w20.index = w20.index.tz_localize("UTC")
+                if not spy_wk.empty:
+                    if spy_wk.index.tz is not None:
+                        spy_wk = spy_wk.copy()
+                        spy_wk.index = spy_wk.index.tz_convert("UTC")
+                    elif spy_wk.index.tz is None:
+                        spy_wk = spy_wk.copy()
+                        spy_wk.index = spy_wk.index.tz_localize("UTC")
+            except Exception:
+                pass
             common = w20.index.intersection(spy_wk.index)
             if len(common) >= 5:
                 rs_line = w20["Close"].loc[common] / spy_wk["Close"].loc[common]
@@ -847,16 +866,20 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             _ns_raw = _ns_resp.content[0].text.strip()
             if _ns_raw.startswith("```"):
                 _ns_raw = _ns_raw.split("```")[1].lstrip("json").strip()
-            _ns = json.loads(_ns_raw)
-            _ns_sent = _ns.get("sentiment", "neutral")
-            if _ns_sent == "negative":
-                _news_conf_penalty = 0.10
-                _news_negative     = True
-                _log.info("[vcp] %s news NEGATIVE (%s) → min_conf +0.10",
-                          symbol, _ns.get("reason", "")[:50])
-            elif _ns_sent == "positive":
-                _news_positive = True
-                _log.info("[vcp] %s news POSITIVE (%s)", symbol, _ns.get("reason", "")[:50])
+            try:
+                _ns = json.loads(_ns_raw)
+                _ns_sent = _ns.get("sentiment", "neutral")
+                if _ns_sent == "negative":
+                    _news_conf_penalty = 0.10
+                    _news_negative     = True
+                    _log.info("[vcp] %s news NEGATIVE (%s) → min_conf +0.10",
+                              symbol, _ns.get("reason", "")[:50])
+                elif _ns_sent == "positive":
+                    _news_positive = True
+                    _log.info("[vcp] %s news POSITIVE (%s)", symbol, _ns.get("reason", "")[:50])
+            except json.JSONDecodeError:
+                _news_conf_penalty = 0.05
+                _log.debug("[vcp] %s news sentiment JSON parse failed — applying 0.05 penalty", symbol)
     except Exception:
         _log.debug("[vcp] %s news sentiment check suppressed", symbol, exc_info=True)
 
@@ -979,6 +1002,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     # ── Tier 3: Opus final validation for elite setups ────────────────────────
     # quality >= 4: worth spending ~$0.03 to validate before betting real money
     tier_label = "sonnet"
+    _opus_watch = False
     if quality >= 4:
         _log.info("[vcp] %s → Opus tier-3 validation (quality=%d)", symbol, quality)
         o_prompt = _build_opus_prompt(symbol, df, s_data, quant, last_candle)
@@ -1012,6 +1036,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             if verdict == "watch":
                 confidence *= 0.85  # proportional discount; preserves relative nuance
                 _log.info("[vcp] %s Opus verdict=watch — confidence discounted 15%% to %.0f%%", symbol, confidence * 100)
+            _opus_watch = (verdict == "watch")
 
     stop_loss = _atr_adjusted_stop(df, breakout, stop_loss)
     vol_multiweek = quant.get("vol_at_multiweek_low", False)
@@ -1021,7 +1046,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
         symbol=symbol, passed=passed, current_price=price,
         confidence=confidence, breakout_level=breakout, stop_loss=stop_loss,
         pattern_depth_pct=depth, contractions=contractions, tight_pct=tight_pct,
-        ai_verdict="confirmed" if passed else "rejected",
+        ai_verdict=("opus_watch" if _opus_watch and passed else "confirmed" if passed else "rejected"),
         ai_reasoning=(s_data.get("pattern_notes", "") + " | " +
                       s_data.get("risk_factors", "")),
         fail_reason="" if passed else f"rejected_conf={confidence:.0%}",
