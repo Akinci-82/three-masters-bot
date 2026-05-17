@@ -145,6 +145,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
     step_f_done   = False
     shares        = 1.0          # normalised to 1 share
     proceeds      = 0.0
+    total_cost    = entry_price   # tracks actual capital deployed (updated on add-ons)
     trail_pct     = INITIAL_STOP_PCT
     exit_step     = "stop"
 
@@ -176,6 +177,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
         # Step F: early pyramid +25% at +4% (simple proxy: no RS check in backtest)
         pnl_now = (cls - entry_price) / entry_price
         if not step_f_done and not partial1_done and 0.04 <= pnl_now < 0.10:
+            total_cost   += 0.25 * cls
             shares       += 0.25
             step_f_done   = True
 
@@ -191,6 +193,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
         # Pyramid (P): add 30% of original qty between +12-20% after B1
         if (partial1_done and not pyramid_done and not partial2_done
                 and entry_price * 1.12 <= hi <= entry_price * 1.20):
+            total_cost   += 0.30 * cls
             shares       += 0.30
             pyramid_done  = True
 
@@ -207,7 +210,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
                 and not partial2_done
                 and _weekly_close_under_ma10w(df_fwd, i)):
             proceeds  += shares * cls
-            total_pnl  = (proceeds - entry_price) / entry_price
+            total_pnl  = (proceeds - total_cost) / total_cost
             return {"exit": str(ts.date()), "exit_price": cls,
                     "pnl_pct": round(total_pnl, 4), "days": i + 1,
                     "reason": "W_weekly_close",
@@ -216,7 +219,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
         # Stop hit
         if lo <= stop_trail:
             proceeds += shares * stop_trail
-            total_pnl = (proceeds - entry_price) / entry_price
+            total_pnl = (proceeds - total_cost) / total_cost
             return {"exit": str(ts.date()), "exit_price": stop_trail,
                     "pnl_pct": round(total_pnl, 4), "days": i + 1,
                     "reason": "stop",
@@ -227,7 +230,7 @@ def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
             paper_gain = (cls - entry_price) / entry_price
             if paper_gain < TIME_STOP_MIN_GAIN:
                 proceeds += shares * cls
-                total_pnl = (proceeds - entry_price) / entry_price
+                total_pnl = (proceeds - total_cost) / total_cost
                 return {"exit": str(ts.date()), "exit_price": cls,
                         "pnl_pct": round(total_pnl, 4), "days": i + 1,
                         "reason": "time_stop",

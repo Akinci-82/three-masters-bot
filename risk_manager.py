@@ -300,7 +300,7 @@ def close_trade(symbol: str, pnl_pct: float, portfolio_value: float,
         state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
 
         # Use day_start_equity stored at daily_reset() if caller doesn't know it
-        start = start_value or state.get("day_start_equity", portfolio_value)
+        start = start_value if start_value is not None else state.get("day_start_equity", portfolio_value)
         daily_pnl = (portfolio_value - start) / start if start else 0
         state["daily_pnl_pct"] = daily_pnl
 
@@ -322,13 +322,14 @@ def record_stop_out(symbol: str, breakout_level: float = 0.0, cooldown_days: int
     (shorter cooldown because stop-out after a pyramid often reflects a shakeout
     of the add-on shares, not a full base failure).
     """
-    state = _load()
-    state.setdefault("stop_out_cooldown", {})[symbol] = {
-        "date":           str(date.today()),
-        "breakout_level": round(breakout_level, 2),
-        "cooldown_days":  cooldown_days,
-    }
-    _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        state.setdefault("stop_out_cooldown", {})[symbol] = {
+            "date":           str(date.today()),
+            "breakout_level": round(breakout_level, 2),
+            "cooldown_days":  cooldown_days,
+        }
+        _save(state)
     _log.info("[risk] %s stop-out recorded — %d-day cooldown (pivot=$%.2f)",
               symbol, cooldown_days, breakout_level)
 
@@ -413,9 +414,10 @@ def record_pivot_failure(symbol: str):
     """Record a failed breakout — same pivot rejected for 45 trading days.
     Longer than stop_out_cooldown (5d): same pivot failing twice = distribution signal.
     """
-    state = _load()
-    state.setdefault("pivot_failure_cooldown", {})[symbol] = str(date.today())
-    _save(state)
+    with _RISK_LOCK:
+        state = _load()
+        state.setdefault("pivot_failure_cooldown", {})[symbol] = str(date.today())
+        _save(state)
     _log.info("[risk] %s pivot failure recorded — 45-day re-entry cooldown", symbol)
 
 

@@ -320,7 +320,9 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
     last_price  = sym_data.get("last_price", avg_cost)
     initial_qty = sym_data.get("initial_qty", 0)
     partial_qty = sym_data.get("partial_qty", 0)
-    exit_qty    = initial_qty - partial_qty
+    _pyr_qty = (sym_data.get("pyramid_qty", 0) + sym_data.get("step_f_qty", 0) +
+                sym_data.get("step_f2_qty", 0) + sym_data.get("step_e_qty", 0))
+    exit_qty    = initial_qty + _pyr_qty - partial_qty
     pnl_dollar  = (last_price - avg_cost) * exit_qty if avg_cost > 0 else 0.0
     stop_loss      = sym_data.get("stop_loss", 0.0)
     risk_per_share = (avg_cost - stop_loss) if stop_loss > 0 else avg_cost * 0.07
@@ -877,10 +879,14 @@ def check_positions() -> None:
         _today_str = datetime.now(_ET).strftime("%Y-%m-%d")
         if not sym.get("_meta_loaded") or sym.get("_meta_date") != _today_str:
             meta = _lookup_position_metadata(symbol)
+            _first_load = not sym.get("_meta_loaded")
             sym["_meta_loaded"]       = True
             sym["_meta_date"]         = _today_str
-            sym["stop_loss"]          = meta["stop_loss"]
-            sym["stop_loss_initial"]  = meta["stop_loss"]  # preserved for R-multiple calc
+            # Only set stop levels on first load — subsequent daily refreshes must not
+            # overwrite stops that have been ratcheted up by the trailing-stop logic.
+            if _first_load:
+                sym["stop_loss"]          = meta["stop_loss"]
+                sym["stop_loss_initial"]  = meta["stop_loss"]  # preserved for R-multiple calc
             sym["quality_score"]      = meta["quality_score"]
             sym["composite_score"]    = meta["composite_score"]
             sym["measured_move_pct"]  = meta["measured_move_pct"]
@@ -1127,10 +1133,10 @@ def check_positions() -> None:
                     _kclose  = _kdf["Close"].values
                     _khigh   = _kdf["High"].values
                     _klow    = _kdf["Low"].values
-                    # EMA20 of close
+                    # EMA20 of close — seed with mean of oldest 20 bars to eliminate bias
                     _alpha   = 2.0 / (20 + 1)
-                    _ema20   = _kclose[-20]
-                    for _cv in _kclose[-19:]:
+                    _ema20   = sum(_kclose[-21:-1]) / 20.0
+                    for _cv in _kclose[-1:]:
                         _ema20 = _alpha * _cv + (1 - _alpha) * _ema20
                     # ATR14
                     _ktr = [max(_khigh[i] - _klow[i],
@@ -1214,7 +1220,7 @@ def check_positions() -> None:
         composite      = sym.get("composite_score", 0.0)
         partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
         _regime_ts      = _get_cached_regime()
-        _base_ts        = 25 if _regime_ts == "bull" else (10 if _regime_ts == "neutral" else 15)
+        _base_ts        = 25 if _regime_ts == "bull" else (15 if _regime_ts == "neutral" else 10)
         time_stop_days  = max(_base_ts, 20) if composite >= 8.0 else _base_ts
 
         # ── Step G: Gap-up harvest — sell 50% on overnight gap ≥12% ─────────────
@@ -1526,9 +1532,9 @@ def check_positions() -> None:
                         if len(_dfp) >= 5:
                             # Find most recent swing low in last 20 bars (skip last 2 incomplete)
                             _lows  = _dfp["Low"].values
-                            _n_pt  = min(20, len(_lows) - 2)
+                            _n_start = max(1, len(_lows) - 21)
                             _swing = None
-                            for _i in range(1, _n_pt):
+                            for _i in range(_n_start, len(_lows) - 2):
                                 if _lows[_i] < _lows[_i - 1] and _lows[_i] < _lows[_i + 1]:
                                     _swing = _lows[_i]  # keep last (most recent) swing low
                             if _swing is not None:
@@ -1638,6 +1644,15 @@ def check_positions() -> None:
                 changed = True
                 _log.info("[monitor] %s B1 fill confirmed (order left open list)", symbol)
 
+        # ── Confirm pending B2 fill: same pattern as B1 ────────────────────────
+        if sym.get("_b2_fill_pending") and sym.get("_b2_order_id"):
+            _open_oids_b2 = {o.get("id", "") for o in _get_open_orders(symbol)}
+            if sym["_b2_order_id"] not in _open_oids_b2:
+                sym.pop("_b2_fill_pending", None)
+                sym.pop("_b2_order_id", None)
+                changed = True
+                _log.info("[monitor] %s B2 fill confirmed (order left open list)", symbol)
+
         _skip_b1_8w = sym.get("fast_mover") and _trading_days_held(sym.get("entry_date", "")) < 40
         if pnl_pct >= partial1_trigger and not sym.get("partial1_done") and not _skip_b1_8w:
             sell_qty = max(1, round(initial_qty / 3))
@@ -1659,16 +1674,22 @@ def check_positions() -> None:
         # ── Step B2: Second partial at measured move or +20% — sell 33%, tighten ─
         elif (sym.get("partial1_done") and
               not sym.get("_b1_fill_pending") and   # don't fire B2 until B1 confirmed filled
+              not sym.get("_b2_fill_pending") and   # don't re-fire B2 while awaiting confirmation
               pnl_pct >= partial2_trigger and
               not sym.get("partial2_done")):
             already_sold = sym.get("partial_qty", 0)
             sell_qty2 = max(1, round(initial_qty / 3))
             _lim2 = round(cur_price * 0.999, 2)
-            if _place_limit_sell(symbol, sell_qty2, _lim2):
+            _b2_oid_val = _place_limit_sell(symbol, sell_qty2, _lim2)
+            if _b2_oid_val:
                 sym["partial2_done"]  = True
                 sym["partial2_qty"]   = sell_qty2
                 sym["partial_qty"]    = already_sold + sell_qty2
                 sym["partial2_price"] = cur_price
+                # Track fill confirmation unless it was a market-sell fallback (instant fill)
+                if _b2_oid_val not in ("market", ""):
+                    sym["_b2_order_id"]    = _b2_oid_val
+                    sym["_b2_fill_pending"] = True
                 changed = True
                 _log.info("[monitor] ✓ %s PARTIAL-2 (33%%): sold %d sh @ $%.2f (+%.1f%%)"
                           " — runner with 5%% trailing",

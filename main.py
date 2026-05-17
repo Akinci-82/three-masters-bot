@@ -416,12 +416,13 @@ def _send_morning_briefing() -> None:
                         if pre and pre > stop_p * (1 + gap_threshold):
                             # Stock has gapped above stop — cancel to avoid chasing
                             from broker import cancel_all_orders
-                            from risk_manager import get_state as _grs, _load as _lrs, _save as _srs
+                            from risk_manager import get_state as _grs, _load as _lrs, _save as _srs, _RISK_LOCK
                             cancel_all_orders(sym)
-                            rs = _lrs()
-                            rs.get("positions_risk", {}).pop(sym, None)
-                            rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
-                            _srs(rs)
+                            with _RISK_LOCK:
+                                rs = _lrs()
+                                rs.get("positions_risk", {}).pop(sym, None)
+                                rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                                _srs(rs)
                             buy_stops.remove(o)
                             gapped_out.append((sym, pre, stop_p))
                             _log.info("[briefing] PRE-MARKET GAP: %s $%.2f >> stop $%.2f — order cancelled",
@@ -635,7 +636,7 @@ def _opening_range_check() -> None:
     try:
         import pytz, yfinance as yf
         from broker import get_open_orders, cancel_all_orders
-        from risk_manager import _load as _lrs, _save as _srs
+        from risk_manager import _load as _lrs, _save as _srs, _RISK_LOCK as _or_RISK_LOCK
 
         buy_stops = [o for o in get_open_orders()
                      if o.get("side") == "buy" and o.get("type") in ("stop", "stop_limit")]
@@ -656,10 +657,11 @@ def _opening_range_check() -> None:
             for o in buy_stops:
                 sym = o["symbol"]
                 cancel_all_orders(sym)
-                rs = _lrs()
-                rs.get("positions_risk", {}).pop(sym, None)
-                rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
-                _srs(rs)
+                with _or_RISK_LOCK:
+                    rs = _lrs()
+                    rs.get("positions_risk", {}).pop(sym, None)
+                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                    _srs(rs)
                 mkt_cancelled.append(sym)
             _log.info("[or_check] MARKET WEAK (SPY %.1f%% QQQ %.1f%%) — cancelled: %s",
                       spy_chg * 100, qqq_chg * 100, mkt_cancelled)
@@ -709,29 +711,32 @@ def _opening_range_check() -> None:
                     _log.debug("[%s] suppressed", __name__, exc_info=True)
                 if cur_price < stop_p * 0.998:
                     cancel_all_orders(sym)
-                    rs = _lrs()
-                    rs.get("positions_risk", {}).pop(sym, None)
-                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
-                    _srs(rs)
+                    with _or_RISK_LOCK:
+                        rs = _lrs()
+                        rs.get("positions_risk", {}).pop(sym, None)
+                        rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                        _srs(rs)
                     cancelled.append((sym, "no_price_confirm", cur_price, stop_p, 0))
                     _log.info("[or_check] CANCEL %s — price $%.2f below stop $%.2f",
                               sym, cur_price, stop_p)
                 elif not _vwap_ok:
                     cancel_all_orders(sym)
-                    rs = _lrs()
-                    rs.get("positions_risk", {}).pop(sym, None)
-                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
-                    _srs(rs)
+                    with _or_RISK_LOCK:
+                        rs = _lrs()
+                        rs.get("positions_risk", {}).pop(sym, None)
+                        rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                        _srs(rs)
                     vol_pct = vol_30min / vol_daily if vol_daily > 0 else 0
                     cancelled.append((sym, "below_vwap", cur_price, stop_p, vol_pct))
                     _log.info("[or_check] CANCEL %s — price $%.2f below VWAP (selling pressure)",
                               sym, cur_price)
                 elif not vol_ok:
                     cancel_all_orders(sym)
-                    rs = _lrs()
-                    rs.get("positions_risk", {}).pop(sym, None)
-                    rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
-                    _srs(rs)
+                    with _or_RISK_LOCK:
+                        rs = _lrs()
+                        rs.get("positions_risk", {}).pop(sym, None)
+                        rs["open_risk_pct"] = sum(rs.get("positions_risk", {}).values())
+                        _srs(rs)
                     vol_pct = vol_30min / vol_daily if vol_daily > 0 else 0
                     cancelled.append((sym, "low_volume", cur_price, stop_p, vol_pct))
                     _log.info("[or_check] CANCEL %s — weak volume %.0f%% of daily avg",
@@ -3105,6 +3110,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         for _sym in _stale_orders:
             _cancel_stale(_sym)
             orders_to_skip.discard(_sym)
+            max_new_pos += 1
             _log.info("[score] Cancelled stale order %s — composite dropped below %.1f", _sym, _MIN_COMPOSITE)
 
     # Sort by composite descending — Minervini dominates but Simons/Tudor contribute
@@ -3388,7 +3394,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             if not buy_order:
                 continue
             register_trade(vcp.symbol, sizing["risk_pct"])
-        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
         _b1_trigger = 0.15 if composite >= 8.0 else 0.10
         order_rec = {
@@ -3433,8 +3439,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "news_positive":   getattr(vcp, "news_positive", False),
         }
         orders_placed.append(order_rec)
-        cash -= sizing["notional"]
-        held_symbols.add(vcp.symbol)
+        if not _is_live():
+            cash -= sizing["notional"]
+            held_symbols.add(vcp.symbol)
 
         # OP1: Log active signals for this order to signal_accuracy.json
         try:
@@ -3997,6 +4004,9 @@ def main():
 
     if "--run-now" in sys.argv:
         _log.info("[main] --run-now flag — executing immediately")
+        if not _startup_healthcheck():
+            _log.critical("[main] Startup health check failed — aborting. Fix issues and restart.")
+            sys.exit(1)
         run_daily()
         return
 

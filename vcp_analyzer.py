@@ -209,6 +209,8 @@ def _atr_adjusted_stop(df: pd.DataFrame, entry: float, pivot_stop: float) -> flo
             return pivot_stop
         min_stop = entry - 1.0 * atr
         max_stop = entry - 3.0 * atr
+        if max_stop <= 0:
+            max_stop = entry * 0.85
         if pivot_stop > min_stop:
             return min_stop
         if pivot_stop < max_stop:
@@ -988,14 +990,14 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             if verdict == "skip":
                 return VCPResult(
                     symbol=symbol, passed=False, current_price=price,
-                    confidence=float(o_data.get("confidence", confidence)),
-                    breakout_level=float(o_data.get("breakout_level", breakout)),
-                    stop_loss=float(o_data.get("stop_loss", stop_loss)),
+                    confidence=float(o_data.get("confidence") or confidence),
+                    breakout_level=float(o_data.get("breakout_level") or breakout),
+                    stop_loss=float(o_data.get("stop_loss") or stop_loss),
                     fail_reason=f"opus_veto: {o_data.get('risk_factors','')[:80]}",
                     ai_verdict="opus_vetoed",
                     ai_reasoning=o_data.get("pattern_notes", ""),
                     breakout_volume=breakout_vol, last_candle=last_candle,
-                    quality_score=int(o_data.get("quality_score", quality)),
+                    quality_score=int(o_data.get("quality_score") or quality),
                     tier_used="opus",
                 )
             # Refine levels with Opus precision (clamp to valid ranges)

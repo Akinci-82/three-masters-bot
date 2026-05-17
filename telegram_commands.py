@@ -462,8 +462,11 @@ def _cmd_confirm_live(arg: str) -> str:
             try:
                 from risk_manager import register_trade as _reg
                 _reg(sym, risk_pct)
-            except Exception:
-                pass
+            except Exception as _reg_err:
+                _log.error("[confirm_live] register_trade failed for %s: %s", sym, _reg_err)
+                return (f"⚠️ *VARNING*: Order placerad men register\\_trade misslyckades för "
+                        f"*{_tg_escape(sym)}*: `{_reg_err}`\n"
+                        f"Risk-budget ej uppdaterad — order kvar i kön för manuell åtgärd.")
 
         # Remove from pending queue (atomic write)
         del pending[sym]

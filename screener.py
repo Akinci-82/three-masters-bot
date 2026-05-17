@@ -162,10 +162,16 @@ def _calc_rsi(close: pd.Series, period: int = 14) -> float:
     loss  = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
     rs    = gain / loss.replace(0, np.nan)
     rsi   = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    val   = float(rsi.iloc[-1])
+    if val != val:  # NaN check
+        return 50.0
+    return val
 
 
 def _rs_rating(close: pd.Series, spy_close: pd.Series) -> float:
+    common_idx = close.index.intersection(spy_close.index)
+    close      = close.loc[common_idx]
+    spy_close  = spy_close.loc[common_idx]
     n = min(len(close), len(spy_close), 252)
     if n < 60:
         return 50.0
@@ -645,12 +651,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             monthly_ok, monthly_note = _check_monthly_context(symbol)
             result.monthly_stage2 = monthly_ok
             if not monthly_ok:
-                # Soft reject: only block if weekly also shows weakness
-                # (monthly alone may lag; require both to fail before blocking)
-                if not result.weekly_ok or weekly_note.startswith("weekly_MA"):
-                    result.fail_reason = monthly_note
-                    return result
-                _log.debug("[screen] %s monthly Stage 2 weak (%s) — weekly OK, continuing", symbol, monthly_note)
+                result.fail_reason = monthly_note
+                return result
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
