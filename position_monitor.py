@@ -298,6 +298,7 @@ def _stop_order_alive(order_id: str) -> bool:
 
 def _infer_exit_step(sym_data: dict) -> str:
     """Infer primary exit step from state flags — avoids scattered exit_step assignments."""
+    if sym_data.get("slippage_exited"):        return "slippage_close"
     if sym_data.get("max_loss_exited"):       return "max_loss_cap"
     if sym_data.get("weekly_close_exited"):   return "W_weekly_close"
     if sym_data.get("earnings_closed"):       return "earnings_close"
@@ -926,7 +927,10 @@ def check_positions() -> None:
                     _log.warning("[monitor] %s SLIPPAGE GUARD >2%% (%.1f%%) — closing "
                                  "(fill=$%.2f planned=$%.2f)",
                                  symbol, _slip * 100, avg_cost, _planned)
+                    _cancel_stop_orders(symbol)   # avoid orphan GTC stop → unintended short
                     _place_market_sell(symbol, qty)
+                    sym["slippage_exited"] = True
+                    changed = True
                 elif _slip > 0.01:
                     _log.warning("[monitor] %s slippage >1%% (%.1f%%) — "
                                  "fill=$%.2f planned=$%.2f",
@@ -1433,10 +1437,12 @@ def check_positions() -> None:
                            and not sym.get("breakeven_done")
                            and not sym.get("partial_done"))
 
-        needs_stop = (not sym.get("trailing_stop_placed") or (
-            sym.get("trailing_stop_placed") and
-            sym.get("stop_order_id") and
-            not _stop_order_alive(sym["stop_order_id"])
+        needs_stop = (not sym.get("slippage_exited") and (
+            not sym.get("trailing_stop_placed") or (
+                sym.get("trailing_stop_placed") and
+                sym.get("stop_order_id") and
+                not _stop_order_alive(sym["stop_order_id"])
+            )
         ))
 
         if needs_stop:

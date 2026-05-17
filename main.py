@@ -2788,7 +2788,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _sh_held = any(p["symbol"] in ("SH", "PSQ") for p in positions)
         if not _sh_held:
             try:
-                from broker import place_buy_stop as _pbs_sh
+                from broker import place_market_buy as _pmb_sh
                 from risk_manager import position_size as _psz_sh, register_trade as _reg_sh
                 _sh_fi = yf.Ticker("SH").fast_info
                 _sh_px = float(getattr(_sh_fi, "last_price", None) or
@@ -2797,7 +2797,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                     _sh_stop = round(_sh_px * 0.95, 2)   # 5% stop on the hedge
                     _sh_sz   = _psz_sh(portfolio_value, _sh_px, _sh_stop, risk_pct=0.005)
                     if _sh_sz["shares"] >= 1:
-                        _sh_oid = _pbs_sh("SH", _sh_sz["shares"], _sh_px)
+                        _sh_oid = _pmb_sh("SH", _sh_sz["shares"])
                         if _sh_oid:
                             _reg_sh("SH", _sh_sz["risk_pct"])
                             _bear_hedge_placed = True
