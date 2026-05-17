@@ -15,10 +15,36 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.common.exceptions import APIError
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
+from config import (
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, ALPACA_LIVE,
+    ALPACA_PAPER_COMPARE_KEY, ALPACA_PAPER_COMPARE_SECRET,
+)
 
 _log = logging.getLogger(__name__)
 _api: TradingClient | None = None
+
+
+def is_live() -> bool:
+    """True when the bot is trading against a live (non-paper) Alpaca account."""
+    return ALPACA_LIVE
+
+
+def _live_notify(msg: str) -> None:
+    """Send Telegram alert for live-account order events. No-op in paper mode."""
+    if not ALPACA_LIVE:
+        return
+    try:
+        import os as _os, requests as _req
+        _tok  = _os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        _chat = _os.environ.get("TELEGRAM_CHAT_ID", "")
+        if _tok and _chat:
+            _req.post(
+                f"https://api.telegram.org/bot{_tok}/sendMessage",
+                json={"chat_id": _chat, "text": msg, "parse_mode": "Markdown"},
+                timeout=8,
+            )
+    except Exception:
+        pass
 
 
 class AlpacaError(RuntimeError):
@@ -145,8 +171,13 @@ def place_sell_stop(symbol: str, qty: int, stop_price: float) -> dict | None:
         )
         _log.info("[broker] SELL-STOP %s qty=%d stop=$%.2f id=%s",
                   symbol, qty, stop_price, order.id)
-        return {"id": str(order.id), "symbol": symbol, "qty": qty,
-                "stop": stop_price, "type": "sell_stop"}
+        result = {"id": str(order.id), "symbol": symbol, "qty": qty,
+                  "stop": stop_price, "type": "sell_stop"}
+        _live_notify(
+            f"🔴 *LIVE STOP PLACED*: *{symbol}* stop ${stop_price:.2f} (qty {qty})\n"
+            f"Order ID: `{order.id}`"
+        )
+        return result
     except Exception as e:
         _log.error("[broker] SELL-STOP %s FAILED (stop NOT placed): %s", symbol, e)
         return None
@@ -237,3 +268,21 @@ def get_open_orders() -> list[dict]:
     except Exception as e:
         _log.error("[broker] get_orders FAILED after retries: %s", e)
         raise AlpacaError(f"get_orders failed: {e}") from e
+
+
+def get_paper_comparison_equity() -> float | None:
+    """Return portfolio value of the paper comparison account.
+
+    Only meaningful when ALPACA_LIVE=true and the THREE_MASTERS_ALPACA_PAPER_*
+    env vars are set (a separate paper account used as benchmark).
+    Returns None if credentials are not configured.
+    """
+    if not ALPACA_PAPER_COMPARE_KEY or not ALPACA_PAPER_COMPARE_SECRET:
+        return None
+    try:
+        _paper_api = TradingClient(ALPACA_PAPER_COMPARE_KEY, ALPACA_PAPER_COMPARE_SECRET, paper=True)
+        acct = _paper_api.get_account()
+        return float(acct.portfolio_value)
+    except Exception as e:
+        _log.debug("[broker] Paper comparison equity fetch failed: %s", e)
+        return None

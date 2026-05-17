@@ -92,6 +92,52 @@ def _tg(msg: str) -> bool:
         return False
 
 
+# ── Live trading — pending order queue ───────────────────────────────────────
+_PENDING_LIVE_ORDERS_FILE = LOG_DIR / "pending_live_orders.json"
+
+
+def _load_pending_live_orders() -> dict:
+    try:
+        if _PENDING_LIVE_ORDERS_FILE.exists():
+            return json.loads(_PENDING_LIVE_ORDERS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_pending_live_orders(orders: dict) -> None:
+    try:
+        _tmp = _PENDING_LIVE_ORDERS_FILE.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(orders, indent=2))
+        _tmp.replace(_PENDING_LIVE_ORDERS_FILE)
+    except Exception as e:
+        _log.warning("[main] pending_live_orders save failed: %s", e)
+
+
+def _queue_live_order(symbol: str, qty: int, stop_price: float,
+                      composite_score: float = 0.0,
+                      vcp_confidence: float = 0.0) -> None:
+    """Queue a buy-stop for manual /confirm_live confirmation (live mode only)."""
+    now     = datetime.now(timezone.utc)
+    orders  = _load_pending_live_orders()
+    orders[symbol] = {
+        "symbol":          symbol,
+        "qty":             qty,
+        "stop_price":      round(stop_price, 2),
+        "composite_score": round(composite_score, 2),
+        "vcp_confidence":  round(vcp_confidence, 3),
+        "queued_at":       now.isoformat(),
+        "expires_at":      (now + timedelta(hours=24)).isoformat(),
+    }
+    _save_pending_live_orders(orders)
+    _tg(
+        f"⚠️ *LIVE ORDER QUEUED*: *{symbol}* BUY-STOP {qty}sh @ ${stop_price:.2f}\n"
+        f"Score: {composite_score:.1f} | Conf: {vcp_confidence*100:.0f}%\n"
+        f"Reply `/confirm_live {symbol} {qty} {stop_price:.2f}` to execute\n"
+        f"_(expires in 24h — use /live\\_orders to list all pending)_"
+    )
+
+
 # ── Config hot-reload ────────────────────────────────────────────────────────
 _CONFIG_OVERRIDE = BASE_DIR / "config.override.json"
 
@@ -1029,6 +1075,27 @@ def _send_weekly_report(portfolio_value: float) -> None:
                         lines.append(f"  ⚠️ Svaga signals (WR<35%, ≥5 trades):")
                         for _bs in _bad_signals[:5]:
                             lines.append(f"    — {_bs}")
+        except Exception:
+            _log.debug("[%s] suppressed", __name__, exc_info=True)
+
+        # ── Paper vs Live P&L comparison (only in live mode with paper benchmark creds) ──
+        try:
+            from broker import is_live as _wk_is_live, get_paper_comparison_equity as _wk_paper_eq
+            if _wk_is_live():
+                _paper_eq = _wk_paper_eq()
+                if _paper_eq and portfolio_value > 0:
+                    _diff_pct = (portfolio_value - _paper_eq) / _paper_eq * 100
+                    _diff_str = f"{_diff_pct:+.1f}%"
+                    lines.append("")
+                    lines.append(f"*📊 Paper vs Live:*")
+                    lines.append(f"  Live:  ${portfolio_value:>10,.0f}")
+                    lines.append(f"  Paper: ${_paper_eq:>10,.0f}")
+                    if _diff_pct < -10:
+                        lines.append(f"  ⚠️ Live underperformar paper med {abs(_diff_pct):.1f}%")
+                    elif _diff_pct < 0:
+                        lines.append(f"  🔶 Live {_diff_str} vs paper")
+                    else:
+                        lines.append(f"  ✅ Live outperformar paper med {_diff_pct:.1f}%")
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
 
@@ -3288,9 +3355,29 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             _reject_reasons[vcp.symbol] = "price extended past breakout"
             continue
 
-        buy_order = place_buy_stop(vcp.symbol, sizing["shares"], vcp.breakout_level)
-        if not buy_order:
-            continue
+        from broker import is_live as _is_live
+        if _is_live():
+            # ── Live mode: pre-check + queue for manual /confirm_live ──────
+            try:
+                _live_cur = float(yf.Ticker(vcp.symbol).fast_info.last_price)
+                if vcp.breakout_level <= _live_cur * 1.001:
+                    _log.warning(
+                        "[tudor] %s LIVE pre-check FAIL: breakout $%.2f ≤ current×1.001 $%.2f — not queued",
+                        vcp.symbol, vcp.breakout_level, _live_cur * 1.001)
+                    _tg(f"⚠️ *Live pre-check*: {vcp.symbol} breakout ${vcp.breakout_level:.2f} "
+                        f"≤ current ${_live_cur:.2f}×1.001 — order not queued")
+                    _reject_reasons[vcp.symbol] = "live pre-check: breakout ≤ current×1.001"
+                    continue
+            except Exception:
+                _log.debug("[%s] suppressed", __name__, exc_info=True)
+            _queue_live_order(vcp.symbol, sizing["shares"], vcp.breakout_level,
+                              composite, vcp.confidence)
+            buy_order: dict = {"id": None}  # pending — no Alpaca order yet
+        else:
+            # ── Paper mode: place immediately ─────────────────────────────
+            buy_order = place_buy_stop(vcp.symbol, sizing["shares"], vcp.breakout_level)
+            if not buy_order:
+                continue
 
         register_trade(vcp.symbol, sizing["risk_pct"])
         sector_counts[sec] = sector_counts.get(sec, 0) + 1

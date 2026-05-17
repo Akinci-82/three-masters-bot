@@ -15,9 +15,13 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
+
+_BASE = Path(__file__).parent
+_LOG_DIR = _BASE / "logs"
 
 _log = logging.getLogger(__name__)
 _POLL_INTERVAL = 5   # seconds between getUpdates calls
@@ -355,7 +359,125 @@ def _cmd_risk() -> str:
         return f"Fel vid hämtning av risk-state: {_e}"
 
 
+def _cmd_live_orders() -> str:
+    """List pending live buy-stop orders awaiting /confirm_live."""
+    try:
+        from broker import is_live
+        if not is_live():
+            return "ℹ️ Bot kör i paper-läge — inga live-ordrar."
+        pending_file = _LOG_DIR / "pending_live_orders.json"
+        if not pending_file.exists():
+            return "✅ Inga väntande live-ordrar."
+        pending = json.loads(pending_file.read_text())
+        # Purge expired entries
+        now = datetime.now(timezone.utc)
+        active = {}
+        for sym, o in pending.items():
+            try:
+                exp = datetime.fromisoformat(o["expires_at"])
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now <= exp:
+                    active[sym] = o
+            except Exception:
+                active[sym] = o
+        if not active:
+            return "✅ Inga väntande live-ordrar (alla har löpt ut)."
+        lines = ["📋 *Väntande live-ordrar* — bekräfta med /confirm\\_live:\n"]
+        for sym, o in active.items():
+            lines.append(
+                f"• *{_tg_escape(sym)}* {o['qty']}sh @ ${o['stop_price']:.2f} "
+                f"| Score: {o.get('composite_score', 0):.1f} "
+                f"| Conf: {o.get('vcp_confidence', 0)*100:.0f}%\n"
+                f"  `/confirm_live {sym} {o['qty']} {o['stop_price']:.2f}`"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Fel: {e}"
+
+
+def _cmd_confirm_live(arg: str) -> str:
+    """Confirm and execute a pending live buy-stop order.
+
+    Usage: /confirm_live SYMBOL QTY PRICE
+    Example: /confirm_live NVDA 50 213.40
+    """
+    try:
+        from broker import is_live, place_buy_stop
+        if not is_live():
+            return "⚠️ Bot kör i paper-läge (ALPACA\\_LIVE=true krävs för live-trading)."
+        parts = arg.strip().split()
+        if len(parts) != 3:
+            return ("Användning: /confirm\\_live SYMBOL QTY PRICE\n"
+                    "Exempel: /confirm\\_live NVDA 50 213.40")
+        sym = parts[0].upper()
+        try:
+            qty   = int(parts[1])
+            price = float(parts[2])
+        except ValueError:
+            return "Ogiltigt format — QTY måste vara heltal och PRICE ett decimaltal."
+
+        pending_file = _LOG_DIR / "pending_live_orders.json"
+        if not pending_file.exists():
+            return f"Ingen väntande order för {sym}."
+        pending = json.loads(pending_file.read_text())
+        order = pending.get(sym)
+        if not order:
+            return (f"Ingen väntande order för *{_tg_escape(sym)}*.\n"
+                    "Visa alla med /live\\_orders")
+
+        # Check expiry
+        try:
+            exp = datetime.fromisoformat(order["expires_at"])
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > exp:
+                del pending[sym]
+                _tmp = pending_file.with_suffix(".json.tmp")
+                _tmp.write_text(json.dumps(pending, indent=2))
+                _tmp.replace(pending_file)
+                return (f"⏰ Order för *{_tg_escape(sym)}* har löpt ut (24h).\n"
+                        "Kör /scan för att generera en ny order.")
+        except Exception:
+            pass
+
+        # Validate qty and price match
+        if order["qty"] != qty:
+            return (f"Qty matchar inte: förväntad {order['qty']}, fick {qty}.\n"
+                    f"Korrekt: `/confirm_live {sym} {order['qty']} {order['stop_price']:.2f}`")
+        if abs(order["stop_price"] - price) > 0.02:
+            return (f"Pris matchar inte: förväntad ${order['stop_price']:.2f}, fick ${price:.2f}.\n"
+                    f"Korrekt: `/confirm_live {sym} {qty} {order['stop_price']:.2f}`")
+
+        # Place the live order
+        result = place_buy_stop(sym, qty, price)
+        if not result:
+            return f"❌ Order för *{_tg_escape(sym)}* misslyckades — se Alpaca-loggar."
+
+        # Remove from pending queue
+        del pending[sym]
+        _tmp = pending_file.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(pending, indent=2))
+        _tmp.replace(pending_file)
+
+        return (f"✅ *LIVE ORDER PLACERAD*\n"
+                f"Symbol: *{_tg_escape(sym)}* BUY-STOP {qty}sh @ ${price:.2f}\n"
+                f"Order ID: `{result.get('id', '?')}`")
+    except Exception as e:
+        return f"❌ Fel vid /confirm\\_live: {e}"
+
+
 def _cmd_help() -> str:
+    try:
+        from broker import is_live
+        live_section = (
+            "\n"
+            "*Live-trading:*\n"
+            "/live\\_orders — visa väntande live-ordrar\n"
+            "/confirm\\_live SYMBOL QTY PRICE — bekräfta och skicka live-order\n"
+        ) if is_live() else ""
+    except Exception:
+        live_section = ""
     return (
         "🤖 *Three Masters Bot — Kommandon*\n"
         "\n"
@@ -374,6 +496,7 @@ def _cmd_help() -> str:
         "*Åtgärder:*\n"
         "/scan — kör dagens VCP-scan manuellt\n"
         "/briefing — utlös morning briefing nu\n"
+        + live_section +
         "/help — denna lista"
     )
 
@@ -415,6 +538,13 @@ def _handle_update(update: dict) -> None:
         _send(_cmd_size(arg))
     elif cmd == "/briefing":
         _send(_cmd_briefing())
+    elif cmd == "/live_orders":
+        _send(_cmd_live_orders())
+    elif cmd == "/confirm_live":
+        if not arg:
+            _send("Användning: /confirm\\_live SYMBOL QTY PRICE\nEx: /confirm\\_live NVDA 50 213.40")
+        else:
+            _send(_cmd_confirm_live(arg))
     elif cmd == "/scan":
         try:
             import main as _main_mod

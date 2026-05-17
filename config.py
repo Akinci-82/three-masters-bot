@@ -18,6 +18,20 @@ ALPACA_API_KEY    = os.environ.get("THREE_MASTERS_ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("THREE_MASTERS_ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL   = os.environ.get("THREE_MASTERS_ALPACA_URL", "https://paper-api.alpaca.markets")
 
+# ── Live trading flag ─────────────────────────────────────────────────────────
+# Set ALPACA_LIVE=true in .env to switch from paper to live account.
+# When enabled, ALPACA_BASE_URL is overridden to the live endpoint and the
+# paper-URL guard in _validate_config() is bypassed.
+ALPACA_LIVE = os.environ.get("ALPACA_LIVE", "").lower() == "true"
+if ALPACA_LIVE:
+    ALPACA_BASE_URL = "https://api.alpaca.markets"
+
+# Optional paper account for paper-vs-live P&L comparison (weekly report).
+# Set these in .env when running ALPACA_LIVE=true and you want to benchmark
+# the live account against a parallel paper account.
+ALPACA_PAPER_COMPARE_KEY    = os.environ.get("THREE_MASTERS_ALPACA_PAPER_KEY", "")
+ALPACA_PAPER_COMPARE_SECRET = os.environ.get("THREE_MASTERS_ALPACA_PAPER_SECRET", "")
+
 # ── Claude AI (Minervini VCP layer) ─────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FMP_API_KEY        = os.environ.get("FMP_API_KEY", "")
@@ -200,9 +214,11 @@ def _validate_config() -> None:
     _chk(r.get("max_positions_per_sector", 1) <= r["max_positions"],
          f"max_positions_per_sector ({r.get('max_positions_per_sector')}) > max_positions ({r['max_positions']})")
 
-    # Refuse to proceed if URL is not a paper endpoint — hard guard against live-account accidents
-    _chk("paper" in ALPACA_BASE_URL.lower(),
-         f"ALPACA_BASE_URL '{ALPACA_BASE_URL}' does not contain 'paper' — refusing to run against live account")
+    # Paper-URL guard: refuse to run against live account unless explicitly opted in
+    if not ALPACA_LIVE:
+        _chk("paper" in ALPACA_BASE_URL.lower(),
+             f"ALPACA_BASE_URL '{ALPACA_BASE_URL}' does not contain 'paper' — "
+             "refusing to run against live account. Set ALPACA_LIVE=true in .env to enable live trading.")
 
     if errors:
         raise ValueError("Config validation failed:\n" + "\n".join(f"  • {e}" for e in errors))
