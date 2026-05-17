@@ -172,11 +172,12 @@ def _cmd_cancel(symbol: str) -> str:
         if not before:
             return f"No open buy-stop orders found for {sym}."
         n = cancel_all_orders(sym)
-        from risk_manager import get_state, _load, _save
-        state = _load()
-        state.get("positions_risk", {}).pop(sym, None)
-        state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
-        _save(state)
+        from risk_manager import get_state, _load, _save, _RISK_LOCK
+        with _RISK_LOCK:
+            state = _load()
+            state.get("positions_risk", {}).pop(sym, None)
+            state["open_risk_pct"] = sum(state.get("positions_risk", {}).values())
+            _save(state)
         return f"✅ Cancelled {n} order(s) for *{_tg_escape(sym)}* and removed from risk state."
     except Exception as e:
         return f"Error cancelling {symbol}: {e}"

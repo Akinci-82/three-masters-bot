@@ -9,6 +9,7 @@ Quantitative screening with full filter chain:
 """
 from __future__ import annotations
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
