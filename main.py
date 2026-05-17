@@ -116,8 +116,13 @@ def _save_pending_live_orders(orders: dict) -> None:
 
 def _queue_live_order(symbol: str, qty: int, stop_price: float,
                       composite_score: float = 0.0,
-                      vcp_confidence: float = 0.0) -> None:
-    """Queue a buy-stop for manual /confirm_live confirmation (live mode only)."""
+                      vcp_confidence: float = 0.0,
+                      risk_pct: float = 0.0) -> None:
+    """Queue a buy-stop for manual /confirm_live confirmation (live mode only).
+
+    register_trade() is intentionally NOT called here — the order has not been
+    placed yet. /confirm_live calls register_trade() once the order is executed.
+    """
     now     = datetime.now(timezone.utc)
     orders  = _load_pending_live_orders()
     orders[symbol] = {
@@ -126,6 +131,7 @@ def _queue_live_order(symbol: str, qty: int, stop_price: float,
         "stop_price":      round(stop_price, 2),
         "composite_score": round(composite_score, 2),
         "vcp_confidence":  round(vcp_confidence, 3),
+        "risk_pct":        round(risk_pct, 6),
         "queued_at":       now.isoformat(),
         "expires_at":      (now + timedelta(hours=24)).isoformat(),
     }
@@ -3370,16 +3376,18 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                     continue
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
+            # Store risk_pct so /confirm_live can call register_trade() when the order
+            # is actually placed — we must NOT register here because the order may expire
+            # unconfirmed, which would permanently lock up risk budget.
             _queue_live_order(vcp.symbol, sizing["shares"], vcp.breakout_level,
-                              composite, vcp.confidence)
+                              composite, vcp.confidence, sizing["risk_pct"])
             buy_order: dict = {"id": None}  # pending — no Alpaca order yet
         else:
             # ── Paper mode: place immediately ─────────────────────────────
             buy_order = place_buy_stop(vcp.symbol, sizing["shares"], vcp.breakout_level)
             if not buy_order:
                 continue
-
-        register_trade(vcp.symbol, sizing["risk_pct"])
+            register_trade(vcp.symbol, sizing["risk_pct"])
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
         _b1_trigger = 0.15 if composite >= 8.0 else 0.10

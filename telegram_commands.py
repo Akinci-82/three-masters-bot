@@ -454,7 +454,18 @@ def _cmd_confirm_live(arg: str) -> str:
         if not result:
             return f"❌ Order för *{_tg_escape(sym)}* misslyckades — se Alpaca-loggar."
 
-        # Remove from pending queue
+        # Register trade in risk manager now that the order is actually placed.
+        # This was intentionally deferred from queue time to prevent permanently
+        # locking up risk budget for unconfirmed orders.
+        risk_pct = float(order.get("risk_pct", 0.0))
+        if risk_pct > 0:
+            try:
+                from risk_manager import register_trade as _reg
+                _reg(sym, risk_pct)
+            except Exception:
+                pass
+
+        # Remove from pending queue (atomic write)
         del pending[sym]
         _tmp = pending_file.with_suffix(".json.tmp")
         _tmp.write_text(json.dumps(pending, indent=2))
