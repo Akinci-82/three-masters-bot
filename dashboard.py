@@ -743,16 +743,36 @@ def create_app():
   <!-- ── Trade journal ────────────────────────────────────────────────── -->
   <div class="table-card">
     <div class="table-header">
-      <h2>Recent Trades</h2>
+      <h2>Trade Journal</h2>
       <div class="table-header-right">
-        <span class="count">last 15</span>
+        <span class="count" id="journal-count">—</span>
         <a href="/api/journal.csv" download="trade_journal.csv" class="btn-csv">&#8595; CSV</a>
       </div>
     </div>
+    <div style="padding:10px 20px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border2);align-items:center">
+      <input id="jf-sym" type="text" placeholder="Symbol…" oninput="filterJournal()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:6px;font-size:12px;width:90px;outline:none;text-transform:uppercase;font-family:inherit">
+      <select id="jf-step" onchange="filterJournal()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:6px;font-size:12px;outline:none;font-family:inherit">
+        <option value="">All exit steps</option>
+        <option value="stop">Stop</option>
+        <option value="B1">B1 (+15%)</option>
+        <option value="B2">B2 (+20%)</option>
+        <option value="C">C (breakeven)</option>
+        <option value="D">D (time stop)</option>
+        <option value="W">W (weekly)</option>
+        <option value="P">P (pyramid)</option>
+      </select>
+      <select id="jf-r" onchange="filterJournal()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:6px;font-size:12px;outline:none;font-family:inherit">
+        <option value="">All R</option>
+        <option value="win">Winners only</option>
+        <option value="loss">Losers only</option>
+        <option value="1r">≥ 1R</option>
+        <option value="2r">≥ 2R</option>
+      </select>
+    </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>Date</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&amp;L %</th><th>P&amp;L $</th><th>R-Multiple</th></tr></thead>
-        <tbody id="journal-body"><tr class="empty-row"><td colspan="7">No closed trades yet</td></tr></tbody>
+        <thead><tr><th>Date</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Exit Step</th><th>P&amp;L %</th><th>P&amp;L $</th><th>R-Multiple</th></tr></thead>
+        <tbody id="journal-body"><tr class="empty-row"><td colspan="8">No closed trades yet</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -776,6 +796,7 @@ def create_app():
     let equityChart = null, sectorChart = null, monthlyChart = null;
     let _fullHistory = [], _fullSpy = [];
     let _tf = 'ALL';
+    let _allJournal  = [];
 
     // ── Theme ──────────────────────────────────────────────────────────────
     function toggleTheme() {
@@ -848,6 +869,33 @@ def create_app():
       if (rs === null || rs === undefined) return '<span class="muted">—</span>';
       const cls = rs >= 80 ? 'rs-high' : rs >= 60 ? 'rs-mid' : 'rs-low';
       return `<span class="${cls}">${Number(rs).toFixed(0)}</span>`;
+    }
+
+    // ── Journal filter ─────────────────────────────────────────────────────
+    function filterJournal() {
+      const sym  = (document.getElementById('jf-sym').value||'').trim().toUpperCase();
+      const step = document.getElementById('jf-step').value;
+      const rF   = document.getElementById('jf-r').value;
+      let rows   = _allJournal;
+      if (sym)          rows = rows.filter(t=>(t.symbol||'').includes(sym));
+      if (step)         rows = rows.filter(t=>(t.exit_step||t.reason||'').includes(step));
+      if (rF==='win')   rows = rows.filter(t=>(t.pnl_pct||0)>=0);
+      if (rF==='loss')  rows = rows.filter(t=>(t.pnl_pct||0)<0);
+      if (rF==='1r')    rows = rows.filter(t=>(t.r_multiple||0)>=1);
+      if (rF==='2r')    rows = rows.filter(t=>(t.r_multiple||0)>=2);
+      document.getElementById('journal-count').textContent=rows.length+' trade'+(rows.length!==1?'s':'');
+      document.getElementById('journal-body').innerHTML=rows.length
+        ?rows.map(t=>`<tr>
+            <td class="muted" style="font-size:12px">${(t.ts||'').slice(0,10)}</td>
+            <td><a href="https://finance.yahoo.com/quote/${t.symbol}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none"><span class="sym">${t.symbol}</span></a></td>
+            <td class="num">$${t.avg_cost}</td>
+            <td class="num">$${t.exit_price}</td>
+            <td class="muted" style="font-size:12px">${t.exit_step||t.reason||'—'}</td>
+            <td>${pnlBadge(t.pnl_pct,'%')}</td>
+            <td>${pnlBadge(t.pnl_dollar,'')}</td>
+            <td><span class="r-badge ${(t.r_multiple||0)>=1?'r-win':'r-loss'}">${t.r_multiple!=null?t.r_multiple+'R':'—'}</span></td>
+          </tr>`).join('')
+        :'<tr class="empty-row"><td colspan="8">No matching trades</td></tr>';
     }
 
     // ── Timeframe filter ───────────────────────────────────────────────────
@@ -1106,7 +1154,8 @@ def create_app():
         renderMonthlyChart(d.monthly_pnl||[]);
 
         // Performance
-        const j = d.journal||[];
+        _allJournal = d.journal||[];
+        const j = _allJournal;
         const wins = j.filter(t=>t.pnl_pct>=0).length;
         const wr   = j.length?(wins/j.length*100).toFixed(0)+'%':'—';
         const avgR = j.length?(j.reduce((s,t)=>s+(t.r_multiple||0),0)/j.length).toFixed(2)+'R':'—';
@@ -1213,19 +1262,8 @@ def create_app():
             }).join('')
           : '<div class="token-row"><div class="muted" style="flex:1">No API calls today</div></div>';
 
-        // Journal
-        const jrn = d.journal||[];
-        document.getElementById('journal-body').innerHTML = jrn.length
-          ? jrn.map(t=>`<tr>
-              <td class="muted" style="font-size:12px">${(t.ts||'').slice(0,10)}</td>
-              <td><span class="sym">${t.symbol}</span></td>
-              <td class="num">$${t.avg_cost}</td>
-              <td class="num">$${t.exit_price}</td>
-              <td>${pnlBadge(t.pnl_pct,'%')}</td>
-              <td>${pnlBadge(t.pnl_dollar,'')}</td>
-              <td><span class="r-badge ${(t.r_multiple||0)>=1?'r-win':'r-loss'}">${t.r_multiple}R</span></td>
-            </tr>`).join('')
-          : '<tr class="empty-row"><td colspan="7">No closed trades yet</td></tr>';
+        // Journal — filter + render via filterJournal()
+        filterJournal();
 
         // Signal accuracy
         const sa   = d.signal_accuracy || {};
@@ -1307,6 +1345,34 @@ def create_app():
         return Response(buf.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition":"attachment; filename=trade_journal.csv"})
 
+    @app.route("/health")
+    def health():
+        from datetime import timezone as _tz
+        hb      = _read_json(BASE / "logs" / "heartbeat.json")
+        ts      = hb.get("last_run") or hb.get("last_heartbeat", "")
+        stale   = True
+        age_min = None
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                age_min = round((datetime.now(_tz.utc) - dt).total_seconds() / 60, 1)
+                stale   = age_min > 20
+            except Exception:
+                pass
+        risk   = _read_json(BASE / "logs" / "risk_state.json")
+        halted = bool(risk.get("trading_halted", False))
+        ok     = not stale and bool(ts)
+        return jsonify({
+            "status":            "ok" if ok else "error",
+            "last_heartbeat":    ts or None,
+            "heartbeat_age_min": age_min,
+            "trading_halted":    halted,
+            "halt_reason":       risk.get("halt_reason", "") if halted else "",
+            "service":           "running" if ok else "stale",
+        }), 200 if ok else 503
+
     @app.route("/api/calc")
     def calc_position():
         sym      = freq.args.get("symbol","").upper().strip()
@@ -1342,7 +1408,7 @@ def create_app():
 
 def _build_state() -> dict:
     risk    = _read_json(BASE / "logs" / "risk_state.json")
-    journal = _read_jsonl(BASE / "logs" / "trade_journal.jsonl", tail=15)
+    journal = _read_jsonl(BASE / "logs" / "trade_journal.jsonl", tail=10000)
     monitor = _read_json(BASE / "logs" / "monitor_state.json")
 
     signal_accuracy = _read_json(BASE / "logs" / "signal_accuracy.json")

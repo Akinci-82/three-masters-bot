@@ -92,6 +92,47 @@ def _tg(msg: str) -> bool:
         return False
 
 
+# ── Config hot-reload ────────────────────────────────────────────────────────
+_CONFIG_OVERRIDE = BASE_DIR / "config.override.json"
+
+def _load_config_override() -> None:
+    """Apply config.override.json (if present) to live RISK/VCP_FILTER dicts.
+
+    Allows adjusting risk_per_trade_pct, max_positions, min_confidence without
+    restarting the service.  Keys not present in the file are left unchanged.
+    Delete or empty the file to revert to defaults on the next scan.
+    """
+    if not _CONFIG_OVERRIDE.exists():
+        return
+    try:
+        from config import RISK, VCP_FILTER
+        overrides = json.loads(_CONFIG_OVERRIDE.read_text())
+        applied: list[str] = []
+
+        if "risk_per_trade_pct" in overrides:
+            val = float(overrides["risk_per_trade_pct"])
+            if 0 < val <= 0.03:
+                RISK["risk_per_trade_pct"] = val
+                applied.append(f"risk_per_trade_pct={val:.3f}")
+        if "max_positions" in overrides:
+            val = int(overrides["max_positions"])
+            if 1 <= val <= 20:
+                RISK["max_positions"] = val
+                applied.append(f"max_positions={val}")
+        if "min_confidence" in overrides:
+            val = float(overrides["min_confidence"])
+            if 0 < val <= 1.0:
+                VCP_FILTER["min_confidence"] = val
+                applied.append(f"min_confidence={val:.2f}")
+
+        if applied:
+            _log.info("[main] config.override.json applied: %s", ", ".join(applied))
+        else:
+            _log.debug("[main] config.override.json present but no valid keys")
+    except Exception as e:
+        _log.warning("[main] config.override.json load failed: %s", e)
+
+
 # ── Shutdown ──────────────────────────────────────────────────────────────────
 _SHUTDOWN = False
 _monitor_stop = threading.Event()
@@ -2384,6 +2425,7 @@ def _archive_old_jsonl(max_age_days: int = 180):
 
 def _run_daily_impl():
     """Actual pipeline — always called under _SCAN_LOCK."""
+    _load_config_override()
     _heartbeat()
 
     today = str(date.today())
