@@ -1125,6 +1125,7 @@ def _run_sunday_opus_analysis() -> None:
     try:
         import anthropic as _ant
         from config import CLAUDE_MODEL_ULTRA, ANTHROPIC_API_KEY
+        from screener import get_sector
 
         ms_file = LOG_DIR / "monitor_state.json"
         rs_file = LOG_DIR / "risk_state.json"
