@@ -3071,7 +3071,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     for vcp in vcp_passed:
         trend_r = trend_map.get(vcp.symbol)
         if trend_r is None:
-            scored.append((vcp, trend_r, 0.0))
+            _log.debug("[score] %s — no trend_map entry, skipping", vcp.symbol)
             continue
         sec_bonus = _sector_bonus(vcp.symbol, sector_momentum, sector_stage2)
         cs = _composite_score(vcp, trend_r, _rs_now, regime, sec_bonus, _breadth_pct, _power_trend, _current_pcr, _rate_slope_bps, _vix_slope, _dist_days, _nh_nl_ratio, _breadth_trend, _ad_divergence)
