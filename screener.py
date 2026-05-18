@@ -182,16 +182,20 @@ def _calc_rsi(close: pd.Series, period: int = 14) -> float:
 
 
 def _rs_rating(close: pd.Series, spy_close: pd.Series) -> float:
+    """Return raw relative return vs SPY over 12 months.
+    P3-fix: no longer applies the arbitrary *200 linear scaling.
+    run() converts these raw values to true percentile ranks [1-99] after
+    all symbols are processed, so each symbol is ranked against the universe.
+    """
     common_idx = close.index.intersection(spy_close.index)
     close      = close.loc[common_idx]
     spy_close  = spy_close.loc[common_idx]
     n = min(len(close), len(spy_close), 252)
     if n < 60:
-        return 50.0
-    stock_perf = close.iloc[-1] / close.iloc[-n] - 1
-    spy_perf   = spy_close.iloc[-1] / spy_close.iloc[-n] - 1
-    rs = 50 + (stock_perf - spy_perf) * 200
-    return float(np.clip(rs, 1, 99))
+        return 0.0  # sentinel: insufficient data
+    stock_perf = float(close.iloc[-1] / close.iloc[-n] - 1)
+    spy_perf   = float(spy_close.iloc[-1] / spy_close.iloc[-n] - 1)
+    return round(stock_perf - spy_perf, 6)  # raw excess return, ranked by run()
 
 
 def _check_monthly_context(symbol: str) -> tuple[bool, str]:
@@ -603,10 +607,9 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         adx_val  = _compute_adx(df)
         # At 52-week high: within 2% = no overhead supply from prior holders
         at_52w_high_val = abs(pct_from_high) <= 0.02
-        # Accumulation days: up-close bars on above-avg volume in the base
-        _up_days_df     = _df50[_df50["Close"] >= _df50["Open"]]
-        _accum_d        = _up_days_df[_up_days_df["Volume"] >= avg_vol]
-        accum_ratio_val = round(_accum_d.shape[0] / max(_up_days_df.shape[0], 1), 3)
+        # P3.8: normalized A/D oscillator [-1, +1]: positive = accumulation, negative = distribution
+        _tot_v = _up_v + _dn_v
+        accum_ratio_val = round((_up_v - _dn_v) / _tot_v, 3) if _tot_v > 0 else 0.0
 
         # Earnings check (do early — cheap to skip)
         days_earn = _days_to_earnings(symbol)
@@ -1329,6 +1332,19 @@ def run(symbols: list[str] | None = None, workers: int = 10) -> list[TrendResult
             if i % 50 == 0:
                 passed = sum(1 for r in results if r.passed)
                 _log.info("[screen] %d/%d done (%d passed)", i, len(symbols), passed)
+
+    # P3-fix: convert raw RS excess returns to percentile ranks [1-99]
+    # Only rank symbols with valid data (raw != 0.0 sentinel)
+    _valid = [(i, r) for i, r in enumerate(results) if r.rs_rating != 0.0]
+    if len(_valid) > 1:
+        _raw_vals = np.array([r.rs_rating for _, r in _valid])
+        _ranks = np.argsort(np.argsort(_raw_vals)).astype(float)
+        _pct = np.clip(np.round((_ranks / (len(_raw_vals) - 1)) * 98 + 1), 1, 99)
+        for (_, r), p in zip(_valid, _pct):
+            r.rs_rating = float(p)
+    for r in results:
+        if r.rs_rating == 0.0:
+            r.rs_rating = 50.0  # assign median for symbols with insufficient data
 
     results.sort(key=lambda r: (-int(r.passed), -r.rs_rating))
     passed_n = sum(1 for r in results if r.passed)

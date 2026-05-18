@@ -2062,22 +2062,52 @@ def check_positions() -> None:
                             symbol, _cur_stp_r, _one_r_stop,
                             pnl_pct * 100, _rps)
 
-        # ── Step G2: Runner upgrade — widen trail to 8% when past 2× measured move ─
-        # Position has proven itself past double the expected target; give the runner room.
+        # ── Step G2: Runner upgrade — 25% partial exit + 10% trail at 2× measured move ─
+        # P3.6-fix: at 2× target take 25% off the table, then give the true runner 10% room.
+        # Widens from 5% to 10% so normal pullbacks don't stop out an extended winner.
         if (sym.get("partial2_done")
                 and not sym.get("runner_upgraded")
                 and mm_pct > 0.05
                 and pnl_pct >= mm_pct * 2):
-            _runner_2x = qty - sym.get("partial_qty", 0)
-            if _runner_2x > 0:
-                _cancel_stop_orders(symbol)
-                _r2x_oid = _place_trailing_stop(symbol, _runner_2x, 0.08)
-                if _r2x_oid:
-                    sym["runner_upgraded"] = True
-                    sym["stop_order_id"]   = _r2x_oid
-                    changed = True
-                    _log.info("[monitor] %s RUNNER UPGRADE: trail 5%%→8%% at 2×mm (pnl=+%.1f%%)",
-                              symbol, pnl_pct * 100)
+            _runner_rem = qty - sym.get("partial_qty", 0)
+            if _runner_rem > 0:
+                # sell 25% of total position as partial
+                _g2_partial = max(1, round(qty * 0.25))
+                _g2_partial = min(_g2_partial, _runner_rem)
+                _g2_sold = False
+                if _g2_partial > 0:
+                    _g2_sold = bool(_place_market_sell(symbol, _g2_partial))
+                    if _g2_sold:
+                        sym["partial_qty"] = sym.get("partial_qty", 0) + _g2_partial
+                        changed = True
+                        _log.info("[monitor] %s G2 PARTIAL: sold %d sh (25%%) at 2×mm pnl=+%.1f%%",
+                                  symbol, _g2_partial, pnl_pct * 100)
+                _runner_after = _runner_rem - (_g2_partial if _g2_sold else 0)
+                if _runner_after > 0:
+                    _cancel_stop_orders(symbol)
+                    _r2x_oid = _place_trailing_stop(symbol, _runner_after, 0.10)
+                    if _r2x_oid:
+                        sym["runner_upgraded"] = True
+                        sym["stop_order_id"]   = _r2x_oid
+                        changed = True
+                        _log.info("[monitor] %s RUNNER UPGRADE: trail→10%% at 2×mm (pnl=+%.1f%%)",
+                                  symbol, pnl_pct * 100)
+                        try:
+                            import requests as _rqg2, os as _osg2
+                            _tg2 = _osg2.getenv("TELEGRAM_BOT_TOKEN", "")
+                            _cg2 = _osg2.getenv("TELEGRAM_CHAT_ID", "")
+                            if _tg2 and _cg2:
+                                _rqg2.post(
+                                    f"https://api.telegram.org/bot{_tg2}/sendMessage",
+                                    json={"chat_id": _cg2, "parse_mode": "Markdown",
+                                          "text": (
+                                              f"\U0001f680 *Runner Upgrade G2 — {symbol}*\n"
+                                              f"Sold {_g2_partial if _g2_sold else 0} sh (25%%)\n"
+                                              f"Trail widened → 10%% | P&L +{pnl_pct*100:.1f}%%"
+                                          )},
+                                    timeout=8)
+                        except Exception:
+                            _log.debug("[%s] suppressed", __name__, exc_info=True)
 
         # ── Step V: Volume climax exit — monster-volume day after ≥20% gain ────────
         # Blow-off top signal: churning on extreme volume = likely institutional exit.
@@ -2210,7 +2240,10 @@ def check_positions() -> None:
                 try:
                     import pandas as _pd
                     _ed_df = yf.Ticker(symbol).earnings_dates
-                    if _ed_df is not None and not _ed_df.empty:
+                    if _ed_df is None or _ed_df.empty:
+                        # P3.5: no data — mark checked so we don't retry every cycle
+                        sym["pead_checked"] = True
+                    elif _ed_df is not None and not _ed_df.empty:
                         _ed_r = _ed_df.reset_index()
                         _now_ts = _pd.Timestamp.now(tz="UTC")
                         _past = _ed_r[
@@ -2361,6 +2394,10 @@ def check_positions() -> None:
 
         # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
         time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
+        # P3.7: in soft-DD mode shorten patience and require higher gain to stay
+        if _soft_dd_mode:
+            time_stop_days = max(int(time_stop_days * 0.7), 10)
+            time_stop_gain = max(time_stop_gain, 0.04)
         entry_date_str = sym.get("entry_date", "")
         _pead_active = (
             sym.get("pead_hold")

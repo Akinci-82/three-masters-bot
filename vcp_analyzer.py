@@ -4,7 +4,7 @@ VCP (Volatility Contraction Pattern) analysis.
 
 Three-tier Claude strategy:
   Tier 0: Quantitative pre-filter  — free, eliminates ~70% of candidates
-  Tier 1: Haiku  (20-bar OHLCV)   — cheap yes/no + score 1-10
+  Tier 1: Haiku  (40-bar OHLCV)   — cheap yes/no + score 1-10  (P3-fix: was 20)
   Tier 2: Sonnet (100-bar OHLCV)  — full Minervini VCP analysis, only if Haiku is_vcp=True
   Tier 3: Opus   (validation)     — final verdict for quality_score >= 4 setups
 
@@ -387,7 +387,8 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
 def _build_haiku_prompt(symbol: str, df: pd.DataFrame, quant: dict,
                          last_candle: str) -> str:
     """
-    Haiku prompt with last 20 bars of actual OHLCV so it can see the handle shape.
+    Haiku prompt with last 40 bars of OHLCV (P3-fix: was 20 — insufficient to see prior
+    contraction context; Haiku needs at least one prior swing to judge if contractions tighten).
     Goal: reject obvious non-VCPs cheaply before Sonnet.
     """
     close = df["Close"]
@@ -403,13 +404,15 @@ def _build_haiku_prompt(symbol: str, df: pd.DataFrame, quant: dict,
     except Exception:
         ma200_str = "N/A"
 
-    # Last 20 bars OHLCV — gives Haiku actual bar data to assess the handle
-    r20   = df.tail(20)
-    dates = r20.index.strftime("%m/%d")
+    # Last 40 bars OHLCV — P3-fix: was 20, now 40 to include at least one prior contraction
+    # so Haiku can judge whether the handle is genuinely tightening vs earlier swings
+    _n_haiku = 40
+    r40   = df.tail(_n_haiku)
+    dates = r40.index.strftime("%m/%d")
     rows  = [
-        f"{dates[i]} H={high.iloc[-20+i]:.2f} L={low.iloc[-20+i]:.2f} "
-        f"C={close.iloc[-20+i]:.2f} V={int(vol.iloc[-20+i]/1000)}K"
-        for i in range(20)
+        f"{dates[i]} H={high.iloc[-_n_haiku+i]:.2f} L={low.iloc[-_n_haiku+i]:.2f} "
+        f"C={close.iloc[-_n_haiku+i]:.2f} V={int(vol.iloc[-_n_haiku+i]/1000)}K"
+        for i in range(_n_haiku)
     ]
     bar_table = "\n".join(rows)
 
@@ -429,7 +432,7 @@ def _build_haiku_prompt(symbol: str, df: pd.DataFrame, quant: dict,
         f"60-day segment ranges (oldest→newest): {seg_str}\n"
         f"Pattern depth: {quant.get('pattern_depth_pct',0):.1%} | "
         f"Handle range (10 bars): {quant.get('tight_rng_pct',0):.1%}{vol_note}\n\n"
-        f"Last 20 bars:\n{bar_table}\n\n"
+        f"Last {_n_haiku} bars:\n{bar_table}\n\n"
         f"Does the handle (last 10 bars) show a tight, low-volume consolidation "
         f"after a multi-week contraction? Is this a valid VCP setup?\n\n"
         f'JSON only: {{"vcp_score": 1-10, "is_vcp": true/false, "reason": "one sentence"}}'
@@ -587,9 +590,12 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle
     # Volume average for context
     vol_avg = int(volume.mean())
 
+    # P3-fix: normalize volume as ×avg so Claude sees relative volume directly
+    # (raw integers like 3,482,000 give Claude no context about what's heavy or light)
+    _vol_mean = float(volume.mean()) if float(volume.mean()) > 0 else 1.0
     rows = [
         f"{dates[i]}  H={high.iloc[i]:.2f}  L={low.iloc[i]:.2f}  "
-        f"C={close.iloc[i]:.2f}  V={int(volume.iloc[i]):,}"
+        f"C={close.iloc[i]:.2f}  V={volume.iloc[i]/_vol_mean:.2f}x"
         for i in range(len(recent))
     ]
     price_table = "\n".join(rows)
@@ -635,7 +641,7 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle
 
 ## Price Data (last {len(recent)} trading days, vol avg={vol_avg:,})
 ```
-Date        High    Low     Close   Volume
+Date        High    Low     Close   Vol(×avg)
 {price_table}
 ```
 
@@ -762,7 +768,7 @@ def _build_opus_prompt(symbol: str, df: pd.DataFrame, sonnet: dict,
     _bl_disp = f"${_bl:.2f}" if _bl else "N/A"
     _sl_disp = f"${_sl_v:.2f}" if _sl_v else "N/A"
 
-    return f"""You are an experienced VCP analyst trained by Mark Minervini. A junior analyst (Sonnet) flagged {symbol} as a potential high-quality VCP setup. Your job: weigh the evidence and give a balanced verdict — trade, watch, or skip. When the risk/reward is favourable and the pattern is mostly sound, lean toward trade or watch rather than skip.
+    return f"""You are a strict senior VCP analyst trained by Mark Minervini. A junior analyst (Sonnet) flagged {symbol} as a potential VCP setup. Your job: independently verify the pattern and give an unbiased verdict — trade, watch, or skip. Apply the same strict Minervini criteria regardless of the junior's assessment.
 
 ## Price Data (last {len(recent)} trading days, vol avg={vol_avg:,})
 ```
@@ -781,8 +787,8 @@ MA50=${ma50:.2f} | MA200=${ma200:.2f} | Entry candle: {last_candle}
 2. Is the handle truly low-volume compared to the prior contractions?
 3. Is the proposed breakout level ({_bl_disp}) the correct pivot high — or is there a better level?
 4. Is the stop loss ({_sl_disp}) logical — just below the handle low, not too wide?
-5. Weigh risk/reward: entry {_bl_disp} → projected +20-25% move. If the setup is 70%+ sound, prefer "trade" or "watch" over "skip".
-6. Use "skip" only when a clear disqualifying flaw exists (broken pattern, wrong volume structure, stop too wide).
+5. Weigh risk/reward: entry {_bl_disp} stop {_sl_disp}. Is the R:R at least 2:1 given the measured move? Be precise.
+6. Use "skip" freely when the pattern is marginal — a missed trade is better than a bad entry. Use "watch" when setup needs 1-2 more days of confirmation. Use "trade" only for high-conviction setups.
 
 ## Response (JSON ONLY)
 {{
