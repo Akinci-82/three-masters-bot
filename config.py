@@ -134,6 +134,8 @@ MONITOR = {
     "time_stop_min_gain_pct":  0.02,  # only close if gain < 2% (not a winner)
     # Pre-market gap check: cancel buy-stop if stock gaps above stop
     "premarket_gap_pct":       0.02,  # cancel if stock >2% above stop price
+    # F1: Intraday 5-min entry timing (Haiku analysis at 09:20-09:29 ET)
+    "use_intraday_timing":     False,  # enable when ready for live use
 }
 
 # ── Sector ETF map (SPDR) — shared across screener, main, position_monitor ───

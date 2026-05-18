@@ -85,6 +85,11 @@ def get_api() -> TradingClient:
                 "THREE_MASTERS_ALPACA_API_KEY and THREE_MASTERS_ALPACA_SECRET_KEY must be set"
             )
         _is_paper = "paper" in ALPACA_BASE_URL.lower()
+        if ALPACA_LIVE and _is_paper:
+            raise RuntimeError(
+                "Config mismatch: ALPACA_LIVE=True but ALPACA_BASE_URL contains 'paper'. "
+                "Set ALPACA_BASE_URL to the live endpoint or disable ALPACA_LIVE."
+            )
         _api = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=_is_paper)
     return _api
 

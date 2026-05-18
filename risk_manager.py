@@ -424,19 +424,20 @@ def record_pivot_failure(symbol: str):
 
 def check_pivot_failure_cooldown(symbol: str) -> bool:
     """True if symbol is still in 45-day pivot failure cooldown."""
-    state = _load()
-    fail_date_str = state.get("pivot_failure_cooldown", {}).get(symbol)
-    if not fail_date_str:
-        return False
-    try:
-        from pandas.tseries.offsets import BDay
-        import pandas as _pd
-        fail_dt      = _pd.Timestamp(fail_date_str)
-        cooldown_end = fail_dt + BDay(45)
-        in_cooldown  = _pd.Timestamp.today() < cooldown_end
-        if not in_cooldown:
-            state.get("pivot_failure_cooldown", {}).pop(symbol, None)
-            _save(state)
-        return in_cooldown
-    except Exception:
-        return False
+    with _RISK_LOCK:
+        state = _load()
+        fail_date_str = state.get("pivot_failure_cooldown", {}).get(symbol)
+        if not fail_date_str:
+            return False
+        try:
+            from pandas.tseries.offsets import BDay
+            import pandas as _pd
+            fail_dt      = _pd.Timestamp(fail_date_str)
+            cooldown_end = fail_dt + BDay(45)
+            in_cooldown  = _pd.Timestamp.today() < cooldown_end
+            if not in_cooldown:
+                state.get("pivot_failure_cooldown", {}).pop(symbol, None)
+                _save(state)
+            return in_cooldown
+        except Exception:
+            return False

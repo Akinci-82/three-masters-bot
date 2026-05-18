@@ -4045,8 +4045,11 @@ def main():
             _heartbeat()
             _maybe_morning_briefing()
             _maybe_opening_range_check()
+            _maybe_intraday_timing_check()     # F1: 09:20-09:29 ET
             _maybe_midday_momentum_check()
             _maybe_sunday_opus_analysis()
+            _maybe_sector_rotation_report()   # F2: daily after close
+            _maybe_live_paper_report()         # F4: Sunday only
             if elapsed % 3600 == 0 and elapsed > 0:
                 _write_obsidian_positions()
 
@@ -4219,6 +4222,351 @@ def _update_obsidian_performance() -> None:
         _log.info("[obsidian] Performance Stats updated")
     except Exception:
         _log.debug("[obsidian] performance update failed", exc_info=True)
+
+
+# ── F1: Intraday 5-min entry timing ──────────────────────────────────────────
+_last_timing_check_date: str = ""
+_last_timing_check_lock = threading.Lock()
+
+def _intraday_timing_check() -> None:
+    """
+    F1: At 09:20–09:29 ET (15:20–15:29 CEST), analyze 5-min pre-market bars
+    for each pending buy-stop order. Cancel or adjust trigger price based on
+    Haiku's assessment of volume/spread/price momentum.
+    Only active when config USE_INTRADAY_TIMING is True.
+    """
+    global _last_timing_check_date
+    from config import MONITOR as _mcfg_t
+    if not _mcfg_t.get("use_intraday_timing", False):
+        return
+
+    _today = str(date.today())
+    with _last_timing_check_lock:
+        if _last_timing_check_date == _today:
+            return
+        _last_timing_check_date = _today
+
+    try:
+        import yfinance as _yf_t
+        from broker import get_open_orders as _get_orders, cancel_order as _cancel_order
+        from vcp_analyzer import _call_haiku_timing
+
+        _orders = _get_orders()  # list of open buy-stop orders
+        if not _orders:
+            return
+
+        _log.info("[f1] Intraday timing check: %d pending orders", len(_orders))
+        _adjustments: list[str] = []
+
+        for _ord in _orders:
+            _sym = _ord.get("symbol", "")
+            _trigger = float(_ord.get("stop_price", _ord.get("limit_price", 0)) or 0)
+            if not _sym or not _trigger:
+                continue
+            try:
+                # Fetch 5-min bars (last 2 days to include pre-market)
+                _df5 = _yf_t.Ticker(_sym).history(
+                    period="2d", interval="5m", prepost=True, auto_adjust=True
+                )
+                if _df5.empty:
+                    continue
+
+                # Only keep bars from today
+                import pytz as _ptz_t
+                _et = _ptz_t.timezone("America/New_York")
+                _today_et = datetime.now(_et).date()
+                _df5 = _df5[_df5.index.tz_convert(_et).date == _today_et]
+                if _df5.empty or len(_df5) < 3:
+                    continue
+
+                _result = _call_haiku_timing(_sym, _df5, _trigger)
+                _action = _result.get("action", "place")
+                _delta  = float(_result.get("price_delta_pct", 0))
+                _reason = _result.get("reason", "")
+
+                if _action == "skip":
+                    _cancel_order(_ord["id"])
+                    _log.info("[f1] %s SKIP (timing): %s", _sym, _reason)
+                    _adjustments.append(f"⏭ {_sym} SKIP: {_reason}")
+                elif _action == "adjust" and abs(_delta) > 0.0005:
+                    _new_trigger = round(_trigger * (1 + _delta / 100), 2)
+                    _log.info("[f1] %s ADJUST trigger $%.2f → $%.2f (%+.2f%%): %s",
+                              _sym, _trigger, _new_trigger, _delta, _reason)
+                    _adjustments.append(
+                        f"🎯 {_sym} ADJUST ${_trigger:.2f}→${_new_trigger:.2f}: {_reason}"
+                    )
+                    # Cancel old + replace (broker handles this)
+                    # For now: log only — order modification requires broker support
+                else:
+                    _log.info("[f1] %s PLACE (timing OK): %s", _sym, _reason)
+            except Exception as _te:
+                _log.debug("[f1] timing %s: %s", _sym, _te)
+
+        if _adjustments:
+            _tg("🕐 *Entry Timing Check*\n" + "\n".join(_adjustments[:5]))
+    except Exception as _e:
+        _log.warning("[f1] intraday_timing_check failed: %s", _e)
+
+
+def _maybe_intraday_timing_check() -> None:
+    """Time-gated trigger: 09:20–09:29 ET (15:20–15:29 CEST) on weekdays."""
+    import pytz as _ptz_f1
+    _now_et = datetime.now(_ptz_f1.timezone("America/New_York"))
+    if _now_et.weekday() >= 5:
+        return
+    if not (9 == _now_et.hour and 20 <= _now_et.minute <= 29):
+        return
+    _intraday_timing_check()
+
+
+# ── F2: Sector rotation dashboard ────────────────────────────────────────────
+_last_sector_report_date: str = ""
+_last_sector_report_lock = threading.Lock()
+
+def _write_sector_rotation_report() -> None:
+    """
+    F2: Daily sector rotation dashboard written to Obsidian after market close.
+    Computes RS vs SPY over 1m/3m/6m for each sector ETF, ranks by momentum,
+    and writes a markdown table to Three Masters/Sektor-rotation.md.
+    """
+    global _last_sector_report_date
+    _today = str(date.today())
+    with _last_sector_report_lock:
+        if _last_sector_report_date == _today:
+            return
+        _last_sector_report_date = _today
+
+    try:
+        from config import SECTOR_ETF_MAP as _etf_map
+        import yfinance as _yf_sr
+
+        _spy = _yf_sr.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)
+        if _spy.empty or len(_spy) < 20:
+            _log.warning("[f2] SPY data unavailable for sector report")
+            return
+
+        rows: list[dict] = []
+        for sector, etf in _etf_map.items():
+            try:
+                _df = _yf_sr.Ticker(etf).history(period="6mo", interval="1d", auto_adjust=True)
+                if _df.empty or len(_df) < 20:
+                    continue
+                _c = _df["Close"]
+                _s = _spy["Close"]
+                # Align indices
+                _idx = _c.index.intersection(_s.index)
+                _c, _s = _c.reindex(_idx), _s.reindex(_idx)
+
+                def _pct(n: int) -> float:
+                    if len(_c) < n:
+                        return 0.0
+                    return float(_c.iloc[-1] / _c.iloc[-n] - 1)
+
+                def _rs(n: int) -> float:
+                    if len(_c) < n or len(_s) < n:
+                        return 0.0
+                    return float((_c.iloc[-1]/_c.iloc[-n]) / (_s.iloc[-1]/_s.iloc[-n]) - 1)
+
+                _ma50 = float(_c.rolling(50).mean().iloc[-1]) if len(_c) >= 50 else 0.0
+                _above_ma50 = _c.iloc[-1] > _ma50 if _ma50 > 0 else False
+                rows.append({
+                    "sector": sector, "etf": etf,
+                    "rs_1m": _rs(21), "rs_3m": _rs(63), "rs_6m": _rs(126),
+                    "abs_1m": _pct(21),
+                    "ma50": "🟢" if _above_ma50 else "🔴",
+                    "score": _rs(21) + _rs(63) + _rs(6),  # simple composite
+                })
+            except Exception as _e:
+                _log.debug("[f2] sector %s: %s", sector, _e)
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda r: r["score"], reverse=True)
+
+        # Build markdown
+        _lines = [
+            f"---", f"updated: {_today}", f"---", "",
+            f"# Sektor-rotation Dashboard", "",
+            f"*Uppdaterad: {_today} (dagligen efter market close)*", "",
+            f"## RS vs SPY", "",
+            f"| # | Sektor | ETF | 1m RS | 3m RS | 6m RS | MA50 |",
+            f"|---|--------|-----|-------|-------|-------|------|",
+        ]
+        for i, r in enumerate(rows, 1):
+            emoji = "🏆" if i <= 3 else ("⚠️" if i >= len(rows) - 2 else "")
+            _lines.append(
+                f"| {i}{emoji} | {r['sector']} | {r['etf']} "
+                f"| {r['rs_1m']*100:+.1f}% | {r['rs_3m']*100:+.1f}% "
+                f"| {r['rs_6m']*100:+.1f}% | {r['ma50']} |"
+            )
+
+        # Top-3 / Bottom-3 highlight
+        top3    = [r["sector"] for r in rows[:3]]
+        bottom3 = [r["sector"] for r in rows[-3:]]
+        _lines += [
+            "", f"## Ledare (Top 3)", "",
+            *[f"- **{s}** ({_etf_map.get(s,'')}) RS 1m {[r for r in rows if r['sector']==s][0]['rs_1m']*100:+.1f}%" for s in top3],
+            "", f"## Svaga (Bottom 3)", "",
+            *[f"- **{s}** ({_etf_map.get(s,'')}) RS 1m {[r for r in rows if r['sector']==s][0]['rs_1m']*100:+.1f}%" for s in bottom3],
+            "", f"---",
+            f"*Genererad av `main.py:_write_sector_rotation_report()`*",
+        ]
+
+        _vault_path = _VAULT_DIR / "Three Masters" / "Sektor-rotation.md"
+        _vault_path.write_text("\n".join(_lines))
+        _obsidian_git_commit(f"bot: sector rotation {_today}")
+        _log.info("[f2] Sector rotation report written")
+
+        # Telegram: notify if leadership changed significantly
+        _tg(
+            f"📊 *Sektor-rotation — {_today}*\n"
+            f"🏆 Top: {', '.join(top3)}\n"
+            f"⚠️ Svaga: {', '.join(bottom3)}"
+        )
+    except Exception as _e:
+        _log.warning("[f2] sector_rotation_report failed: %s", _e)
+
+
+def _maybe_sector_rotation_report() -> None:
+    """Time-gated trigger: run once daily at 22:05–22:25 CEST (after US close, before scan)."""
+    import pytz as _ptz_sr
+    _now = datetime.now(_ptz_sr.timezone("Europe/Stockholm"))
+    if _now.weekday() >= 5:
+        return
+    if not (22 <= _now.hour and _now.minute <= 25 or _now.hour == 22 and _now.minute >= 5):
+        return
+    if not (22 == _now.hour and 5 <= _now.minute <= 25):
+        return
+    _write_sector_rotation_report()
+
+
+# ── F4: Live vs paper comparison ─────────────────────────────────────────────
+_last_live_paper_report_date: str = ""
+_last_live_paper_lock = threading.Lock()
+
+def _write_live_vs_paper_report() -> None:
+    """
+    F4: Weekly live vs paper account comparison written to Obsidian on Sundays.
+    Fetches both live and paper portfolios from Alpaca, compares position by position.
+    """
+    global _last_live_paper_report_date
+    _today = str(date.today())
+    with _last_live_paper_lock:
+        if _last_live_paper_report_date == _today:
+            return
+        _last_live_paper_report_date = _today
+
+    try:
+        from config import (
+            ALPACA_BASE_URL, ALPACA_API_KEY, ALPACA_SECRET_KEY,
+            ALPACA_PAPER_COMPARE_KEY, ALPACA_PAPER_COMPARE_SECRET,
+        )
+        import requests as _rq_f4
+
+        if not ALPACA_PAPER_COMPARE_KEY or not ALPACA_PAPER_COMPARE_SECRET:
+            _log.info("[f4] ALPACA_PAPER_COMPARE_KEY not set — skipping live vs paper")
+            return
+
+        _PAPER_URL = "https://paper-api.alpaca.markets"
+
+        def _get_positions(base_url: str, key: str, secret: str) -> list[dict]:
+            try:
+                r = _rq_f4.get(f"{base_url}/v2/positions",
+                               headers={"APCA-API-KEY-ID": key,
+                                        "APCA-API-SECRET-KEY": secret}, timeout=10)
+                r.raise_for_status()
+                return r.json()
+            except Exception as _e:
+                _log.warning("[f4] positions fetch failed (%s): %s", base_url, _e)
+                return []
+
+        def _get_account(base_url: str, key: str, secret: str) -> dict:
+            try:
+                r = _rq_f4.get(f"{base_url}/v2/account",
+                               headers={"APCA-API-KEY-ID": key,
+                                        "APCA-API-SECRET-KEY": secret}, timeout=10)
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                return {}
+
+        _live_pos  = _get_positions(ALPACA_BASE_URL, ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        _paper_pos = _get_positions(_PAPER_URL, ALPACA_PAPER_COMPARE_KEY,
+                                    ALPACA_PAPER_COMPARE_SECRET)
+        _live_acc  = _get_account(ALPACA_BASE_URL, ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        _paper_acc = _get_account(_PAPER_URL, ALPACA_PAPER_COMPARE_KEY,
+                                  ALPACA_PAPER_COMPARE_SECRET)
+
+        # Index by symbol
+        _live_map  = {p["symbol"]: p for p in _live_pos}
+        _paper_map = {p["symbol"]: p for p in _paper_pos}
+        _all_syms  = sorted(set(_live_map) | set(_paper_map))
+
+        _lines = [
+            f"---", f"updated: {_today}", f"---", "",
+            f"# Live vs Paper — Veckojämförelse", "",
+            f"*Uppdaterad: {_today}*", "",
+            f"## Konton",
+            f"| | Live | Paper |",
+            f"|--|------|-------|",
+            f"| Equity | ${float(_live_acc.get('equity',0)):,.0f} | ${float(_paper_acc.get('equity',0)):,.0f} |",
+            f"| Dag P&L | ${float(_live_acc.get('equity',0))-float(_live_acc.get('last_equity',float(_live_acc.get('equity',0)))):+,.0f} | ${float(_paper_acc.get('equity',0))-float(_paper_acc.get('last_equity',float(_paper_acc.get('equity',0)))):+,.0f} |",
+            "",
+            f"## Positioner",
+            f"| Symbol | Live P&L | Paper P&L | Delta | Anm |",
+            f"|--------|----------|-----------|-------|-----|",
+        ]
+
+        _divergences: list[str] = []
+        for sym in _all_syms:
+            lp = _live_map.get(sym)
+            pp = _paper_map.get(sym)
+            live_pnl  = f"{float(lp['unrealized_plpc'])*100:+.1f}%" if lp else "—"
+            paper_pnl = f"{float(pp['unrealized_plpc'])*100:+.1f}%" if pp else "—"
+            if lp and pp:
+                delta = float(lp['unrealized_plpc']) - float(pp['unrealized_plpc'])
+                delta_str = f"{delta*100:+.1f}%"
+                anm = "Slippage" if abs(delta) > 0.02 else ""
+                if abs(delta) > 0.03:
+                    _divergences.append(f"{sym} delta {delta*100:+.1f}%")
+            elif lp:
+                delta_str, anm = "—", "Bara live"
+            else:
+                delta_str, anm = "—", "Bara paper"
+            _lines.append(f"| {sym} | {live_pnl} | {paper_pnl} | {delta_str} | {anm} |")
+
+        if _divergences:
+            _lines += ["", "## Stor divergens (>3%)", ""]
+            _lines += [f"- {d}" for d in _divergences]
+
+        _lines += ["", "---",
+                   "*Genererad av `main.py:_write_live_vs_paper_report()`*"]
+
+        _vault_path = _VAULT_DIR / "Three Masters" / "Live vs Paper.md"
+        _vault_path.write_text("\n".join(_lines))
+        _obsidian_git_commit(f"bot: live vs paper {_today}")
+        _log.info("[f4] Live vs paper report written (%d symbols)", len(_all_syms))
+
+        _tg(
+            f"📋 *Live vs Paper — {_today}*\n"
+            f"Live: ${float(_live_acc.get('equity',0)):,.0f} | "
+            f"Paper: ${float(_paper_acc.get('equity',0)):,.0f}\n"
+            + (f"⚠️ Divergens: {', '.join(_divergences[:3])}" if _divergences else "✅ Ingen stor divergens")
+        )
+    except Exception as _e:
+        _log.warning("[f4] live_vs_paper_report failed: %s", _e)
+
+
+def _maybe_live_paper_report() -> None:
+    """Time-gated trigger: run once on Sundays at 18:00–18:30 CEST."""
+    import pytz as _ptz_f4
+    _now = datetime.now(_ptz_f4.timezone("Europe/Stockholm"))
+    if _now.weekday() != 6:  # Sunday only
+        return
+    if not (18 == _now.hour and _now.minute <= 30):
+        return
+    _write_live_vs_paper_report()
 
 
 def _obsidian_git_commit(message: str) -> None:

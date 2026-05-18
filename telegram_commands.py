@@ -567,7 +567,6 @@ def _handle_update(update: dict) -> None:
             if not _main_mod._SCAN_LOCK.acquire(blocking=False):
                 _send("\u23f3 En scan k\u00f6rs redan \u2014 resultaten kommer n\u00e4r den \u00e4r klar.")
             else:
-                _main_mod._SCAN_LOCK.release()
                 _send("\ud83d\udd0d K\u00f6r manuell scan\u2026 (2\u20135 min)")
                 import threading as _thr
                 def _bg_scan(_send_fn=_send, _m=_main_mod):
@@ -575,6 +574,8 @@ def _handle_update(update: dict) -> None:
                         _m.run_daily()
                     except Exception as _e:
                         _send_fn(f"\u274c Scan-fel: {_e}")
+                    finally:
+                        _m._SCAN_LOCK.release()
                 _thr.Thread(target=_bg_scan, daemon=True, name="tg-manual-scan").start()
         except Exception as _scan_ex:
             _send(f"\u274c Kunde inte starta scan: {_scan_ex}")

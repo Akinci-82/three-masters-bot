@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import RISK, LOG_DIR
@@ -78,7 +78,7 @@ def _save_monitor(data: dict) -> None:
 
 def _audit(entry: dict) -> None:
     """Append one sync run to the audit log."""
-    entry["ts"] = datetime.now().isoformat()
+    entry["ts"] = datetime.now(timezone.utc).isoformat()
     try:
         _AUDIT_LOG.parent.mkdir(exist_ok=True)
         with open(_AUDIT_LOG, "a") as f:

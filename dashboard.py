@@ -823,7 +823,7 @@ def create_app():
     function updateCountdown() {
       const now = new Date();
       const cet = new Date(now.toLocaleString('en-US', {timeZone:'Europe/Stockholm'}));
-      const next = new Date(cet); next.setHours(7,0,0,0);
+      const next = new Date(cet); next.setHours(22,30,0,0);
       if (cet >= next) next.setDate(next.getDate()+1);
       const diff = Math.floor((next - cet) / 1000);
       const h = Math.floor(diff/3600), m = Math.floor((diff%3600)/60), s = diff%60;
@@ -1422,7 +1422,8 @@ def _build_state() -> dict:
     breadth_raw    = _read_json(BASE / "logs" / "breadth_history.json")
     market_breadth = None
     if isinstance(breadth_raw, list) and breadth_raw:
-        market_breadth = round(float(breadth_raw[-1]) * 100, 1)
+        _bval = breadth_raw[-1]
+        market_breadth = round(float(_bval["breadth"] if isinstance(_bval, dict) else _bval) * 100, 1)
 
     regime = _compute_regime()
 

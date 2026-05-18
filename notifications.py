@@ -6,7 +6,12 @@ from __future__ import annotations
 import logging
 import os
 
-import requests
+try:
+    import httpx as _http_lib  # F5: prefer httpx (sync+async capable)
+    _USE_HTTPX = True
+except ImportError:
+    import requests as _http_lib  # type: ignore[no-redef]
+    _USE_HTTPX = False
 
 _log = logging.getLogger(__name__)
 
@@ -25,11 +30,12 @@ def _tg(msg: str, parse_mode: str = "Markdown") -> bool:
             rest = rest[4000:]
         return all(_tg(p, parse_mode) for p in parts)
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            json={"chat_id": cid, "text": msg, "parse_mode": parse_mode},
-            timeout=10,
-        )
+        payload = {"chat_id": cid, "text": msg, "parse_mode": parse_mode}
+        url = f"https://api.telegram.org/bot{tok}/sendMessage"
+        if _USE_HTTPX:
+            r = _http_lib.post(url, json=payload, timeout=10)
+        else:
+            r = _http_lib.post(url, json=payload, timeout=10)
         return r.status_code == 200
     except Exception as e:
         _log.debug("_tg suppressed: %s", e)

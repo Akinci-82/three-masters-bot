@@ -1,474 +1,330 @@
-#!/usr/bin/env python3
 """
-Three Masters Bot — Backtest Module
-Replays the full strategy pipeline against historical daily bars:
-  - Minervini Trend Template  (quantitative screener)
-  - Tier-0 quantitative VCP   (contraction + volume dry-up, no Claude)
-  - Three-stage exit rules    (mirrors actual bot: breakeven, partial exits, trailing stop)
-  - Time stop                 (15 trading days, <2% gain)
+Backtest module with Claude API cost accounting.
+Reads trade_journal.jsonl and token_usage.jsonl to simulate net returns
+including actual Haiku/Sonnet/Opus API costs per trade.
 
 Usage:
-    python backtest.py [--symbols AAPL,MSFT,...] [--years 2] [--start 2022-01-01]
-    python backtest.py --min-score 6.0  # filter by quant composite >= threshold
+    python3 backtest.py                  # run with all available trades
+    python3 backtest.py --iterations 2000
+    python3 backtest.py --report-file /path/to/report.md
 """
 from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timedelta
+import random
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
-import pandas as pd
-import yfinance as yf
-
-from config import LOG_DIR, TREND_TEMPLATE, VCP
-from screener import load_universe
 
 _log = logging.getLogger(__name__)
-BASE = Path(__file__).parent
 
-# ── Exit parameters (mirrors actual bot config) ──────────────────────────────
-INITIAL_STOP_PCT   = 0.07   # 7% trailing stop at entry
-BREAKEVEN_AT       = 0.08   # move stop to entry cost at +8%
-PARTIAL1_AT        = 0.10   # sell 33% at +10%
-PARTIAL2_AT        = 0.20   # sell 33% at +20% (measured move proxy)
-TRAIL_TIGHT_PCT    = 0.05   # tighten trailing stop to 5% after first partial
-TIME_STOP_DAYS     = 15     # close if held ≥15 trading days with <2% gain
-TIME_STOP_MIN_GAIN = 0.02
+# ── Claude API pricing (USD per 1M tokens, as of 2026) ────────────────────────
+_PRICES: dict[str, dict[str, float]] = {
+    "haiku":  {"in": 0.80,  "out": 4.00},
+    "sonnet": {"in": 3.00,  "out": 15.00},
+    "opus":   {"in": 15.00, "out": 75.00},
+}
+
+# Map tier names from token_usage.jsonl to price keys
+_TIER_MAP = {
+    "tier0_news":    "haiku",
+    "tier1_haiku":   "haiku",
+    "tier2_sonnet":  "sonnet",
+    "tier3_opus":    "opus",
+}
+
+COMMISSION_PER_TRADE = 1.00  # $1 flat per round-trip (Alpaca)
 
 
-def _fetch(symbol: str, start: str, end: str) -> pd.DataFrame | None:
+def _load_trades(log_dir: Path) -> list[dict]:
+    """Load completed trades from trade_journal.jsonl."""
+    path = log_dir / "trade_journal.jsonl"
+    if not path.exists():
+        _log.warning("[backtest] trade_journal.jsonl not found at %s", path)
+        return []
+    trades = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                t = json.loads(line)
+                # Only include completed trades (have pnl_pct)
+                if t.get("pnl_pct") is not None and t.get("symbol"):
+                    trades.append(t)
+            except json.JSONDecodeError:
+                continue
+    _log.info("[backtest] Loaded %d completed trades", len(trades))
+    return trades
+
+
+def _load_token_costs(log_dir: Path) -> dict[str, float]:
+    """
+    Load token_usage.jsonl and compute total Claude API cost per symbol.
+    Returns {symbol: total_usd}.
+    """
+    path = log_dir / "token_usage.jsonl"
+    if not path.exists():
+        _log.warning("[backtest] token_usage.jsonl not found — costs will be estimated")
+        return {}
+    costs: dict[str, float] = defaultdict(float)
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                sym  = rec.get("symbol", "")
+                tier = rec.get("tier", "")
+                model_key = _TIER_MAP.get(tier, "haiku")
+                price = _PRICES[model_key]
+                in_tok  = int(rec.get("input_tokens", 0))
+                out_tok = int(rec.get("output_tokens", 0))
+                usd = (in_tok * price["in"] + out_tok * price["out"]) / 1_000_000
+                costs[sym] += usd
+            except (json.JSONDecodeError, KeyError):
+                continue
+    _log.info("[backtest] Token costs loaded for %d symbols", len(costs))
+    return dict(costs)
+
+
+def _estimate_claude_cost(trade: dict) -> float:
+    """
+    Fallback cost estimate when token_usage.jsonl has no entry for a symbol.
+    Assumes: Haiku screen (always) + Sonnet if passed (60% of trades) + Opus (20%).
+    Average token counts from production observations.
+    """
+    # Haiku: ~1200 in / 80 out
+    cost = (1200 * _PRICES["haiku"]["in"] + 80 * _PRICES["haiku"]["out"]) / 1_000_000
+    # 60% chance Sonnet was called: ~3500 in / 700 out
+    cost += 0.60 * (3500 * _PRICES["sonnet"]["in"] + 700 * _PRICES["sonnet"]["out"]) / 1_000_000
+    # 20% chance Opus: ~5000 in / 500 out
+    cost += 0.20 * (5000 * _PRICES["opus"]["in"] + 500 * _PRICES["opus"]["out"]) / 1_000_000
+    return cost
+
+
+def _trade_net_return(trade: dict, token_costs: dict[str, float]) -> float:
+    """
+    Net dollar return for a single trade:
+    gross_pnl_$ - claude_api_cost - commission
+    """
+    pnl_pct  = float(trade.get("pnl_pct", 0))
+    notional = float(trade.get("notional", trade.get("shares", 0) *
+                               trade.get("avg_cost", 100)))
+    gross_pnl = pnl_pct * notional
+
+    sym = trade.get("symbol", "")
+    claude_cost = token_costs.get(sym, _estimate_claude_cost(trade))
+
+    return gross_pnl - claude_cost - COMMISSION_PER_TRADE
+
+
+def run_monte_carlo(
+    trades: list[dict],
+    token_costs: dict[str, float],
+    iterations: int = 1000,
+    sample_size: Optional[int] = None,
+) -> dict:
+    """
+    Run Monte Carlo simulation by sampling from trade history with replacement.
+    Returns statistics dict.
+    """
+    if not trades:
+        return {"error": "no trades"}
+
+    n = sample_size or len(trades)
+    net_returns = [_trade_net_return(t, token_costs) for t in trades]
+    gross_returns = [float(t.get("pnl_pct", 0)) *
+                     float(t.get("notional", 0)) for t in trades]
+    claude_costs = [token_costs.get(t.get("symbol", ""),
+                    _estimate_claude_cost(t)) for t in trades]
+
+    # Per-trade statistics
+    wins = [r for r in net_returns if r > 0]
+    losses = [r for r in net_returns if r <= 0]
+
+    # Monte Carlo
+    mc_totals = []
+    for _ in range(iterations):
+        sample = random.choices(net_returns, k=n)
+        mc_totals.append(sum(sample))
+
+    mc_arr = np.array(mc_totals)
+
+    return {
+        "n_trades":            len(trades),
+        "win_rate":            len(wins) / len(net_returns) if net_returns else 0,
+        "avg_gross_pnl":       float(np.mean(gross_returns)) if gross_returns else 0,
+        "avg_net_return":      float(np.mean(net_returns)),
+        "avg_claude_cost":     float(np.mean(claude_costs)),
+        "total_claude_cost":   float(sum(claude_costs)),
+        "total_gross":         float(sum(gross_returns)),
+        "total_net":           float(sum(net_returns)),
+        "cost_drag_pct":       (sum(claude_costs) / abs(sum(gross_returns)) * 100
+                                if sum(gross_returns) != 0 else 0),
+        "mc_median":           float(np.median(mc_arr)),
+        "mc_p5":               float(np.percentile(mc_arr, 5)),
+        "mc_p25":              float(np.percentile(mc_arr, 25)),
+        "mc_p75":              float(np.percentile(mc_arr, 75)),
+        "mc_p95":              float(np.percentile(mc_arr, 95)),
+        "mc_positive_pct":     float(np.mean(mc_arr > 0) * 100),
+        "iterations":          iterations,
+    }
+
+
+def format_report(stats: dict, trades: list[dict],
+                  token_costs: dict[str, float]) -> str:
+    """Format Monte Carlo results as Obsidian-friendly markdown."""
+    today = date.today().isoformat()
+    lines = [
+        f"---",
+        f"updated: {today}",
+        f"---",
+        f"",
+        f"# Three Masters — Backtest-rapport",
+        f"",
+        f"*Senast uppdaterad: {today} | {stats.get('n_trades', 0)} trades | "
+        f"{stats.get('iterations', 0)} MC-iterationer*",
+        f"",
+        f"---",
+        f"",
+        f"## Sammanfattning",
+        f"",
+        f"| Mätvärde | Värde |",
+        f"|---------|-------|",
+        f"| Antal trades | {stats['n_trades']} |",
+        f"| Win rate (netto) | {stats['win_rate']*100:.1f}% |",
+        f"| Snitt brutto P&L/trade | ${stats['avg_gross_pnl']:+,.2f} |",
+        f"| Snitt Claude-kostnad/trade | ${stats['avg_claude_cost']:.4f} |",
+        f"| **Snitt netto P&L/trade** | **${stats['avg_net_return']:+,.2f}** |",
+        f"| Total brutto | ${stats['total_gross']:+,.2f} |",
+        f"| Total Claude API-kostnad | ${stats['total_claude_cost']:.2f} |",
+        f"| **Total netto** | **${stats['total_net']:+,.2f}** |",
+        f"| API-kostnad som % av brutto | {stats['cost_drag_pct']:.2f}% |",
+        f"",
+        f"---",
+        f"",
+        f"## Monte Carlo ({stats['iterations']} iterationer, n={stats['n_trades']})",
+        f"",
+        f"| Percentil | Netto total |",
+        f"|-----------|-------------|",
+        f"| P5 (pessimistiskt) | ${stats['mc_p5']:+,.2f} |",
+        f"| P25 | ${stats['mc_p25']:+,.2f} |",
+        f"| P50 (median) | ${stats['mc_median']:+,.2f} |",
+        f"| P75 | ${stats['mc_p75']:+,.2f} |",
+        f"| P95 (optimistiskt) | ${stats['mc_p95']:+,.2f} |",
+        f"| Sannolikhet positivt resultat | {stats['mc_positive_pct']:.1f}% |",
+        f"",
+        f"---",
+        f"",
+        f"## Kostnad per tier",
+        f"",
+    ]
+
+    # Per-tier breakdown
+    tier_costs: dict[str, float] = defaultdict(float)
     try:
-        df = yf.download(symbol, start=start, end=end, interval="1d",
-                         auto_adjust=True, progress=False)
-        if df is None or len(df) < 50:
-            return None
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        return df
-    except Exception as e:
-        _log.debug("fetch %s: %s", symbol, e)
-        return None
-
-
-def _trend_template(df: pd.DataFrame, cfg: dict | None = None) -> bool:
-    cfg = cfg or TREND_TEMPLATE
-    if len(df) < 200:
-        return False
-    close  = df["Close"]
-    price  = float(close.iloc[-1])
-    ma50   = float(close.rolling(50).mean().iloc[-1])
-    ma150  = float(close.rolling(150).mean().iloc[-1])
-    ma200  = float(close.rolling(200).mean().iloc[-1])
-    hi52   = float(close.rolling(252).max().iloc[-1])
-    lo52   = float(close.rolling(252).min().iloc[-1])
-    ma200_20ago = float(close.rolling(200).mean().iloc[-21]) if len(close) >= 220 else ma200
-    return (
-        price > ma50 > ma150 > ma200
-        and ma200 > ma200_20ago                           # MA200 slope rising
-        and price >= hi52 * (1 - cfg.get("pct_from_high", 0.25))
-        and price >= lo52 * 1.30
-        and price >= cfg.get("min_price", 10)
-    )
-
-
-def _quant_vcp_score(df: pd.DataFrame) -> tuple[bool, float, float, float]:
-    """
-    Simplified Tier-0 VCP check (no Claude). Returns (passed, score, breakout_lvl, stop_lvl).
-    Score 0-10: measures contraction quality + volume dry-up.
-    """
-    try:
-        from vcp_analyzer import _quantitative_vcp_check
-        ok, quant = _quantitative_vcp_check(df, VCP)
-        if not ok:
-            return False, 0.0, 0.0, 0.0
-        score = 0.0
-        # Contractions (max 3 pts)
-        nc = int(quant.get("contractions", 0))
-        score += min(nc, 4) * 0.75
-        # Volume dry-up (2 pts)
-        if quant.get("vol_at_multiweek_low", False):
-            score += 2.0
-        # Tight final handle (2 pts)
-        tight = float(quant.get("tight_rng_pct", 1.0))
-        score += 2.0 if tight < 0.05 else (1.0 if tight < 0.08 else 0.0)
-        # Pattern depth (1 pt for moderate correction)
-        depth = float(quant.get("pattern_depth_pct", 0.5))
-        score += 1.0 if 0.10 <= depth <= 0.35 else 0.5 if depth <= 0.50 else 0.0
-        # Breakout volume (2 pts)
-        if quant.get("breakout_volume", False):
-            score += 2.0
-        bl  = float(quant.get("breakout_level", 0.0))
-        sl  = float(quant.get("stop_loss_candidate", 0.0))
-        return True, round(min(score, 10.0), 2), bl, sl
-    except Exception as e:
-        _log.debug("quant_vcp error: %s", e)
-        return False, 0.0, 0.0, 0.0
-
-
-def _weekly_close_under_ma10w(df_fwd: pd.DataFrame, day_idx: int) -> bool:
-    """True if the most recently completed weekly bar closed below its 10-week MA.
-    Resamples daily bars to weekly to mirror position_monitor Step W logic.
-    """
-    try:
-        hist_slice = df_fwd.iloc[: day_idx + 1]
-        if len(hist_slice) < 15:   # need at least ~3 weeks to form a meaningful MA
-            return False
-        weekly = hist_slice["Close"].resample("W-FRI").last().dropna()
-        if len(weekly) < 12:
-            return False
-        last_completed = float(weekly.iloc[-2])   # -1 may be in-progress week
-        ma10w = float(weekly.iloc[-11:-1].mean())
-        return last_completed < ma10w
-    except Exception:
-        return False
-
-
-def _sim_trade(df_fwd: pd.DataFrame, entry_price: float) -> dict:
-    """
-    Simulate one trade with actual bot exit rules:
-      - 7% trailing stop, breakeven at +8%
-      - Early pyramid (F): add 25% at +4% if first 5 days (simple proxy for RS check)
-      - Sell 33% at +10% (B1), 33% at +20% (B2)
-      - Pyramid (P): add 30% at +12-20% after B1
-      - Tighten trailing to 5% after first partial
-      - Step W: exit if weekly close falls under MA10w
-      - Time stop: 15 days and <2% gain
-    Returns dict with outcome details.
-    """
-    stop_trail    = entry_price * (1 - INITIAL_STOP_PCT)
-    peak_price    = entry_price
-    partial1_done = False
-    partial2_done = False
-    breakeven_set = False
-    pyramid_done  = False
-    step_f_done   = False
-    shares        = 1.0          # normalised to 1 share
-    proceeds      = 0.0
-    total_cost    = entry_price   # tracks actual capital deployed (updated on add-ons)
-    trail_pct     = INITIAL_STOP_PCT
-    exit_step     = "stop"
-
-    # Resample to weekly for Step W check (done once, not per-bar)
-    _weekly_dates = set()
-    try:
-        _wk = df_fwd["Close"].resample("W-FRI").last().dropna()
-        _weekly_dates = set(_wk.index.normalize())
+        log_dir = Path(__file__).parent / "logs"
+        token_path = log_dir / "token_usage.jsonl"
+        if token_path.exists():
+            with open(token_path) as tf:
+                for line in tf:
+                    try:
+                        rec = json.loads(line.strip())
+                        tier = rec.get("tier", "")
+                        mk = _TIER_MAP.get(tier, "haiku")
+                        price = _PRICES[mk]
+                        in_t = int(rec.get("input_tokens", 0))
+                        out_t = int(rec.get("output_tokens", 0))
+                        tier_costs[tier] += (in_t * price["in"] + out_t * price["out"]) / 1_000_000
+                    except Exception:
+                        pass
     except Exception:
         pass
 
-    for i, (ts, row) in enumerate(df_fwd.iterrows()):
-        lo  = float(row["Low"])
-        hi  = float(row["High"])
-        cls = float(row["Close"])
+    lines.append("| Tier | Total kostnad |")
+    lines.append("|------|--------------|")
+    for tier, cost in sorted(tier_costs.items(), key=lambda x: -x[1]):
+        lines.append(f"| {tier} | ${cost:.4f} |")
+    if not tier_costs:
+        lines.append("| (token_usage.jsonl saknas) | — |")
 
-        # Update peak + trailing stop
-        if hi > peak_price:
-            peak_price = hi
-        new_trail = peak_price * (1 - trail_pct)
-        if new_trail > stop_trail:
-            stop_trail = new_trail
-
-        # Breakeven: move stop to entry at +8%
-        if not breakeven_set and cls >= entry_price * (1 + BREAKEVEN_AT):
-            stop_trail = max(stop_trail, entry_price)
-            breakeven_set = True
-
-        # Step F: early pyramid +25% at +4% (simple proxy: no RS check in backtest)
-        pnl_now = (cls - entry_price) / entry_price
-        if not step_f_done and not partial1_done and 0.04 <= pnl_now < 0.10:
-            total_cost   += 0.25 * cls
-            shares       += 0.25
-            step_f_done   = True
-
-        # Partial exit 1 (B1): sell 33% at +10%
-        if not partial1_done and hi >= entry_price * (1 + PARTIAL1_AT):
-            exit1          = entry_price * (1 + PARTIAL1_AT)
-            sell_qty       = shares * 0.33 / shares   # normalised: always 1/3 of current
-            proceeds      += shares * 0.33 * exit1
-            shares        -= shares * 0.33
-            trail_pct      = TRAIL_TIGHT_PCT
-            partial1_done  = True
-
-        # Pyramid (P): add 30% of original qty between +12-20% after B1
-        if (partial1_done and not pyramid_done and not partial2_done
-                and entry_price * 1.12 <= hi <= entry_price * 1.20):
-            total_cost   += 0.30 * cls
-            shares       += 0.30
-            pyramid_done  = True
-
-        # Partial exit 2 (B2): sell 33% at +20%
-        if partial1_done and not partial2_done and hi >= entry_price * (1 + PARTIAL2_AT):
-            exit2          = entry_price * (1 + PARTIAL2_AT)
-            proceeds      += shares * 0.33 * exit2
-            shares        -= shares * 0.33
-            partial2_done  = True
-
-        # Step W: weekly close under MA10w — check on each Monday (start of new week)
-        _ts_norm = pd.Timestamp(ts).normalize()
-        if (_ts_norm.weekday() == 0       # Monday = start of new completed week
-                and not partial2_done
-                and _weekly_close_under_ma10w(df_fwd, i)):
-            proceeds  += shares * cls
-            total_pnl  = (proceeds - total_cost) / total_cost
-            return {"exit": str(ts.date()), "exit_price": cls,
-                    "pnl_pct": round(total_pnl, 4), "days": i + 1,
-                    "reason": "W_weekly_close",
-                    "partials": int(partial1_done) + int(partial2_done)}
-
-        # Stop hit
-        if lo <= stop_trail:
-            proceeds += shares * stop_trail
-            total_pnl = (proceeds - total_cost) / total_cost
-            return {"exit": str(ts.date()), "exit_price": stop_trail,
-                    "pnl_pct": round(total_pnl, 4), "days": i + 1,
-                    "reason": "stop",
-                    "partials": int(partial1_done) + int(partial2_done)}
-
-        # Time stop: ≥15 days and gain < 2%
-        if i + 1 >= TIME_STOP_DAYS and not partial1_done:
-            paper_gain = (cls - entry_price) / entry_price
-            if paper_gain < TIME_STOP_MIN_GAIN:
-                proceeds += shares * cls
-                total_pnl = (proceeds - total_cost) / total_cost
-                return {"exit": str(ts.date()), "exit_price": cls,
-                        "pnl_pct": round(total_pnl, 4), "days": i + 1,
-                        "reason": "time_stop",
-                        "partials": int(partial1_done) + int(partial2_done)}
-
-    # End of data — close at last close
-    final = float(df_fwd["Close"].iloc[-1]) if len(df_fwd) > 0 else entry_price
-    proceeds += shares * final
-    total_pnl = (proceeds - entry_price) / entry_price
-    return {"exit": str(df_fwd.index[-1].date()), "exit_price": final,
-            "pnl_pct": round(total_pnl, 4), "days": len(df_fwd),
-            "reason": "data_end",
-            "partials": int(partial1_done) + int(partial2_done)}
+    lines += [
+        "",
+        "---",
+        "",
+        f"*Rapporten genereras automatiskt av `backtest.py` — kör `python3 backtest.py` för att uppdatera.*",
+    ]
+    return "\n".join(lines)
 
 
-def run_backtest(symbols: list[str], start: str, end: str,
-                 min_score: float = 0.0, scan_freq: str = "W-MON") -> dict:
-    """
-    For each symbol and each scan date, apply Trend Template + quant VCP.
-    If score >= min_score, simulate entry with actual bot exit rules.
-    """
-    trades: list[dict] = []
-    scanned = 0
-    signals = 0
+def run(log_dir: Optional[Path] = None, iterations: int = 1000,
+        report_file: Optional[Path] = None) -> dict:
+    """Main entry point. Returns stats dict."""
+    if log_dir is None:
+        log_dir = Path(__file__).parent / "logs"
 
-    scan_dates = pd.bdate_range(start=start, end=end, freq=scan_freq)
-
-    for sym in symbols:
-        df = _fetch(sym, start, end)
-        if df is None:
-            continue
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-
-        for scan_dt in scan_dates:
-            scan_dt = pd.Timestamp(scan_dt).tz_localize(None)
-            hist = df[df.index <= scan_dt]
-            if len(hist) < 200:
-                continue
-            scanned += 1
-
-            if not _trend_template(hist):
-                continue
-
-            passed_vcp, score, bl, sl = _quant_vcp_score(hist)
-            if not passed_vcp or score < min_score:
-                continue
-
-            signals += 1
-            fwd = df[df.index > scan_dt]
-            if len(fwd) < 2:
-                continue
-
-            # Entry: buy-stop at breakout level or next-day open if already above.
-            # Lookahead guard: if bl > open, the stop order only fills when high >= bl.
-            # Without this check we'd simulate a fill that never happened.
-            _fwd0_open = float(fwd.iloc[0]["Open"])
-            _fwd0_high = float(fwd.iloc[0]["High"])
-            entry_candidate = bl if bl > 0 else _fwd0_open
-            entry_price = max(_fwd0_open, entry_candidate)
-            if entry_price <= 0:
-                continue
-            if entry_price > _fwd0_open and _fwd0_high < entry_price:
-                continue  # buy-stop never triggered on entry day
-
-            result = _sim_trade(fwd.iloc[1:], entry_price)
-            result.update({
-                "symbol":       sym,
-                "entry":        str(scan_dt.date()),
-                "entry_price":  round(entry_price, 2),
-                "quant_score":  score,
-                "breakout_lvl": round(bl, 2),
-                "stop_lvl":     round(sl, 2),
-            })
-            trades.append(result)
+    trades      = _load_trades(log_dir)
+    token_costs = _load_token_costs(log_dir)
 
     if not trades:
-        return {"trades": [], "stats": {}, "score_buckets": {}}
+        print("No completed trades found in trade_journal.jsonl")
+        return {}
 
-    df_t   = pd.DataFrame(trades)
-    wins   = df_t[df_t["pnl_pct"] > 0]
-    losses = df_t[df_t["pnl_pct"] <= 0]
+    stats  = run_monte_carlo(trades, token_costs, iterations=iterations)
+    report = format_report(stats, trades, token_costs)
 
-    # Score bucket breakdown
-    buckets = {"0-4": [], "4-6": [], "6-8": [], "8-10": []}
-    for _, row in df_t.iterrows():
-        s = row["quant_score"]
-        _sl   = row.get("stop_lvl", 0)
-        _risk = abs(_sl / row["entry_price"]) if row["entry_price"] > 0 and _sl > 0 else 0.07
-        r = 0.0 if _risk < 0.001 else row["pnl_pct"] / _risk
-        bkt = ("8-10" if s >= 8 else "6-8" if s >= 6 else "4-6" if s >= 4 else "0-4")
-        buckets[bkt].append(r)
+    # Write to Obsidian vault
+    vault_path = Path("/home/habil/obsidian-vault/Three Masters/Backtest-rapport.md")
+    if vault_path.parent.exists():
+        vault_path.write_text(report)
+        print(f"Report written to {vault_path}")
+        # Git commit
+        try:
+            import subprocess
+            vault_dir = vault_path.parent.parent
+            subprocess.run(["git", "-C", str(vault_dir), "add", str(vault_path)],
+                           capture_output=True, timeout=10)
+            subprocess.run(["git", "-C", str(vault_dir), "commit", "-m",
+                            f"backtest: report {date.today()}"],
+                           capture_output=True, timeout=10)
+        except Exception as e:
+            print(f"Git commit failed: {e}")
 
-    bucket_stats = {}
-    for bkt, rs in buckets.items():
-        if rs:
-            wins_b = [r for r in rs if r > 0]
-            bucket_stats[bkt] = {
-                "count": len(rs),
-                "win_rate": round(len(wins_b) / len(rs), 3),
-                "avg_r": round(sum(rs) / len(rs), 3),
-            }
+    if report_file:
+        Path(report_file).write_text(report)
 
-    # Exit reason breakdown
-    exit_reasons = df_t["reason"].value_counts().to_dict()
+    # Print summary
+    print(f"\n=== Backtest Summary ({stats['n_trades']} trades) ===")
+    print(f"  Win rate:          {stats['win_rate']*100:.1f}%")
+    print(f"  Avg gross/trade:   ${stats['avg_gross_pnl']:+.2f}")
+    print(f"  Avg Claude cost:   ${stats['avg_claude_cost']:.4f}")
+    print(f"  Avg net/trade:     ${stats['avg_net_return']:+.2f}")
+    print(f"  API cost drag:     {stats['cost_drag_pct']:.2f}% of gross")
+    print(f"  MC P50 (total):    ${stats['mc_median']:+.2f}")
+    print(f"  MC P5–P95:         ${stats['mc_p5']:+.0f} – ${stats['mc_p95']:+.0f}")
+    print(f"  Positive outcome:  {stats['mc_positive_pct']:.0f}% of simulations")
 
-    # Per-exit-step P&L analysis
-    exit_step_stats: dict = {}
-    for reason, grp in df_t.groupby("reason"):
-        _wr = grp[grp["pnl_pct"] > 0]
-        exit_step_stats[str(reason)] = {
-            "count":       len(grp),
-            "win_rate":    round(len(_wr) / len(grp), 3),
-            "avg_pnl_pct": round(grp["pnl_pct"].mean() * 100, 2),
-        }
-
-    # SPY benchmark return for same period
-    spy_period_return = 0.0
-    try:
-        _spy = yf.download("SPY", start=start, end=end, interval="1d",
-                           auto_adjust=True, progress=False)
-        if _spy is not None and len(_spy) >= 2:
-            _spy.columns = [c[0] if isinstance(c, tuple) else c for c in _spy.columns]
-            _spy_start = float(_spy["Close"].iloc[0])
-            _spy_end   = float(_spy["Close"].iloc[-1])
-            spy_period_return = (_spy_end - _spy_start) / _spy_start if _spy_start > 0 else 0.0
-    except Exception as e:
-        _log.debug("SPY benchmark fetch failed: %s", e)
-
-    avg_hold  = df_t["days"].mean()
-    _td_total = max(len(pd.bdate_range(start=start, end=end)), 1)
-    _spy_per_trade = spy_period_return * (avg_hold / _td_total)
-    _avg_pnl_dec   = df_t["pnl_pct"].mean()
-    _alpha_per_trade = round((_avg_pnl_dec - _spy_per_trade) * 100, 2)
-
-    stats = {
-        "total_trades":      len(df_t),
-        "win_rate":          round(len(wins) / len(df_t), 3),
-        "avg_pnl_pct":       round(_avg_pnl_dec * 100, 2),
-        "avg_win_pct":       round(wins["pnl_pct"].mean() * 100, 2) if len(wins) else 0,
-        "avg_loss_pct":      round(losses["pnl_pct"].mean() * 100, 2) if len(losses) else 0,
-        "avg_hold_days":     round(avg_hold, 1),
-        "max_dd_pct":        round(df_t["pnl_pct"].min() * 100, 2),
-        "signals_found":     signals,
-        "scan_checks":       scanned,
-        "signal_rate":       round(signals / max(scanned, 1), 4),
-        "exit_reasons":      exit_reasons,
-        "exit_step_stats":   exit_step_stats,
-        "spy_period_return_pct": round(spy_period_return * 100, 2),
-        "alpha_per_trade_pct":   _alpha_per_trade,
-    }
-    return {"trades": trades, "stats": stats, "score_buckets": bucket_stats}
-
-
-def main():
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-
-    parser = argparse.ArgumentParser(description="Three Masters Backtest")
-    parser.add_argument("--symbols",   default="", help="Comma-separated (default: universe)")
-    parser.add_argument("--years",     type=float, default=2.0)
-    parser.add_argument("--start",     default="")
-    parser.add_argument("--min-score", type=float, default=0.0,
-                        help="Minimum quant VCP score (0-10, default: no filter)")
-    parser.add_argument("--out",          default="")
-    parser.add_argument("--walk-forward", action="store_true",
-                        help="Run 4 rolling windows and check for overfitting")
-    args = parser.parse_args()
-
-    end   = datetime.today().strftime("%Y-%m-%d")
-    start = args.start or (datetime.today() - timedelta(days=int(args.years * 365))).strftime("%Y-%m-%d")
-
-    if args.symbols:
-        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    else:
-        print("Loading universe...")
-        symbols = load_universe()
-
-    if not symbols:
-        raise ValueError("Universe är tomt — kontrollera universe.txt eller network connectivity")
-
-    print(f"Backtest: {len(symbols)} symbols | {start} → {end} | min_score={args.min_score}")
-
-    # ── Walk-forward validering ────────────────────────────────────────────────
-    if args.walk_forward:
-        print("\n── Walk-Forward Validering (4 fönster) ──")
-        _total_days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
-        _win_days   = _total_days // 4
-        _wf_rates: list[float] = []
-        for _wi in range(4):
-            _ws = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=_wi * _win_days)).strftime("%Y-%m-%d")
-            _we = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=(_wi + 1) * _win_days)).strftime("%Y-%m-%d")
-            _wr = run_backtest(symbols, _ws, _we, min_score=args.min_score)
-            _ws_stats = _wr.get("stats", {})
-            _wf_wr    = _ws_stats.get("win_rate", 0.0)
-            _wf_n     = _ws_stats.get("total_trades", 0)
-            _wf_rates.append(_wf_wr)
-            print(f"  Fönster {_wi+1}: {_ws} → {_we}  |  n={_wf_n}  WR={_wf_wr:.1%}  avg={_ws_stats.get('avg_pnl_pct', 0):+.1f}%")
-        if len(_wf_rates) >= 2:
-            _wr_spread = max(_wf_rates) - min(_wf_rates)
-            _overfit_warn = " ⚠️  ÖVERANPASSNING — WR varierar >15% mellan fönster" if _wr_spread > 0.15 else " ✓ stabilt"
-            print(f"  WR-spridning: {_wr_spread:.1%}{_overfit_warn}")
-        print()
-
-    results = run_backtest(symbols, start, end, min_score=args.min_score)
-    stats   = results.get("stats", {})
-    buckets = results.get("score_buckets", {})
-
-    print(f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Three Masters Backtest  (Trend Template + Quant VCP)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Period:          {start} → {end}
-Symbols:         {len(symbols)}
-Scans:           {stats.get('scan_checks', 0)}
-Signals:         {stats.get('signals_found', 0)} ({stats.get('signal_rate', 0):.2%} hit rate)
-Trades taken:    {stats.get('total_trades', 0)}
-Win rate:        {stats.get('win_rate', 0):.1%}
-Avg P&L:         {stats.get('avg_pnl_pct', 0):+.2f}%
-Avg win:         {stats.get('avg_win_pct', 0):+.2f}%
-Avg loss:        {stats.get('avg_loss_pct', 0):+.2f}%
-Avg hold:        {stats.get('avg_hold_days', 0):.1f} days
-Max single loss: {stats.get('max_dd_pct', 0):+.2f}%
-SPY period ret:  {stats.get('spy_period_return_pct', 0):+.2f}%  (buy-and-hold benchmark)
-Alpha/trade:     {stats.get('alpha_per_trade_pct', 0):+.2f}%  (vs SPY per holding period)
-Exit reasons:    {stats.get('exit_reasons', {})}
-
-Per-exit-steg:""")
-    for _step, _sv in sorted(stats.get("exit_step_stats", {}).items()):
-        print(f"  {_step:<16} n={_sv['count']:<4} WR={_sv['win_rate']:.0%}  avg={_sv['avg_pnl_pct']:+.1f}%")
-    print("\nScore buckets (quant VCP score):")
-    for bkt in sorted(buckets.keys()):
-        b = buckets[bkt]
-        print(f"  [{bkt}]  n={b['count']}  WR={b['win_rate']:.0%}  avg_R={b['avg_r']:+.2f}")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-    out_path = Path(args.out) if args.out else LOG_DIR / "backtest_results.json"
-    out_path.write_text(json.dumps(results, indent=2))
-    print(f"Results saved to {out_path}")
+    return stats
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Three Masters backtest with API cost accounting")
+    parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--report-file", type=str, default=None)
+    args = parser.parse_args()
+
+    run(
+        log_dir=Path(args.log_dir) if args.log_dir else None,
+        iterations=args.iterations,
+        report_file=Path(args.report_file) if args.report_file else None,
+    )

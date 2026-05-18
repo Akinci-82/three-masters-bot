@@ -854,6 +854,71 @@ def _call_opus(symbol: str, prompt: str) -> dict:
         return {"_api_error": True}
 
 
+
+def _call_haiku_timing(symbol: str, bars_5m: "pd.DataFrame",
+                       trigger_price: float) -> dict:
+    """
+    F1: Haiku analysis of 5-min pre-market data for entry timing.
+    Returns {"action": "place"|"adjust"|"skip", "price_delta_pct": float, "reason": str}
+    """
+    if bars_5m.empty or len(bars_5m) < 3:
+        return {"action": "place", "price_delta_pct": 0.0, "reason": "insufficient_data"}
+
+    try:
+        close  = bars_5m["Close"]
+        volume = bars_5m["Volume"]
+        high   = bars_5m["High"]
+        low    = bars_5m["Low"]
+        vol_avg = float(volume.mean()) if float(volume.mean()) > 0 else 1.0
+        dates   = bars_5m.index.strftime("%H:%M")
+
+        rows = [
+            f"{dates[i]}  H={high.iloc[i]:.2f} L={low.iloc[i]:.2f} "
+            f"C={close.iloc[i]:.2f} V={volume.iloc[i]/vol_avg:.2f}x"
+            for i in range(len(bars_5m))
+        ]
+        table = "\n".join(rows)
+        last_close = float(close.iloc[-1])
+        gap_pct    = (last_close - trigger_price) / trigger_price * 100
+
+        prompt = (
+            f"Pre-market 5-min data for {symbol}. Buy-stop trigger: ${trigger_price:.2f}\n"
+            f"Current pre-market price: ${last_close:.2f} ({gap_pct:+.1f}% vs trigger)\n\n"
+            f"Bars (most recent last):\n{table}\n\n"
+            f"Assess entry timing quality. Consider:\n"
+            f"1. Volume trend (building = bullish, fading = bearish)\n"
+            f"2. Price vs trigger (gapping away = chasing, tight = good)\n"
+            f"3. Bar structure (tight closes = demand; wide swings = distribution)\n\n"
+            f'Respond ONLY with JSON: {{"action": "place" or "adjust" or "skip", '
+            f'"price_delta_pct": -0.5 to +0.5 (only if adjust), '
+            f'"reason": "<10 words>"}}'
+        )
+
+        resp = _get_client().messages.create(
+            model=_HAIKU_MODEL,
+            max_tokens=80,
+            system=[{"type": "text",
+                     "text": "Respond with raw JSON only, no markdown fences.",
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        _m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+        if _m:
+            raw = _m.group(1).strip()
+        elif raw.startswith("```"):
+            raw = raw.split("```")[1].lstrip("json").strip()
+        _log_tokens(symbol, "f1_timing", _HAIKU_MODEL,
+                    resp.usage.input_tokens, resp.usage.output_tokens)
+        result = json.loads(raw)
+        # Clamp delta
+        result["price_delta_pct"] = max(-0.5, min(0.5,
+                                        float(result.get("price_delta_pct", 0))))
+        return result
+    except Exception as e:
+        _log.debug("[vcp] %s timing Haiku error: %s", symbol, e)
+        return {"action": "place", "price_delta_pct": 0.0, "reason": f"error:{e}"}
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def _get_recent_news(symbol: str, n: int = 5) -> str:
