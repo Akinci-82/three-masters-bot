@@ -2606,6 +2606,7 @@ def _run_daily_impl():
     _archive_old_jsonl()
     _write_obsidian_daily_note(report, portfolio_value)
     _update_obsidian_performance()
+    _write_obsidian_positions()
 
 
 def _run_scan(report: dict, today: str, portfolio_value: float,
@@ -4037,6 +4038,8 @@ def main():
             _maybe_opening_range_check()
             _maybe_midday_momentum_check()
             _maybe_sunday_opus_analysis()
+            if elapsed % 3600 == 0 and elapsed > 0:
+                _write_obsidian_positions()
 
         if _SHUTDOWN:
             break
@@ -4226,6 +4229,73 @@ def _obsidian_git_commit(message: str) -> None:
         _log.info("[obsidian] git commit: %s", message)
     except Exception:
         _log.debug("[obsidian] git commit failed", exc_info=True)
+
+def _write_obsidian_positions() -> None:
+    """Write current open positions + risk state to vault. Called hourly."""
+    try:
+        from datetime import datetime as _dt
+        ms_f = LOG_DIR / "monitor_state.json"
+        rs_f = LOG_DIR / "risk_state.json"
+        ms = json.loads(ms_f.read_text()) if ms_f.exists() else {}
+        rs = json.loads(rs_f.read_text()) if rs_f.exists() else {}
+        now = _dt.now().strftime("%Y-%m-%d %H:%M")
+
+        lines = [
+            "---",
+            "tags: [positions, live]",
+            f"updated: {now}",
+            "---",
+            "",
+            "# Three Masters — Live Positions",
+            "",
+            "_Uppdateras varje timme under borsdagen._",
+            "",
+        ]
+
+        if not ms:
+            lines.append("Inga oppna positioner for tillfalletNaN")
+        else:
+            lines += ["## Oppna positioner", ""]
+            lines.append("| Symbol | Entry | Stop | Dagar | Status |")
+            lines.append("|--------|-------|------|-------|--------|")
+            for sym, pos in ms.items():
+                entry  = pos.get("entry_price", 0)
+                stop   = pos.get("current_stop", 0)
+                edate  = str(pos.get("entry_date", ""))[:10]
+                p1     = "B1 " if pos.get("partial1_done") else ""
+                p2     = "B2 " if pos.get("partial2_done") else ""
+                status = (p1 + p2).strip() or "Aktiv"
+                try:
+                    import numpy as _np
+                    days = int(_np.busday_count(edate, str(date.today())))
+                except Exception:
+                    days = "?"
+                lines.append(f"| {sym} | ${entry:.2f} | ${stop:.2f} | {days}d | {status} |")
+
+        heat   = rs.get("portfolio_heat", 0)
+        dpnl   = rs.get("daily_pnl_pct", 0)
+        cl     = rs.get("consecutive_losses", 0)
+        regime = rs.get("regime", "neutral")
+
+        lines += [
+            "",
+            "## Risk State",
+            "",
+            "| Metric | Varde |",
+            "|--------|-------|",
+            f"| Portfolio heat | {heat:.1%} |",
+            f"| Daglig P&L | {dpnl:+.2%} |",
+            f"| Regime | {regime} |",
+            f"| Consecutive losses | {cl} |",
+        ]
+
+        pos_path = _VAULT_DIR / "Three Masters" / "Live Positions.md"
+        pos_path.write_text("\n".join(lines))
+        _log.debug("[obsidian] Live Positions updated")
+        _obsidian_git_commit(f"bot: positions {now[:16]}")
+    except Exception:
+        _log.debug("[obsidian] positions update failed", exc_info=True)
+
 
 
 if __name__ == "__main__":
