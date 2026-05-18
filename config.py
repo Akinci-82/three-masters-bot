@@ -12,6 +12,7 @@ BASE_DIR   = Path(__file__).parent
 LOG_DIR    = BASE_DIR / "logs"
 CHART_DIR  = BASE_DIR / "charts"
 REPORT_DIR = BASE_DIR / "reports"
+VAULT_DIR  = Path(os.environ.get("VAULT_DIR", "/home/habil/obsidian-vault"))
 
 # ── Alpaca (dedicated paper account for Three Masters) ──────────────────────
 ALPACA_API_KEY    = os.environ.get("THREE_MASTERS_ALPACA_API_KEY", "")
@@ -212,6 +213,7 @@ def _validate_config() -> None:
     # API key presence
     _chk(bool(ALPACA_API_KEY), "ALPACA_API_KEY is not set")
     _chk(bool(ALPACA_SECRET_KEY), "ALPACA_SECRET_KEY is not set")
+    _chk(bool(ANTHROPIC_API_KEY), "ANTHROPIC_API_KEY is not set — Claude VCP analysis will fail")
 
     # Sector cap must not exceed total position cap
     _chk(r.get("max_positions_per_sector", 1) <= r["max_positions"],

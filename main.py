@@ -1469,6 +1469,13 @@ def _vix_size_factor(vix: float) -> float:
 # ── Macro calendar blackout (FOMC + CPI) ────────────────────────────────────
 _FOMC_2026 = [(1,29),(3,19),(5,7),(6,18),(7,30),(9,17),(10,29),(12,10)]
 _CPI_2026  = [(1,15),(2,12),(3,12),(4,10),(5,13),(6,11),(7,15),(8,12),(9,10),(10,14),(11,12),(12,10)]
+# 2027 dates (verify against official Fed/BLS calendar each January)
+_FOMC_2027 = [(1,27),(3,17),(5,5),(6,16),(7,28),(9,15),(10,27),(12,8)]
+_CPI_2027  = [(1,13),(2,10),(3,10),(4,14),(5,12),(6,9),(7,14),(8,11),(9,8),(10,13),(11,10),(12,8)]
+_MACRO_DATES: dict[int, list] = {
+    2026: _FOMC_2026 + _CPI_2026,
+    2027: _FOMC_2027 + _CPI_2027,
+}
 
 
 def _is_macro_blackout() -> tuple[bool, str]:
@@ -1479,15 +1486,24 @@ def _is_macro_blackout() -> tuple[bool, str]:
     resolved before the scan — lift the blackout.
     """
     today = date.today()
-    # P1-fix: dates are only defined for 2026 — disable blackout for other years
-    # rather than silently substituting wrong-year dates (FOMC dates shift annually).
-    # ACTION REQUIRED each December: update _FOMC_2026 / _CPI_2026 for the new year.
-    if today.year != 2026:
+    dates = _MACRO_DATES.get(today.year)
+    if not dates:
         _log.warning(
-            "[macro] FOMC/CPI blackout dates only defined for 2026 — "
-            "BLACKOUT DISABLED for %d. Update _FOMC_2026 and _CPI_2026 in main.py!",
-            today.year)
+            "[macro] FOMC/CPI blackout dates not defined for %d -- "
+            "BLACKOUT DISABLED. Add _FOMC_%d and _CPI_%d to main.py.",
+            today.year, today.year, today.year)
         return False, ""
+    _fomc_this_year = _FOMC_2026 if today.year == 2026 else _FOMC_2027
+    for (m, d) in dates:
+        try:
+            event = date(today.year, m, d)
+        except ValueError:
+            continue
+        delta = (event - today).days
+        if 1 <= delta <= 2:
+            kind = "FOMC" if (m, d) in _fomc_this_year else "CPI"
+            return True, f"{kind} {event}"
+    return False, ""
     for (m, d) in _FOMC_2026 + _CPI_2026:
         try:
             event = date(today.year, m, d)
@@ -4075,7 +4091,7 @@ def main():
 
 
 # ── Obsidian vault integration ────────────────────────────────────────────────
-_VAULT_DIR = Path("/home/habil/obsidian-vault")
+from config import VAULT_DIR as _VAULT_DIR   # N4: centralised in config.py
 
 
 def _write_obsidian_daily_note(report: dict, portfolio_value: float) -> None:

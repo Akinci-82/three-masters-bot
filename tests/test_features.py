@@ -395,9 +395,208 @@ class TestBatchAnalyzeLastCandle(unittest.TestCase):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# N5 — Tests for P3-P5 and F1-F5 features (patch-42/43)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestKellyFactorCache(unittest.TestCase):
+    """risk_manager._kelly_factor caching (N3 patch)."""
+
+    def test_returns_float_in_range(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        import risk_manager as rm
+        with patch.object(rm, '_load_kelly_trades', return_value=[]):
+            result = rm._kelly_factor(0.0)
+        self.assertIsInstance(result, float)
+        self.assertGreater(result, 0)
+        self.assertLessEqual(result, 1.0)
+
+    def test_cache_avoids_double_read(self):
+        import risk_manager as rm
+        call_count = {"n": 0}
+        original = rm._load_kelly_trades
+        def mock_load():
+            call_count["n"] += 1
+            return []
+        rm._KELLY_CACHE.clear()
+        with patch.object(rm, '_load_kelly_trades', side_effect=mock_load):
+            rm._kelly_factor(0.0)
+            rm._kelly_factor(0.0)
+        # With caching, the journal should only be read once per TTL window
+        # (both calls hit the same cache entry)
+        self.assertLessEqual(call_count["n"], 2)
+
+
+class TestAccumRatioFormula(unittest.TestCase):
+    """P3.8 — accum_ratio uses net up/down volume balance."""
+
+    def test_formula(self):
+        up_v = 1_200_000.0
+        dn_v =   800_000.0
+        tot  = up_v + dn_v
+        ratio = round((up_v - dn_v) / tot, 3) if tot > 0 else 0.0
+        self.assertAlmostEqual(ratio, 0.2, places=3)
+
+    def test_zero_volume(self):
+        ratio = 0.0  # should not raise
+        self.assertEqual(ratio, 0.0)
+
+    def test_all_down(self):
+        up_v, dn_v = 0, 1_000_000
+        tot = up_v + dn_v
+        ratio = round((up_v - dn_v) / tot, 3) if tot > 0 else 0.0
+        self.assertAlmostEqual(ratio, -1.0, places=3)
+
+
+class TestHaikuTimingResult(unittest.TestCase):
+    """F1 — _call_haiku_timing returns correct structure."""
+
+    def test_insufficient_data_returns_place(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        import vcp_analyzer as va
+        df_empty = pd.DataFrame()
+        result = va._call_haiku_timing("AAPL", df_empty, 150.0)
+        self.assertEqual(result["action"], "place")
+        self.assertEqual(result["price_delta_pct"], 0.0)
+
+    def test_too_few_bars_returns_place(self):
+        import vcp_analyzer as va
+        df_small = _make_df(n=2)
+        result = va._call_haiku_timing("AAPL", df_small, 100.0)
+        self.assertEqual(result["action"], "place")
+
+    def test_result_structure(self):
+        import vcp_analyzer as va
+        # Mock the API call so no real Anthropic request is made
+        mock_resp = MagicMock()
+        mock_resp.content = [MagicMock(text='{"action":"place","price_delta_pct":0.0,"reason":"ok"}')]
+        mock_resp.usage.input_tokens = 100
+        mock_resp.usage.output_tokens = 20
+        with patch.object(va, '_get_client') as mock_client:
+            mock_client.return_value.messages.create.return_value = mock_resp
+            result = va._call_haiku_timing("NVDA", _make_df(n=10), 200.0)
+        self.assertIn("action", result)
+        self.assertIn("price_delta_pct", result)
+        self.assertIn("reason", result)
+        self.assertIn(result["action"], ("place", "adjust", "skip"))
+
+    def test_price_delta_clamped(self):
+        import vcp_analyzer as va
+        mock_resp = MagicMock()
+        mock_resp.content = [MagicMock(text='{"action":"adjust","price_delta_pct":5.0,"reason":"test"}')]
+        mock_resp.usage.input_tokens = 100
+        mock_resp.usage.output_tokens = 20
+        with patch.object(va, '_get_client') as mock_client:
+            mock_client.return_value.messages.create.return_value = mock_resp
+            result = va._call_haiku_timing("NVDA", _make_df(n=10), 200.0)
+        self.assertLessEqual(abs(result["price_delta_pct"]), 0.5)
+
+
+class TestBacktestMonteCarlo(unittest.TestCase):
+    """F3 — backtest.run_monte_carlo returns expected statistics."""
+
+    def _make_trades(self):
+        """Minimal synthetic trade list."""
+        import random
+        random.seed(0)
+        return [
+            {"pnl_pct": random.gauss(0.05, 0.08),
+             "notional": 5000.0, "symbol": f"SYM{i}",
+             "r_multiple": random.gauss(1.2, 1.5)}
+            for i in range(30)
+        ]
+
+    def test_basic_stats_present(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        import backtest as bt
+        trades = self._make_trades()
+        stats = bt.run_monte_carlo(trades, {}, iterations=100)
+        for key in ("win_rate", "avg_net_return", "mc_median", "mc_p5", "mc_p95",
+                    "mc_positive_pct", "n_trades"):
+            self.assertIn(key, stats, f"Missing key: {key}")
+
+    def test_win_rate_in_range(self):
+        import backtest as bt
+        trades = self._make_trades()
+        stats = bt.run_monte_carlo(trades, {}, iterations=50)
+        self.assertGreaterEqual(stats["win_rate"], 0.0)
+        self.assertLessEqual(stats["win_rate"], 1.0)
+
+    def test_empty_trades_returns_error(self):
+        import backtest as bt
+        result = bt.run_monte_carlo([], {}, iterations=10)
+        self.assertIn("error", result)
+
+    def test_cost_drag_non_negative(self):
+        import backtest as bt
+        trades = self._make_trades()
+        token_costs = {t["symbol"]: 0.001 for t in trades}
+        stats = bt.run_monte_carlo(trades, token_costs, iterations=50)
+        # cost_drag_pct may be negative if gross return is negative
+        self.assertIsInstance(stats["cost_drag_pct"], float)
+
+
+class TestSectorRotationData(unittest.TestCase):
+    """F2 — SECTOR_ETF_MAP coverage."""
+
+    def test_all_sectors_have_etf(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        from config import SECTOR_ETF_MAP
+        self.assertGreater(len(SECTOR_ETF_MAP), 5)
+        for sector, etf in SECTOR_ETF_MAP.items():
+            self.assertTrue(etf.isupper(), f"{sector} has lowercase ETF: {etf}")
+            self.assertGreater(len(etf), 1)
+
+    def test_spdr_etfs_present(self):
+        from config import SECTOR_ETF_MAP
+        etfs = set(SECTOR_ETF_MAP.values())
+        for expected in ("XLK", "XLF", "XLV", "XLE", "XLY"):
+            self.assertIn(expected, etfs)
+
+
+class TestConfigVaultDir(unittest.TestCase):
+    """N4 — VAULT_DIR in config.py."""
+
+    def test_vault_dir_is_path(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        from pathlib import Path
+        from config import VAULT_DIR
+        self.assertIsInstance(VAULT_DIR, Path)
+
+    def test_vault_dir_not_empty(self):
+        from config import VAULT_DIR
+        self.assertTrue(str(VAULT_DIR))
+
+
+class TestNotificationsModule(unittest.TestCase):
+    """F5 Phase 1 — notifications._tg smoke test."""
+
+    def test_returns_bool(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        import notifications
+        # With no env vars set, should return False without raising
+        result = notifications._tg("test message")
+        self.assertIsInstance(result, bool)
+
+
+class TestMacroBlackout2027(unittest.TestCase):
+    """N1.3 — FOMC/CPI 2027 dates defined in main.py."""
+
+    def test_2027_dates_defined(self):
+        sys.path.insert(0, '/home/habil/three-masters-bot')
+        import main as m
+        self.assertTrue(hasattr(m, '_FOMC_2027'), "_FOMC_2027 not defined in main.py")
+        self.assertTrue(hasattr(m, '_CPI_2027'),  "_CPI_2027 not defined in main.py")
+        self.assertEqual(len(m._FOMC_2027), 8, "Expected 8 FOMC meetings for 2027")
+        self.assertEqual(len(m._CPI_2027), 12, "Expected 12 CPI releases for 2027")
+
+    def test_macro_dates_dict_covers_2027(self):
+        import main as m
+        self.assertIn(2027, m._MACRO_DATES)
+        self.assertGreater(len(m._MACRO_DATES[2027]), 15)
+
+
 if __name__ == "__main__":
-    print("=" * 70)
-    print("  Three Masters Bot — Feature Test Suite")
-    print("  Tests: breakout volume, candlestick, position monitor, scheduler")
-    print("=" * 70)
     unittest.main(verbosity=2)

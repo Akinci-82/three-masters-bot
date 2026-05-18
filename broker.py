@@ -33,18 +33,8 @@ def _live_notify(msg: str) -> None:
     """Send Telegram alert for live-account order events. No-op in paper mode."""
     if not ALPACA_LIVE:
         return
-    try:
-        import os as _os, requests as _req
-        _tok  = _os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        _chat = _os.environ.get("TELEGRAM_CHAT_ID", "")
-        if _tok and _chat:
-            _req.post(
-                f"https://api.telegram.org/bot{_tok}/sendMessage",
-                json={"chat_id": _chat, "text": msg, "parse_mode": "Markdown"},
-                timeout=8,
-            )
-    except Exception:
-        pass
+    from notifications import _tg
+    _tg(msg)
 
 
 class AlpacaError(RuntimeError):

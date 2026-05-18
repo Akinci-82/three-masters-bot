@@ -20,6 +20,8 @@ from typing import Optional
 
 import numpy as np
 
+from config import LOG_DIR as _LOG_DIR_CFG, VAULT_DIR as _VAULT_DIR_CFG
+
 _log = logging.getLogger(__name__)
 
 # ── Claude API pricing (USD per 1M tokens, as of 2026) ────────────────────────
@@ -281,7 +283,7 @@ def run(log_dir: Optional[Path] = None, iterations: int = 1000,
     report = format_report(stats, trades, token_costs)
 
     # Write to Obsidian vault
-    vault_path = Path("/home/habil/obsidian-vault/Three Masters/Backtest-rapport.md")
+    vault_path = _VAULT_DIR_CFG / "Three Masters" / "Backtest-rapport.md"
     if vault_path.parent.exists():
         vault_path.write_text(report)
         print(f"Report written to {vault_path}")
@@ -299,6 +301,26 @@ def run(log_dir: Optional[Path] = None, iterations: int = 1000,
 
     if report_file:
         Path(report_file).write_text(report)
+
+    # Write backtest_results.json for monte_carlo.py
+    _bt_results = {
+        "trades": [
+            {"pnl_pct": float(t.get("pnl_pct", 0)),
+             "r_multiple": float(t.get("r_multiple", 0)),
+             "composite_score": float(t.get("composite_score", 0) or 0),
+             "symbol": t.get("symbol", ""),
+             "notional": float(t.get("notional", 0))}
+            for t in trades
+        ],
+        "stats": stats,
+    }
+    _bt_json = _LOG_DIR_CFG / "backtest_results.json"
+    try:
+        import json as _j_bt
+        _bt_json.write_text(_j_bt.dumps(_bt_results, indent=2, default=str))
+        print(f"Backtest results written to {_bt_json} (for monte_carlo.py)")
+    except Exception as _e_bt:
+        print(f"Could not write backtest_results.json: {_e_bt}")
 
     # Print summary
     print(f"\n=== Backtest Summary ({stats['n_trades']} trades) ===")

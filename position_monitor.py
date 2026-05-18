@@ -592,7 +592,6 @@ def _check_drawdown_proximity() -> None:
         from datetime import date as _date
         from risk_manager import get_state as _grs
         from config import RISK as _risk_cfg
-        import requests as _req, os as _os
 
         state       = _grs()
         daily_pnl   = state.get("daily_pnl_pct", 0.0)
@@ -602,41 +601,26 @@ def _check_drawdown_proximity() -> None:
         halt_pct = _risk_cfg.get("max_daily_loss_pct", 0.04)
         warn_pct = halt_pct / 2
 
-        _tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
-        _cid = _os.getenv("TELEGRAM_CHAT_ID", "")
-
         if daily_pnl <= -halt_pct and "4pct" not in alerted_set:
             alerted_set.add("4pct")
-            if _tok and _cid:
-                pct_str = f"{daily_pnl*100:.1f}%"
-                halt_str = f"{halt_pct*100:.0f}%"
-                msg = (
-                    "\U0001F6A8 *DAILY HALT " + pct_str + "*\n"
-                    "Daily loss limit reached -- risk_manager blocks new trades.\n"
-                    "Portfolio at max drawdown (" + halt_str + ") for today."
-                )
-                _req.post(
-                    f"https://api.telegram.org/bot{_tok}/sendMessage",
-                    json={"chat_id": _cid, "parse_mode": "Markdown", "text": msg},
-                    timeout=8,
-                )
+            pct_str  = f"{daily_pnl*100:.1f}%"
+            halt_str = f"{halt_pct*100:.0f}%"
+            _tg(
+                "\U0001F6A8 *DAILY HALT " + pct_str + "*\n"
+                "Daily loss limit reached -- risk_manager blocks new trades.\n"
+                "Portfolio at max drawdown (" + halt_str + ") for today."
+            )
 
         elif daily_pnl <= -warn_pct and "2pct" not in alerted_set:
             alerted_set.add("2pct")
-            if _tok and _cid:
-                pct_str  = f"{abs(daily_pnl)*100:.1f}%"
-                halt_str = f"{halt_pct*100:.0f}%"
-                msg = (
-                    "\u26A0\uFE0F *Drawdown Warning -" + pct_str + "*\n"
-                    "Portfolio down " + pct_str + " today -- "
-                    "halfway to " + halt_str + " daily halt.\n"
-                    "Review open positions and tighten stops."
-                )
-                _req.post(
-                    f"https://api.telegram.org/bot{_tok}/sendMessage",
-                    json={"chat_id": _cid, "parse_mode": "Markdown", "text": msg},
-                    timeout=8,
-                )
+            pct_str  = f"{abs(daily_pnl)*100:.1f}%"
+            halt_str = f"{halt_pct*100:.0f}%"
+            _tg(
+                "\u26A0\uFE0F *Drawdown Warning -" + pct_str + "*\n"
+                "Portfolio down " + pct_str + " today -- "
+                "halfway to " + halt_str + " daily halt.\n"
+                "Review open positions and tighten stops."
+            )
     except Exception as _e_dd:
         import logging
         logging.getLogger(__name__).debug("[monitor] drawdown check error: %s", _e_dd)

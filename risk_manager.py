@@ -56,6 +56,37 @@ def _save(data: dict):
         _tmp.replace(RISK_FILE)  # atomic on POSIX — prevents half-written state on crash
 
 
+# module-level trade journal cache — avoids re-reading file on every call
+_KELLY_CACHE: dict = {}   # {'trades': list, 'ts': float}
+_KELLY_CACHE_TTL = 3600   # 1 hour
+
+
+def _load_kelly_trades() -> list[dict]:
+    """Load and cache trade journal for Kelly calculation. TTL = 1 hour."""
+    import time as _t, json as _j
+    from pathlib import Path as _P
+    now = _t.monotonic()
+    cached = _KELLY_CACHE.get("trades")
+    if cached is not None and now - _KELLY_CACHE.get("ts", 0) < _KELLY_CACHE_TTL:
+        return cached
+    jpath = _P(__file__).parent / "logs" / "trade_journal.jsonl"
+    trades: list[dict] = []
+    try:
+        if jpath.exists():
+            for _ln in jpath.read_text().splitlines():
+                if not _ln.strip():
+                    continue
+                try:
+                    trades.append(_j.loads(_ln))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    _KELLY_CACHE["trades"] = trades
+    _KELLY_CACHE["ts"] = now
+    return trades
+
+
 def _kelly_factor(composite_score: float = 0.0) -> float:
     """
     Half-Kelly fraction from trade journal win rate and average R.
@@ -67,24 +98,12 @@ def _kelly_factor(composite_score: float = 0.0) -> float:
       low (<6.5) / mid (6.5–7.5) / high (>=7.5).
     Falls back to global Kelly if the bucket has fewer than 5 trades.
     """
-    import json as _j
-    from pathlib import Path as _P
-    jpath = _P(__file__).parent / "logs" / "trade_journal.jsonl"
     base_kelly = 1.0
     try:
-        if not jpath.exists():
-            base_kelly = 1.0
+        trades = _load_kelly_trades()
+        if not trades:
+            pass  # keep base_kelly = 1.0
         else:
-            _lines = jpath.read_text().splitlines()
-            trades = []
-            for _ln in _lines:
-                if not _ln.strip():
-                    continue
-                try:
-                    trades.append(_j.loads(_ln))
-                except Exception:
-                    pass
-
             # Segment trades by composite-score bucket when score is provided
             _use_trades = trades
             if composite_score > 0 and len(trades) >= 5:
@@ -355,10 +374,19 @@ def check_reentry_cooldown(symbol: str, current_price: float = 0.0) -> bool:
         if not stop_date_str:
             return False
         try:
-            from pandas.tseries.offsets import BDay
             import pandas as _pd
-            stop_dt      = _pd.Timestamp(stop_date_str)
-            cooldown_end = stop_dt + BDay(_cd_days)
+            stop_dt = _pd.Timestamp(stop_date_str)
+            try:
+                import pandas_market_calendars as _mcal
+                _nyse   = _mcal.get_calendar("NYSE")
+                _end_dt = (stop_dt + _pd.Timedelta(days=max(30, _cd_days * 3))).date()
+                _sched  = _nyse.schedule(start_date=stop_dt.date(), end_date=_end_dt)
+                cooldown_end = (_pd.Timestamp(_sched.index[_cd_days])
+                                if len(_sched) > _cd_days
+                                else stop_dt + _pd.Timedelta(days=_cd_days * 2))
+            except Exception:
+                from pandas.tseries.offsets import BDay
+                cooldown_end = stop_dt + BDay(_cd_days)
             in_cooldown  = _pd.Timestamp.today() < cooldown_end
             if not in_cooldown:
                 # Time cooldown expired — also check pivot recovery
@@ -430,10 +458,19 @@ def check_pivot_failure_cooldown(symbol: str) -> bool:
         if not fail_date_str:
             return False
         try:
-            from pandas.tseries.offsets import BDay
             import pandas as _pd
-            fail_dt      = _pd.Timestamp(fail_date_str)
-            cooldown_end = fail_dt + BDay(45)
+            fail_dt = _pd.Timestamp(fail_date_str)
+            try:
+                import pandas_market_calendars as _mcal
+                _nyse   = _mcal.get_calendar("NYSE")
+                _end_dt = (fail_dt + _pd.Timedelta(days=100)).date()
+                _sched  = _nyse.schedule(start_date=fail_dt.date(), end_date=_end_dt)
+                cooldown_end = (_pd.Timestamp(_sched.index[45])
+                                if len(_sched) > 45
+                                else fail_dt + _pd.Timedelta(days=70))
+            except Exception:
+                from pandas.tseries.offsets import BDay
+                cooldown_end = fail_dt + BDay(45)
             in_cooldown  = _pd.Timestamp.today() < cooldown_end
             if not in_cooldown:
                 state.get("pivot_failure_cooldown", {}).pop(symbol, None)

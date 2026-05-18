@@ -26,19 +26,7 @@ _RECONNECT_MAX       = 300  # cap exponential backoff at 5 minutes
 _ALERT_FAIL_THRESHOLD = 3   # send Telegram alert after this many consecutive auth fails
 
 
-def _tg(msg: str) -> None:
-    try:
-        import requests
-        token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        if token and chat_id:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
-                timeout=8,
-            )
-    except Exception:
-        pass
+from notifications import _tg
 
 
 def _handle_trade_update(data) -> None:
