@@ -41,20 +41,34 @@ _SECTOR_ETF_RETURNS_LOCK = threading.Lock()
 _SECTOR_ETF_TTL = 4 * 3600  # 4 hours
 
 # Nasdaq 100 extras not typically in S&P 500 — high VCP potential
-_NDQ_EXTRAS = [
-    # Original Nasdaq extras
+# P5.4: Dynamic QQQ/IWF holdings replace hardcoded list that ages quickly.
+# Falls back to a core set if network or yfinance fails.
+_NDQ_EXTRAS_FALLBACK = {
     "MELI","BKNG","LULU","REGN","VRTX","IDXX","ANSS","CDNS","SNPS",
-    "DXCM","ALGN","ILMN","ZBRA","NXPI","MCHP","KLAC","MPWR",
-    "ENPH","FSLR","CELH","APP","DUOL","AXON","DECK","CROX","LNTH",
-    "ELF","SMCI","AEHR","FTNT","DDOG","MDB","NET","ZS","PANW","CRWD",
-    "SNOW","NOW","HUBS","BILL","GTLB","IOT","TMDX","AAON","DOCS",
-    # Russell 1000 mid-cap growth additions
-    "PAYC","PODD","MEDP","CRNX","RXRX","RVMD","TGTX","ARDX","PRCT",
-    "ICUI","INSP","IRTC","TNDM","NVST","RGEN","ITGR","KRYS","BBIO",
-    "ACLS","ALGM","FORM","GTLS","HQY","LFST","OMCL","PDFS","PLUS",
-    "POWL","PRVA","SKYW","SPSC","TBBK","TFIN","TRMK","UFPI","WDFC",
-    "WTS","XPEL","YETI","ZWS","GFAI","MGEE","NRC","NTST",
-]
+    "DXCM","ALGN","FTNT","DDOG","MDB","NET","ZS","PANW","CRWD",
+    "SNOW","NOW","HUBS","AXON","DECK","APP","DUOL","CELH","DOCS",
+}
+
+def _fetch_etf_holdings(ticker: str, top_n: int = 100) -> set[str]:
+    """Return top-N holdings of an ETF via yfinance. Empty set on failure."""
+    try:
+        import yfinance as _yf
+        t = _yf.Ticker(ticker)
+        df = t.funds_data.top_holdings if hasattr(t, "funds_data") else None
+        if df is not None and not df.empty:
+            return set(df.index[:top_n].tolist())
+    except Exception:
+        pass
+    return set()
+
+def _get_ndq_extras() -> set[str]:
+    """Get dynamic QQQ + IWF holdings, deduplicated. Falls back to static list."""
+    dynamic = _fetch_etf_holdings("QQQ", 150) | _fetch_etf_holdings("IWF", 80)
+    if len(dynamic) >= 50:
+        _log.info("[screen] Dynamic NDQ extras: %d symbols (QQQ+IWF)", len(dynamic))
+        return dynamic
+    _log.info("[screen] ETF holdings unavailable — using fallback NDQ_EXTRAS")
+    return _NDQ_EXTRAS_FALLBACK
 
 _UNIVERSE_CACHE = LOG_DIR / "universe_cache.json"
 _CACHE_DAYS = 7
@@ -125,7 +139,7 @@ def load_universe() -> list[str]:
             _log.warning("[screen] Wikipedia S&P 500 failed: %s", e)
 
     # ── Source 3: Nasdaq 100 extras ───────────────────────────────────────────
-    symbols.update(_NDQ_EXTRAS)
+    symbols.update(_get_ndq_extras())
 
     # ── Source 4: Alpaca — fractionable large-caps (quality proxy) ────────────
     if len(symbols) < 400:
@@ -156,7 +170,7 @@ def load_universe() -> list[str]:
         "GS","MS","BAC","WFC","C","BLK","SPGI","MCO","ICE","CME",
         "UNP","CSX","NSC","FDX","UPS","LMT","RTX","NOC","GD","BA",
         "CAT","DE","ETN","PH","ROK","EMR","HON","MMM","GE","ITW",
-        "COST","TGT","WMT","AMZN","EBAY","ETSY","W","ZM","PINS","SNAP",
+        "COST","TGT","WMT","EBAY","ETSY","W","ZM","PINS","SNAP",
     ]
     symbols.update(_QUALITY_CORE)
 
@@ -535,6 +549,67 @@ def _compute_adx(df: pd.DataFrame, period: int = 14) -> float:
         return round(float(adx.iloc[-1]), 1)
     except Exception:
         return 0.0
+
+
+def _apply_pead(symbol: str, result: "TrendResult") -> None:
+    """P5.1: Populate result.pead_hold and result.eps_surprise_pct."""
+    try:
+        from data_provider import get_latest_surprise as _get_surprise
+        _rep_date, _surprise = _get_surprise(symbol)
+        if _rep_date and _surprise >= 0.05:
+            _rep_ts     = pd.Timestamp(_rep_date).tz_localize(None)
+            _today_n    = pd.Timestamp.now().normalize()
+            _days_since = int(np.busday_count(_rep_ts.date(), _today_n.date()))
+            if 5 <= _days_since <= 20:
+                result.pead_hold        = True
+                result.eps_surprise_pct = round(_surprise, 4)
+                _log.info("[screen] %s PEAD window: %dd post-report, +%.1f%% surprise",
+                          symbol, _days_since, _surprise * 100)
+    except Exception:
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
+
+
+def _apply_options_filter(symbol: str, price: float, result: "TrendResult") -> bool:
+    """P5.1: Check options liquidity + unusual flow. Returns False → caller should reject."""
+    # Liquidity check
+    _opts_ok = True
+    try:
+        from data_provider import get_atm_options_oi as _get_oi
+        _oi = _get_oi(symbol, price)
+        if _oi is not None and _oi < 100:
+            _opts_ok = False
+            _log.debug("[screen] %s options OI=%d < 100 — illiquid", symbol, _oi)
+    except Exception:
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
+    result.options_liquid = _opts_ok
+    if not _opts_ok:
+        result.fail_reason = "options_illiquid"
+        return False
+
+    # Unusual OTM call flow (institutional signal)
+    try:
+        import yfinance as _yf_opts
+        _ot  = _yf_opts.Ticker(symbol)
+        _exp = _ot.options
+        if _exp:
+            _chain = _ot.option_chain(_exp[0])
+            _calls = _chain.calls
+            if not _calls.empty:
+                _all_call_vol = int(_calls["volume"].fillna(0).sum())
+                _otm_calls    = _calls[_calls["strike"] > price * 1.02]
+                _otm_vol      = int(_otm_calls["volume"].fillna(0).sum())
+                _otm_oi       = int(_otm_calls["openInterest"].fillna(0).sum())
+                _unusual = (
+                    (_otm_oi > 0 and _otm_vol > 3 * _otm_oi and _otm_vol > 500)
+                    or (_all_call_vol > 1000 and _otm_vol > 0.80 * _all_call_vol)
+                )
+                result.unusual_options = _unusual
+                if _unusual:
+                    _log.info("[screen] %s UNUSUAL OPTIONS: OTM vol=%d OI=%d total=%d",
+                              symbol, _otm_vol, _otm_oi, _all_call_vol)
+    except Exception:
+        _log.debug("[%s] suppressed", __name__, exc_info=True)
+    return True
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
@@ -1165,70 +1240,10 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         except Exception:
             result.weinstein_stage = 2
 
-        # ── PEAD: Post-Earnings Announcement Drift ─────────────────────────────
-        # Uses data_provider for yfinance→FMP fallback
-        _pead = False
-        _pead_surprise = 0.0
-        try:
-            from data_provider import get_latest_surprise as _get_surprise
-            _rep_date, _surprise = _get_surprise(symbol)
-            if _rep_date and _surprise >= 0.05:
-                _rep_ts   = pd.Timestamp(_rep_date).tz_localize(None)
-                _today_n  = pd.Timestamp.now().normalize()
-                _days_since = int(np.busday_count(_rep_ts.date(), _today_n.date()))
-                if 5 <= _days_since <= 20:
-                    _pead         = True
-                    _pead_surprise = _surprise
-                    _log.info("[screen] %s PEAD window: %dd post-report, +%.1f%% surprise",
-                              symbol, _days_since, _surprise * 100)
-        except Exception:
-            _log.debug("[%s] suppressed", __name__, exc_info=True)
-        result.pead_hold        = _pead
-        result.eps_surprise_pct = round(_pead_surprise, 4)
-
-        # ── Options liquidity filter ─────────────────────────────────────────
-        # Uses data_provider for yfinance→FMP fallback
-        _opts_ok = True
-        try:
-            from data_provider import get_atm_options_oi as _get_oi
-            _oi = _get_oi(symbol, price)
-            if _oi is not None and _oi < 100:
-                _opts_ok = False
-                _log.debug("[screen] %s options OI=%d < 100 — illiquid", symbol, _oi)
-        except Exception:
-            _log.debug("[%s] suppressed", __name__, exc_info=True)
-        result.options_liquid = _opts_ok
-        if not _opts_ok:
-            result.fail_reason = "options_illiquid"
+        # ── PEAD + Options: P5.1 extracted to sub-functions ────────────────────
+        _apply_pead(symbol, result)
+        if not _apply_options_filter(symbol, price, result):
             return result
-
-        # ── Options flow: unusual OTM call activity → institutional signal ──
-        try:
-            import yfinance as _yf_opts
-            _ot  = _yf_opts.Ticker(symbol)
-            _exp = _ot.options   # list of expiry dates, nearest first
-            if _exp:
-                _chain   = _ot.option_chain(_exp[0])
-                _calls   = _chain.calls
-                if not _calls.empty:
-                    _all_call_vol  = int(_calls["volume"].fillna(0).sum())
-                    # OTM = strike slightly above current price
-                    _otm_calls     = _calls[_calls["strike"] > price * 1.02]
-                    _otm_vol       = int(_otm_calls["volume"].fillna(0).sum())
-                    _otm_oi        = int(_otm_calls["openInterest"].fillna(0).sum())
-                    _unusual = False
-                    # Signal 1: OTM call vol > 3× OTM OI (fresh buying, not rolling) AND vol > 500
-                    if _otm_oi > 0 and _otm_vol > 3 * _otm_oi and _otm_vol > 500:
-                        _unusual = True
-                    # Signal 2: OTM calls dominate total (>80%) with meaningful volume (>1000)
-                    elif _all_call_vol > 1000 and _otm_vol > 0.80 * _all_call_vol:
-                        _unusual = True
-                    result.unusual_options = _unusual
-                    if _unusual:
-                        _log.info("[screen] %s UNUSUAL OPTIONS: OTM vol=%d OI=%d total=%d",
-                                  symbol, _otm_vol, _otm_oi, _all_call_vol)
-        except Exception:
-            _log.debug("[%s] suppressed", __name__, exc_info=True)
 
         result.passed = True
         return result

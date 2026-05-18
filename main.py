@@ -32,6 +32,7 @@ import yfinance as yf
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
+from notifications import _tg
 from config import (
     LOG_DIR, REPORT_DIR, CHART_DIR,
     DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET,
@@ -69,27 +70,7 @@ _log = logging.getLogger("three_masters")
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-def _tg(msg: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    # Telegram silently truncates messages >4096 chars — split at 4000 to stay safe
-    if len(msg) > 4000:
-        parts = []
-        while msg:
-            parts.append(msg[:4000])
-            msg = msg[4000:]
-        return all(_tg(part) for part in parts)
-    try:
-        import requests
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        _log.warning("[tg] failed: %s", e)
-        return False
+# P5.3: _tg imported from notifications.py (shared with position_monitor)
 
 
 # ── Live trading — pending order queue ───────────────────────────────────────
@@ -274,14 +255,17 @@ def _equity_return_str(current: float) -> str:
 
 # ── Portfolio drawdown early-warning ─────────────────────────────────────────
 _last_dd_warn_date: str = ""
+_last_dd_warn_lock = threading.Lock()  # P5.5: guard check-then-set
 
 
 def _check_portfolio_drawdown_warning(portfolio_value: float) -> None:
     """Send Telegram warning if portfolio is >5% below equity-history peak. Once per day."""
     global _last_dd_warn_date
     _today_str = str(date.today())
-    if _last_dd_warn_date == _today_str:
-        return
+    with _last_dd_warn_lock:
+        if _last_dd_warn_date == _today_str:
+            return
+        _last_dd_warn_date = _today_str
     try:
         _eq_path = LOG_DIR / "equity_history.jsonl"
         if not _eq_path.exists():
@@ -302,7 +286,6 @@ def _check_portfolio_drawdown_warning(portfolio_value: float) -> None:
             return
         _dd = (portfolio_value - _peak) / _peak
         if _dd <= -0.05:
-            _last_dd_warn_date = _today_str
             _tg(
                 f"⚠️ *Portfolio Drawdown Warning*\n"
                 f"Portfölj ${portfolio_value:,.0f} — {_dd*100:.1f}% från peak ${_peak:,.0f}\n"
@@ -359,6 +342,7 @@ def _check_bot_idle_alert() -> None:
 
 # ── Morning briefing (15:15 CEST = 09:15 ET, 15 min before US open) ──────────
 _last_briefing_date: date | None = None
+_last_briefing_lock = threading.Lock()  # P5.5: guard check-then-set
 
 
 def _send_morning_briefing() -> None:
@@ -630,9 +614,10 @@ def _maybe_morning_briefing() -> None:
     if not (now.hour == 15 and 13 <= now.minute <= 44):
         return
     today = now.date()
-    if _last_briefing_date == today:
-        return
-    _last_briefing_date = today
+    with _last_briefing_lock:
+        if _last_briefing_date == today:
+            return
+        _last_briefing_date = today
     _send_morning_briefing()
 
 

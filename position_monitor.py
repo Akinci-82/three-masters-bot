@@ -17,6 +17,7 @@ from datetime import datetime, time as dt_time, timedelta
 
 import pytz
 import requests
+from notifications import _tg
 import yfinance as yf
 
 _log = logging.getLogger(__name__)
@@ -377,23 +378,11 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
             jf.write(_json.dumps(entry) + "\n")
         _log.info("[monitor] Trade journaled: %s pnl=%.1f%% (%.1fR)",
                   symbol, pnl_pct * 100, r_multiple)
-        try:
-            import requests as _rqjt, os as _osjt
-            _tjt = _osjt.getenv("TELEGRAM_BOT_TOKEN", "")
-            _cjt = _osjt.getenv("TELEGRAM_CHAT_ID", "")
-            if _tjt and _cjt:
-                _sign_jt = "✅" if r_multiple >= 0 else "❌"
-                _rqjt.post(
-                    f"https://api.telegram.org/bot{_tjt}/sendMessage",
-                    json={"chat_id": _cjt, "parse_mode": "Markdown",
-                          "text": (
+        _tg((
                               f"{_sign_jt} *{symbol}* {pnl_pct*100:+.1f}%"
                               f" ({r_multiple:+.1f}R) via {entry['exit_step']}"
                               f" | {entry['days_held']}d"
-                          )},
-                    timeout=8)
-        except Exception:
-            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                          ))
     except Exception as e:
         _log.warning("[monitor] Journal write failed: %s", e)
 
@@ -653,6 +642,35 @@ def _check_drawdown_proximity() -> None:
         logging.getLogger(__name__).debug("[monitor] drawdown check error: %s", _e_dd)
 
 
+def _step_d_time_stop(sym: dict, symbol: str, qty: int, pnl_pct: float,
+                      time_stop_days: int, days_held: int, pead_active: bool,
+                      soft_dd_mode: bool, cfg: dict) -> bool:
+    """P5.2: Time stop — Minervini 3-4 week rule. Returns True if position closed."""
+    tsg = cfg.get("time_stop_min_gain_pct", 0.02)
+    tsd = time_stop_days
+    if soft_dd_mode:
+        tsd = max(int(tsd * 0.7), 10)
+        tsg = max(tsg, 0.04)
+    if not sym.get("entry_date", ""):
+        return False
+    if (sym.get("partial_done") or sym.get("time_stopped")
+            or sym.get("max_loss_exited") or pead_active):
+        return False
+    if days_held < tsd or pnl_pct >= tsg:
+        return False
+    _rem = qty - sym.get("partial_qty", 0)
+    _log.warning("[monitor] %s TIME STOP: day %d pnl=%.1f%% (< %.0f%%) — closing",
+                 symbol, days_held, pnl_pct * 100, tsg * 100)
+    _cancel_stop_orders(symbol)
+    if _rem > 0 and _place_market_sell(symbol, _rem):
+        sym["time_stopped"] = True
+        _tg(f"⏳ *Time Stop — {symbol}*\n"
+            f"Held {days_held} days | P&L {pnl_pct*100:+.1f}%\n"
+            f"No momentum — Minervini time rule")
+        return True
+    return False
+
+
 def check_positions() -> None:
     """Run one monitoring cycle. Called every 15 min during market hours."""
     if not _market_is_open():
@@ -863,24 +881,12 @@ def check_positions() -> None:
                         symbol, _expected_qty, qty, _qty_ratio,
                         _old_sl, sym.get("stop_loss", 0),
                     )
-                    try:
-                        import requests as _rq_sp, os as _os_sp
-                        _tok_sp = _os_sp.getenv("TELEGRAM_BOT_TOKEN", "")
-                        _cid_sp = _os_sp.getenv("TELEGRAM_CHAT_ID", "")
-                        if _tok_sp and _cid_sp:
-                            _rq_sp.post(
-                                f"https://api.telegram.org/bot{_tok_sp}/sendMessage",
-                                json={"chat_id": _cid_sp, "parse_mode": "Markdown",
-                                      "text": (
+                    _tg((
                                           f"⚠️ *Stock Split Detected — {symbol}*\n"
                                           f"Qty {_expected_qty} → {qty} (ratio {_qty_ratio:.2f}x)\n"
                                           f"Stop adjusted: ${_old_sl:.2f} → ${sym.get('stop_loss', 0):.2f}\n"
                                           "Please verify position parameters."
-                                      )},
-                                timeout=8,
-                            )
-                    except Exception:
-                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                      ))
         # On first encounter: check intraday breakout volume confirmation.
         # Minervini rule: breakout on < 1.0× avg volume = false breakout, exit fast.
         if not sym.get("_vol_checked"):
@@ -897,22 +903,11 @@ def check_positions() -> None:
                         _log.warning("[monitor] %s WEAK BREAKOUT VOL %.1f×avg — "
                                      "stop will tighten to -3%% on any weakness",
                                      symbol, _vol_ratio)
-                        try:
-                            import requests as _rqv, os as _osv
-                            _tokv = _osv.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cidv = _osv.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tokv and _cidv:
-                                _rqv.post(
-                                    f"https://api.telegram.org/bot{_tokv}/sendMessage",
-                                    json={"chat_id": _cidv, "parse_mode": "Markdown",
-                                          "text": (
+                        _tg((
                                               "\u26a0\ufe0f *Weak Vol Breakout \u2014 " + symbol + "*\n"
                                               + f"Volume {_vol_ratio:.1f}x avg (< 1.0x)\n"
                                               + "Stop tightened to -3% on first weakness"
-                                          )},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                          ))
             except Exception as _ve:
                 _log.debug("[monitor] vol check %s: %s", symbol, _ve)
 
@@ -1040,23 +1035,11 @@ def check_positions() -> None:
                     if _sv_oid:
                         sym["stop_order_id"] = _sv_oid
                         changed = True
-                    try:
-                        import requests as _rqsv, os as _ossv
-                        _tsv = _ossv.getenv("TELEGRAM_BOT_TOKEN", "")
-                        _csv2 = _ossv.getenv("TELEGRAM_CHAT_ID", "")
-                        if _tsv and _csv2:
-                            _status = "Re-placed 7% trailing stop" if _sv_oid else "Re-place FAILED — check manually"
-                            _rqsv.post(
-                                f"https://api.telegram.org/bot{_tsv}/sendMessage",
-                                json={"chat_id": _csv2, "parse_mode": "Markdown",
-                                      "text": (
+                    _tg((
                                           f"\u26a0\ufe0f *Stop Missing — {symbol}*\n"
                                           f"GTC stop not found on Alpaca\n"
                                           f"{_status}"
-                                      )},
-                                timeout=8)
-                    except Exception:
-                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                      ))
             except Exception as _sve:
                 _log.debug("[monitor] stop_revalidation %s: %s", symbol, _sve)
 
@@ -1101,23 +1084,12 @@ def check_positions() -> None:
                             "[monitor] %s HWM-STOP: MFE %.1f%% → now %.1f%% "
                             "(>8%% drawdown from peak) — stop $%.2f → $%.2f",
                             symbol, _hwm_mfe * 100, pnl_pct * 100, _hwm_old, _hwm_stop)
-                        try:
-                            import requests as _rqhwm, os as _oshwm
-                            _thwm = _oshwm.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _chwm = _oshwm.getenv("TELEGRAM_CHAT_ID", "")
-                            if _thwm and _chwm:
-                                _rqhwm.post(
-                                    f"https://api.telegram.org/bot{_thwm}/sendMessage",
-                                    json={"chat_id": _chwm, "parse_mode": "Markdown",
-                                          "text": (
+                        _tg((
                                               f"📉 *HWM Stop — {symbol}*\n"
                                               f"MFE {_hwm_mfe*100:.1f}% → now {pnl_pct*100:.1f}%"
                                               f" (>8% drawdown from peak)\n"
                                               f"Stop: ${_hwm_old:.2f} → ${_hwm_stop:.2f} (+5%)"
-                                          )},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                          ))
 
         # ── PM-VWAP: Intraday VWAP weakness — tighten stop 11-14 ET ─────────────
         # If price falls below intraday VWAP with rising volume during 11-14 ET =
@@ -1153,21 +1125,10 @@ def check_positions() -> None:
                                 "[monitor] %s VWAP weakness (price $%.2f < VWAP $%.2f + rising vol) "
                                 "— stop tightened $%.2f → $%.2f",
                                 symbol, cur_price, _vwap_in, _old_sl, _new_sl)
-                            try:
-                                import requests as _rqvw, os as _osvw
-                                _tvw = _osvw.getenv("TELEGRAM_BOT_TOKEN", "")
-                                _cvw = _osvw.getenv("TELEGRAM_CHAT_ID", "")
-                                if _tvw and _cvw:
-                                    _rqvw.post(
-                                        f"https://api.telegram.org/bot{_tvw}/sendMessage",
-                                        json={"chat_id": _cvw, "parse_mode": "Markdown",
-                                              "text": (f"⚠️ *VWAP Weakness — {symbol}*\n"
+                            _tg((f"⚠️ *VWAP Weakness — {symbol}*\n"
                                                        f"Price ${cur_price:.2f} < VWAP ${_vwap_in:.2f} "
                                                        f"+ rising volume (11-14 ET)\n"
-                                                       f"Stop tightened: ${_old_sl:.2f} → ${_new_sl:.2f}")},
-                                        timeout=8)
-                            except Exception:
-                                _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                       f"Stop tightened: ${_old_sl:.2f} → ${_new_sl:.2f}"))
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
 
@@ -1225,23 +1186,12 @@ def check_positions() -> None:
                             else:
                                 _log.warning("[monitor] %s Keltner state updated but Alpaca stop NOT placed — retries next cycle",
                                              symbol)
-                        try:
-                            import requests as _rqkc, os as _oskc
-                            _tkc = _oskc.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _ckc = _oskc.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tkc and _ckc:
-                                _rqkc.post(
-                                    f"https://api.telegram.org/bot{_tkc}/sendMessage",
-                                    json={"chat_id": _ckc, "parse_mode": "Markdown",
-                                          "text": (
+                        _tg((
                                               f"📐 *Keltner Stop — {symbol}*\n"
                                               f"Stop ratcheted ${_old_ksl:.2f} → ${_keltner_low:.2f}\n"
                                               f"EMA20 ${_ema20:.2f} − 2×ATR14 ${_katr14:.2f}\n"
                                               f"P&L {pnl_pct*100:+.1f}% | Price ${cur_price:.2f}"
-                                          )},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                          ))
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
 
@@ -1265,24 +1215,13 @@ def check_positions() -> None:
                 if _ml_rem > 0 and _place_market_sell(symbol, _ml_rem):
                     sym["max_loss_exited"] = True
                     changed = True
-                    try:
-                        import requests as _rqml, os as _osml
-                        _tml = _osml.getenv("TELEGRAM_BOT_TOKEN", "")
-                        _cml = _osml.getenv("TELEGRAM_CHAT_ID", "")
-                        if _tml and _cml:
-                            _rqml.post(
-                                f"https://api.telegram.org/bot{_tml}/sendMessage",
-                                json={"chat_id": _cml, "parse_mode": "Markdown",
-                                      "text": (
+                    _tg((
                                           f"🔴 *Max Loss Cap — {symbol}*\n"
                                           f"Price ${cur_price:.2f} breached 2R floor ${_max_loss_p:.2f}\n"
                                           f"Entry ${avg_cost:.2f} | Stop ${_sli_ml:.2f} | "
                                           f"Loss {pnl_pct*100:.1f}%\n"
                                           f"Tudor Jones hard floor — forced exit"
-                                      )},
-                                timeout=8)
-                    except Exception:
-                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                      ))
         # Quality-adjusted exits: elite setups get more room to run
         composite      = sym.get("composite_score", 0.0)
         _regime_ts      = _get_cached_regime()
@@ -1337,19 +1276,9 @@ def check_positions() -> None:
                                 _log.warning("[monitor] EARNINGS GUARD %s — %dd to report, "
                                              "stop moved to breakeven $%.2f",
                                              symbol, _days_earn, avg_cost)
-                                try:
-                                    import requests as _rq, os as _os
-                                    tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
-                                    cid = _os.getenv("TELEGRAM_CHAT_ID", "")
-                                    if tok and cid:
-                                        _rq.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                                                 json={"chat_id": cid, "parse_mode": "Markdown",
-                                                       "text": (f"🛡️ *Earnings Guard — {symbol}*\n"
+                                _tg((f"🛡️ *Earnings Guard — {symbol}*\n"
                                                                 f"{_days_earn} days to earnings report\n"
-                                                                f"Stop moved to breakeven ${avg_cost:.2f}")},
-                                                 timeout=8)
-                                except Exception:
-                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                                f"Stop moved to breakeven ${avg_cost:.2f}"))
                         elif pnl_pct < 0.01 and _days_earn <= 3 and _remaining > 0:
                             # Flat/losing with report in 3 days → exit now
                             _cancel_stop_orders(symbol)
@@ -1358,19 +1287,9 @@ def check_positions() -> None:
                                 changed = True
                                 _log.warning("[monitor] EARNINGS CLOSE %s — %dd to report, "
                                              "flat/loss %.1f%%", symbol, _days_earn, pnl_pct*100)
-                                try:
-                                    import requests as _rq, os as _os
-                                    tok = _os.getenv("TELEGRAM_BOT_TOKEN", "")
-                                    cid = _os.getenv("TELEGRAM_CHAT_ID", "")
-                                    if tok and cid:
-                                        _rq.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                                                 json={"chat_id": cid, "parse_mode": "Markdown",
-                                                       "text": (f"📅 *Earnings Close — {symbol}*\n"
+                                _tg((f"📅 *Earnings Close — {symbol}*\n"
                                                                 f"{_days_earn} days to report, gain {pnl_pct*100:+.1f}%\n"
-                                                                f"Exiting before earnings risk")},
-                                                 timeout=8)
-                                except Exception:
-                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                                f"Exiting before earnings risk"))
             except Exception as _e:
                 _log.debug("[monitor] earnings check %s: %s", symbol, _e)
 
@@ -1403,24 +1322,13 @@ def check_positions() -> None:
                                 if _iv_rem > 0 and _place_market_sell(symbol, _iv_rem):
                                     sym["iv_crush_exited"] = True
                                     changed = True
-                                    try:
-                                        import requests as _rqiv, os as _osiv
-                                        _tiv = _osiv.getenv("TELEGRAM_BOT_TOKEN", "")
-                                        _civ = _osiv.getenv("TELEGRAM_CHAT_ID", "")
-                                        if _tiv and _civ:
-                                            _rqiv.post(
-                                                f"https://api.telegram.org/bot{_tiv}/sendMessage",
-                                                json={"chat_id": _civ, "parse_mode": "Markdown",
-                                                      "text": (
+                                    _tg((
                                                           f"\U0001f9e8 *IV Crush Exit — {symbol}*\n"
                                                           f"ATM implied vol {_iv_val*100:.0f}% > 50%\n"
                                                           f"{_dte_iv} days to earnings | "
                                                           f"gain +{pnl_pct*100:.1f}%\n"
                                                           f"Exiting runner before IV collapse"
-                                                      )},
-                                                timeout=8)
-                                    except Exception:
-                                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                      ))
                 except Exception as _ive:
                     _log.debug("[monitor] iv_crush %s: %s", symbol, _ive)
 
@@ -1472,21 +1380,9 @@ def check_positions() -> None:
                             _log.warning("[monitor] %s EX-DIV CLOSE: %dd to ex-date, "
                                          "pnl=%.1f%% — closing pre-dividend",
                                          symbol, _exdiv_days, pnl_pct * 100)
-                    try:
-                        import requests as _rqex, os as _osex
-                        _tokex = _osex.getenv("TELEGRAM_BOT_TOKEN", "")
-                        _cidex = _osex.getenv("TELEGRAM_CHAT_ID", "")
-                        if _tokex and _cidex and sym.get("exdiv_guarded"):
-                            _action = "stop → breakeven" if pnl_pct >= 0.03 else "position closed"
-                            _rqex.post(
-                                f"https://api.telegram.org/bot{_tokex}/sendMessage",
-                                json={"chat_id": _cidex, "parse_mode": "Markdown",
-                                      "text": (f"📅 *Ex-Div Guard — {symbol}*\n"
+                    _tg((f"📅 *Ex-Div Guard — {symbol}*\n"
                                                f"{_exdiv_days} day(s) to ex-dividend\n"
-                                               f"Action: {_action} (P&L {pnl_pct*100:+.1f}%)")},
-                                timeout=8)
-                    except Exception:
-                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                               f"Action: {_action} (P&L {pnl_pct*100:+.1f}%)"))
             except Exception as _exe:
                 _log.debug("[monitor] exdiv_guard %s: %s", symbol, _exe)
 
@@ -1552,19 +1448,9 @@ def check_positions() -> None:
                 except Exception:
                     _log.debug("[%s] suppressed", __name__, exc_info=True)
                 changed = True
-                try:
-                    import requests as _rz, os as _oz
-                    _tok = _oz.getenv("TELEGRAM_BOT_TOKEN", "")
-                    _cid = _oz.getenv("TELEGRAM_CHAT_ID", "")
-                    if _tok and _cid:
-                        _rz.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
-                                 json={"chat_id": _cid, "parse_mode": "Markdown",
-                                       "text": (f"❌ *Failed Breakout — {symbol}*\n"
+                _tg((f"❌ *Failed Breakout — {symbol}*\n"
                                                 f"Price ${cur_price:.2f} fell back under pivot ${_buy_stp_z:.2f}\n"
-                                                f"Day {_days_held} — cutting loss")},
-                                 timeout=8)
-                except Exception:
-                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                f"Day {_days_held} — cutting loss"))
         # ── Weak vol override: tighten stop to -3% if weak breakout and price drops ───
         if (sym.get("weak_vol_breakout")
                 and not sym.get("weak_vol_stop_set")
@@ -1676,21 +1562,10 @@ def check_positions() -> None:
             sym["fast_mover"] = True
             _log.info("[monitor] %s FAST MOVER: +%.1f%% in %d days — 8-week hold rule activated",
                       symbol, pnl_pct * 100, _td_fm)
-            try:
-                import requests as _rqfm, os as _osfm
-                _tfm = _osfm.getenv("TELEGRAM_BOT_TOKEN", "")
-                _cfm = _osfm.getenv("TELEGRAM_CHAT_ID", "")
-                if _tfm and _cfm:
-                    _rqfm.post(
-                        f"https://api.telegram.org/bot{_tfm}/sendMessage",
-                        json={"chat_id": _cfm, "parse_mode": "Markdown",
-                              "text": (f"🚀 *Fast Mover — {symbol}*\n"
+            _tg((f"🚀 *Fast Mover — {symbol}*\n"
                                        f"+{pnl_pct*100:.1f}% in {_td_fm} trading days\n"
                                        f"O'Neil 8-week hold rule activated — "
-                                       f"holding full position to week 8")},
-                        timeout=8)
-            except Exception:
-                _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                       f"holding full position to week 8"))
         # ── Step B1: First partial at +10% — sell 33%, keep current stop ─────────
         initial_qty = sym.get("initial_qty", qty)
         # Superperformance skip: composite ≥8 setups (elite VCPs) need more room before first partial
@@ -1803,20 +1678,9 @@ def check_positions() -> None:
                         changed = True
                         _log.info("[monitor] ✓ %s PYRAMID: added %d sh @ $%.2f (+%.1f%%, day %d)",
                                   symbol, _pyr_qty, cur_price, pnl_pct * 100, _pyr_days)
-                        try:
-                            import requests as _rqp, os as _osp
-                            _tokp = _osp.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cidp = _osp.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tokp and _cidp:
-                                _rqp.post(
-                                    f"https://api.telegram.org/bot{_tokp}/sendMessage",
-                                    json={"chat_id": _cidp, "parse_mode": "Markdown",
-                                          "text": (f"📈 *Pyramid* — {symbol}\n"
+                        _tg((f"📈 *Pyramid* — {symbol}\n"
                                                    f"Added {_pyr_qty} shares @ ${cur_price:.2f} "
-                                                   f"(+{pnl_pct*100:.1f}%, day {_pyr_days})")},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                   f"(+{pnl_pct*100:.1f}%, day {_pyr_days})"))
         # ── Step C: Move stop to breakeven at +8% (if no partial yet) ───────────
         if pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
             breakeven = round(avg_cost, 2)
@@ -1867,21 +1731,10 @@ def check_positions() -> None:
                         _log.info("[monitor] ✓ %s STEP-F early pyramid: +%d sh @ $%.2f "
                                   "(+%.1f%%, RS at 90d high)",
                                   symbol, _f_qty, cur_price, pnl_pct * 100)
-                        try:
-                            import requests as _rqf, os as _osf
-                            _tokf = _osf.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cidf = _osf.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tokf and _cidf:
-                                _rqf.post(
-                                    f"https://api.telegram.org/bot{_tokf}/sendMessage",
-                                    json={"chat_id": _cidf, "parse_mode": "Markdown",
-                                          "text": (f"📈 *Step F — Early Pyramid — {symbol}*\n"
+                        _tg((f"📈 *Step F — Early Pyramid — {symbol}*\n"
                                                    f"Added {_f_qty} sh @ ${cur_price:.2f} "
                                                    f"(+{pnl_pct*100:.1f}%)\n"
-                                                   f"RS line at 90-day high — leading strength")},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                   f"RS line at 90-day high — leading strength"))
 
         # ── Step F2: Follow-on add at MA10w pullback with volume dry-up ───────────
         # When an active profitable position pulls back to the 10-week MA with
@@ -1919,21 +1772,10 @@ def check_positions() -> None:
                         _log.info("[monitor] ✓ %s STEP-F2 follow-on: +%d sh @ $%.2f "
                                   "(+%.1f%%, MA10w pull + vol dry)",
                                   symbol, _f2_qty, cur_price, pnl_pct * 100)
-                        try:
-                            import requests as _rqf2, os as _osf2
-                            _tokf2 = _osf2.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cidf2 = _osf2.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tokf2 and _cidf2:
-                                _rqf2.post(
-                                    f"https://api.telegram.org/bot{_tokf2}/sendMessage",
-                                    json={"chat_id": _cidf2, "parse_mode": "Markdown",
-                                          "text": (f"📈 *Step F2 — Follow-on — {symbol}*\n"
+                        _tg((f"📈 *Step F2 — Follow-on — {symbol}*\n"
                                                    f"Added {_f2_qty} sh @ ${cur_price:.2f} "
                                                    f"(+{pnl_pct*100:.1f}%)\n"
-                                                   f"MA10w pull with vol dry-up — re-entry")},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                   f"MA10w pull with vol dry-up — re-entry"))
 
         # ── Step E: 21-EMA pullback scale-in (+15% shares) ───────────────────────
         # Minervini: add to winners on tight pullbacks to the 21-EMA with low volume.
@@ -1972,23 +1814,12 @@ def check_positions() -> None:
                         _log.info("[monitor] ✓ %s STEP-E 21-EMA scale-in: +%d sh @ $%.2f "
                                   "(+%.1f%%, EMA21 pull + vol dry)",
                                   symbol, _e_qty, cur_price, pnl_pct * 100)
-                        try:
-                            import requests as _rqe, os as _ose
-                            _toke = _ose.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cide = _ose.getenv("TELEGRAM_CHAT_ID", "")
-                            if _toke and _cide:
-                                _rqe.post(
-                                    f"https://api.telegram.org/bot{_toke}/sendMessage",
-                                    json={"chat_id": _cide, "parse_mode": "Markdown",
-                                          "text": (
+                        _tg((
                                               f"📊 *Step E — 21-EMA Scale-in — {symbol}*\n"
                                               f"Added {_e_qty} sh @ ${cur_price:.2f}"
                                               f" (+{pnl_pct*100:.1f}%)\n"
                                               f"21-EMA pull with vol dry-up"
-                                          )},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                          ))
 
         # ── Step C2: Sector ETF < MA50 — force breakeven on sector weakness ─────
         # If the broader sector is losing leadership, tighten before the position turns.
@@ -2092,22 +1923,11 @@ def check_positions() -> None:
                         changed = True
                         _log.info("[monitor] %s RUNNER UPGRADE: trail→10%% at 2×mm (pnl=+%.1f%%)",
                                   symbol, pnl_pct * 100)
-                        try:
-                            import requests as _rqg2, os as _osg2
-                            _tg2 = _osg2.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cg2 = _osg2.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tg2 and _cg2:
-                                _rqg2.post(
-                                    f"https://api.telegram.org/bot{_tg2}/sendMessage",
-                                    json={"chat_id": _cg2, "parse_mode": "Markdown",
-                                          "text": (
+                        _tg((
                                               f"\U0001f680 *Runner Upgrade G2 — {symbol}*\n"
                                               f"Sold {_g2_partial if _g2_sold else 0} sh (25%%)\n"
                                               f"Trail widened → 10%% | P&L +{pnl_pct*100:.1f}%%"
-                                          )},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                          ))
 
         # ── Step V: Volume climax exit — monster-volume day after ≥20% gain ────────
         # Blow-off top signal: churning on extreme volume = likely institutional exit.
@@ -2137,21 +1957,10 @@ def check_positions() -> None:
                                     sym["partial_done"]  = True
                                 sym["partial_qty"] = sym.get("partial_qty", 0) + _vc_qty
                                 changed = True
-                                try:
-                                    import requests as _rqv, os as _osv
-                                    _tv = _osv.getenv("TELEGRAM_BOT_TOKEN", "")
-                                    _cv = _osv.getenv("TELEGRAM_CHAT_ID", "")
-                                    if _tv and _cv:
-                                        _rqv.post(
-                                            f"https://api.telegram.org/bot{_tv}/sendMessage",
-                                            json={"chat_id": _cv, "parse_mode": "Markdown",
-                                                  "text": (f"🔥 *Volume Climax — {symbol}*\n"
+                                _tg((f"🔥 *Volume Climax — {symbol}*\n"
                                                            f"{_vol_cur/_vol_avg:.1f}× avg vol, "
                                                            f"pnl=+{pnl_pct*100:.1f}%\n"
-                                                           f"Sold 50% — Minervini blow-off top")},
-                                            timeout=8)
-                                except Exception:
-                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                           f"Sold 50% — Minervini blow-off top"))
                 except Exception as _vce:
                     _log.debug("[monitor] volume climax %s: %s", symbol, _vce)
 
@@ -2210,23 +2019,12 @@ def check_positions() -> None:
                                     sym["partial_done"]  = True
                                 sym["partial_qty"] = sym.get("partial_qty", 0) + _par_qty
                                 changed = True
-                                try:
-                                    import requests as _rqpar, os as _ospar
-                                    _tpar = _ospar.getenv("TELEGRAM_BOT_TOKEN", "")
-                                    _cpar = _ospar.getenv("TELEGRAM_CHAT_ID", "")
-                                    if _tpar and _cpar:
-                                        _rqpar.post(
-                                            f"https://api.telegram.org/bot{_tpar}/sendMessage",
-                                            json={"chat_id": _cpar, "parse_mode": "Markdown",
-                                                  "text": (
+                                _tg((
                                                       f"🚀 *Parabolic Protection — {symbol}*\n"
                                                       f"Day gain +{_day_gain*100:.1f}%,"
                                                       f" total +{pnl_pct*100:.1f}%\n"
                                                       f"Sold 25% ({_par_qty} sh) — locking gains"
-                                                  )},
-                                            timeout=8)
-                                except Exception:
-                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                  ))
                 except Exception as _pare:
                     _log.debug("[monitor] parabolic %s: %s", symbol, _pare)
 
@@ -2265,23 +2063,12 @@ def check_positions() -> None:
                                     "[monitor] %s PEAD: EPS $%.2f vs est $%.2f (+%.0f%%) "
                                     "— 60-day time-stop hold activated",
                                     symbol, _rep, _est, (_rep - _est) / _est * 100)
-                                try:
-                                    import requests as _rqpd, os as _ospd
-                                    _tpd = _ospd.getenv("TELEGRAM_BOT_TOKEN", "")
-                                    _cpd = _ospd.getenv("TELEGRAM_CHAT_ID", "")
-                                    if _tpd and _cpd:
-                                        _rqpd.post(
-                                            f"https://api.telegram.org/bot{_tpd}/sendMessage",
-                                            json={"chat_id": _cpd, "parse_mode": "Markdown",
-                                                  "text": (
+                                _tg((
                                                       f"\U0001f4c8 *PEAD Hold — {symbol}*\n"
                                                       f"EPS ${_rep:.2f} beat est ${_est:.2f}"
                                                       f" (+{(_rep-_est)/_est*100:.0f}%)\n"
                                                       f"60-day time-stop suspended"
-                                                  )},
-                                            timeout=8)
-                                except Exception:
-                                    _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                  ))
                 except Exception as _pde:
                     _log.debug("[monitor] pead_check %s: %s", symbol, _pde)
 
@@ -2326,24 +2113,13 @@ def check_positions() -> None:
                                         sym["stop_order_id"]  = _rsd_oid
                                         sym["stop_loss"]      = avg_cost
                                         changed = True
-                            try:
-                                import requests as _rqrsd, os as _osrsd
-                                _tr = _osrsd.getenv("TELEGRAM_BOT_TOKEN", "")
-                                _cr = _osrsd.getenv("TELEGRAM_CHAT_ID", "")
-                                if _tr and _cr:
-                                    _rqrsd.post(
-                                        f"https://api.telegram.org/bot{_tr}/sendMessage",
-                                        json={"chat_id": _cr, "parse_mode": "Markdown",
-                                              "text": (
+                            _tg((
                                                   f"⚠️ *RS Divergence — {symbol}*\n"
                                                   f"Price new 20d high ${_price_now:.2f} "
                                                   f"but RS line {(1-_rs_now_v/_rs_20h)*100:.1f}%% "
                                                   f"below its peak\n"
                                                   f"Distribution signal — stop moved to breakeven"
-                                              )},
-                                        timeout=8)
-                            except Exception:
-                                _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                              ))
             except Exception as _rsd_e:
                 _log.debug("[monitor] rs_divergence %s: %s", symbol, _rsd_e)
 
@@ -2374,64 +2150,22 @@ def check_positions() -> None:
                         if _rem_w > 0 and _place_market_sell(symbol, _rem_w):
                             sym["weekly_close_exited"] = True
                             changed = True
-                            try:
-                                import requests as _rqw, os as _osw
-                                _tokw = _osw.getenv("TELEGRAM_BOT_TOKEN", "")
-                                _cidw = _osw.getenv("TELEGRAM_CHAT_ID", "")
-                                if _tokw and _cidw:
-                                    _rqw.post(
-                                        f"https://api.telegram.org/bot{_tokw}/sendMessage",
-                                        json={"chat_id": _cidw, "parse_mode": "Markdown",
-                                              "text": (f"📉 *Step W — Weekly Close Exit — {symbol}*\n"
+                            _tg((f"📉 *Step W — Weekly Close Exit — {symbol}*\n"
                                                        f"Last weekly close ${_last_wk_close:.2f} "
                                                        f"< MA10w ${_ma10w_w:.2f}\n"
-                                                       f"Trend breakdown confirmed — position closed")},
-                                        timeout=8)
-                            except Exception:
-                                _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                       f"Trend breakdown confirmed — position closed"))
             except Exception as _we:
                 _log.debug("[monitor] step_w %s: %s", symbol, _we)
 
-        # ── Step D: Time stop — exit stagnant positions (Minervini 3-4 week rule) ──
-        time_stop_gain = cfg.get("time_stop_min_gain_pct", 0.02)
-        # P3.7: in soft-DD mode shorten patience and require higher gain to stay
-        if _soft_dd_mode:
-            time_stop_days = max(int(time_stop_days * 0.7), 10)
-            time_stop_gain = max(time_stop_gain, 0.04)
-        entry_date_str = sym.get("entry_date", "")
+        # ── Step D: Time stop — P5.2 extracted to _step_d_time_stop() ──────
         _pead_active = (
             sym.get("pead_hold")
             and _trading_days_held(sym.get("pead_date", "")) < 60
         )
-
-        if (entry_date_str
-                and not sym.get("partial_done")
-                and not sym.get("time_stopped")
-                and not sym.get("max_loss_exited")
-                and not _pead_active):
-            _td_d = _days_held
-            if _td_d >= time_stop_days and pnl_pct < time_stop_gain:
-                _rem_d = qty - sym.get("partial_qty", 0)
-                _log.warning("[monitor] %s TIME STOP: day %d pnl=%.1f%% (< %.0f%%) — closing",
-                             symbol, _td_d, pnl_pct * 100, time_stop_gain * 100)
-                _cancel_stop_orders(symbol)
-                if _rem_d > 0 and _place_market_sell(symbol, _rem_d):
-                    sym["time_stopped"] = True
-                    changed = True
-                    try:
-                        import requests as _rqd, os as _osd
-                        _tokd = _osd.getenv("TELEGRAM_BOT_TOKEN", "")
-                        _cidd = _osd.getenv("TELEGRAM_CHAT_ID", "")
-                        if _tokd and _cidd:
-                            _rqd.post(
-                                f"https://api.telegram.org/bot{_tokd}/sendMessage",
-                                json={"chat_id": _cidd, "parse_mode": "Markdown",
-                                      "text": (f"⏳ *Time Stop — {symbol}*\n"
-                                               f"Held {_td_d} days | P&L {pnl_pct*100:+.1f}%\n"
-                                               f"No momentum — Minervini time rule")},
-                                timeout=8)
-                    except Exception:
-                        _log.debug("[%s] suppressed", __name__, exc_info=True)
+        if _step_d_time_stop(sym, symbol, qty, pnl_pct,
+                             time_stop_days, _days_held, _pead_active,
+                             _soft_dd_mode, cfg):
+            changed = True
 
         # ── Hard absolute max holding period: 60 trading days ──────────────────────
         # Prevents positions from becoming indefinite anchors. Winners get a tight
@@ -2452,20 +2186,9 @@ def check_positions() -> None:
                         changed = True
                         _log.warning("[monitor] MAX HOLD %s day %d pnl=+%.1f%% — tightened to 3%% trailing",
                                      symbol, _abs_days, pnl_pct * 100)
-                        try:
-                            import requests as _rqmh, os as _osmh
-                            _tok_mh = _osmh.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cid_mh = _osmh.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tok_mh and _cid_mh:
-                                _rqmh.post(
-                                    f"https://api.telegram.org/bot{_tok_mh}/sendMessage",
-                                    json={"chat_id": _cid_mh, "parse_mode": "Markdown",
-                                          "text": ("Max Hold " + symbol + "\n"
+                        _tg(("Max Hold " + symbol + "\n"
                                                    + f"Day {_abs_days} - tightened to 3% trailing\n"
-                                                   + f"P&L {pnl_pct*100:+.1f}% - locking gains")},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                   + f"P&L {pnl_pct*100:+.1f}% - locking gains"))
                 elif _rem_hm > 0:
                     _cancel_stop_orders(symbol)
                     if _place_market_sell(symbol, _rem_hm):
@@ -2473,20 +2196,9 @@ def check_positions() -> None:
                         changed = True
                         _log.warning("[monitor] MAX HOLD EXIT %s day %d pnl=%.1f%% - closed",
                                      symbol, _abs_days, pnl_pct * 100)
-                        try:
-                            import requests as _rqmh2, os as _osmh2
-                            _tok_mh2 = _osmh2.getenv("TELEGRAM_BOT_TOKEN", "")
-                            _cid_mh2 = _osmh2.getenv("TELEGRAM_CHAT_ID", "")
-                            if _tok_mh2 and _cid_mh2:
-                                _rqmh2.post(
-                                    f"https://api.telegram.org/bot{_tok_mh2}/sendMessage",
-                                    json={"chat_id": _cid_mh2, "parse_mode": "Markdown",
-                                          "text": ("Max Hold Exit " + symbol + "\n"
+                        _tg(("Max Hold Exit " + symbol + "\n"
                                                    + f"Day {_abs_days} - closed at {pnl_pct*100:+.1f}%\n"
-                                                   + "60-day absolute cap reached")},
-                                    timeout=8)
-                        except Exception:
-                            _log.debug("[%s] suppressed", __name__, exc_info=True)
+                                                   + "60-day absolute cap reached"))
     # -- Stale position review (>30 trading days, no major exit milestone) --------
     for _sym_st, _sym_std in state.items():
         if _sym_st not in {p["symbol"] for p in positions}:

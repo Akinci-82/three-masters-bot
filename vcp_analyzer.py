@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
+from typing import TypedDict
 from datetime import date, datetime
 from pathlib import Path
 
@@ -47,7 +48,11 @@ _VCP_CACHE  = LOG_DIR / "vcp_cache.json"
 _VCP_CACHE_LOCK = threading.Lock()
 _TOKEN_BUFFER: list = []          # P2-fix: buffer token log entries, flush in batches
 _TOKEN_BUFFER_LOCK = threading.Lock()
-_spy_weekly_cache: dict = {}  # {"df": pd.DataFrame, "ts": float}
+class _SpyWeeklyCache(TypedDict, total=False):
+    df: "pd.DataFrame"
+    ts: float
+
+_spy_weekly_cache: _SpyWeeklyCache = {}
 _SPY_WEEKLY_CACHE_LOCK = threading.Lock()
 
 
