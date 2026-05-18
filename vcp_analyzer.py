@@ -18,6 +18,7 @@ VCP characteristics (Minervini):
 """
 from __future__ import annotations
 import json
+import re
 import logging
 import os
 import threading
@@ -444,13 +445,18 @@ def _call_haiku(symbol: str, prompt: str) -> dict:
         resp = _get_client().messages.create(
             model=_HAIKU_MODEL,
             max_tokens=150,
-            system="Respond with raw JSON only, no markdown fences.",
+            system=[{"type": "text", "text": "Respond with raw JSON only, no markdown fences.",
+                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
         _log_tokens(symbol, "tier1_haiku", _HAIKU_MODEL,
                     resp.usage.input_tokens, resp.usage.output_tokens)
-        if raw.startswith("```"):
+        # P4.2: robust fence extraction via regex
+        _m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+        if _m:
+            raw = _m.group(1).strip()
+        elif raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
     except anthropic.APIError as e:
@@ -574,7 +580,7 @@ def _get_weekly_context(symbol: str, df: pd.DataFrame) -> str:
         return ""
 
 
-def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle: str, fundamentals: dict | None = None) -> str:
+def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle: str, fundamentals: dict | None = None, headlines: str | None = None) -> str:
     """
     100-day OHLCV prompt with explicit step-by-step Minervini VCP analysis.
     Forces Claude to identify each contraction, measure precisely, and pinpoint
@@ -624,7 +630,8 @@ def _build_sonnet_prompt(symbol: str, df: pd.DataFrame, quant: dict, last_candle
     elif last_candle == "bearish":
         candle_ctx = "\n- ENTRY CANDLE: Bearish close — caution"
 
-    news_headlines = _get_recent_news(symbol, n=4)
+    # P4.4: reuse headlines cached upstream to avoid double yfinance/web fetch
+    news_headlines = headlines if headlines is not None else _get_recent_news(symbol, n=4)
     news_ctx = f"\n\n## Recent News (catalyst check)\n{news_headlines}"
     weekly_ctx = _get_weekly_context(symbol, df)
 
@@ -714,13 +721,18 @@ def _call_sonnet(symbol: str, prompt: str) -> dict:
         resp = _get_client().messages.create(
             model=_SONNET_MODEL,
             max_tokens=1000,
-            system="Respond with raw JSON only. No prose before or after the JSON object.",
+            system=[{"type": "text", "text": "Respond with raw JSON only. No prose before or after the JSON object.",
+                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
         _log_tokens(symbol, "tier2_sonnet", _SONNET_MODEL,
                     resp.usage.input_tokens, resp.usage.output_tokens)
-        if raw.startswith("```"):
+        # P4.2: robust fence extraction via regex
+        _m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+        if _m:
+            raw = _m.group(1).strip()
+        elif raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
     except anthropic.APIError as e:
@@ -812,13 +824,18 @@ def _call_opus(symbol: str, prompt: str) -> dict:
         resp = _get_client().messages.create(
             model=_OPUS_MODEL,
             max_tokens=700,
-            system="Respond with raw JSON only. No prose before or after the JSON object.",
+            system=[{"type": "text", "text": "Respond with raw JSON only. No prose before or after the JSON object.",
+                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
         _log_tokens(symbol, "tier3_opus", _OPUS_MODEL,
                     resp.usage.input_tokens, resp.usage.output_tokens)
-        if raw.startswith("```"):
+        # P4.2: robust fence extraction via regex
+        _m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+        if _m:
+            raw = _m.group(1).strip()
+        elif raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
     except anthropic.APIError as e:
@@ -893,7 +910,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     _news_positive     = False
     _news_negative     = False
     try:
-        _headlines = _get_recent_news(symbol, 3)
+        _headlines = _get_recent_news(symbol, 4)  # P4.4: fetch n=4, reuse in Sonnet prompt
         if _headlines and "unavailable" not in _headlines.lower() and "No recent" not in _headlines:
             _ns_prompt = (
                 f"Company ticker: {symbol}\nRecent news headlines:\n{_headlines}\n\n"
@@ -903,11 +920,19 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             )
             _ns_resp = _get_client().messages.create(
                 model=_HAIKU_MODEL, max_tokens=60,
-                system="Respond with raw JSON only, no markdown fences.",
+                system=[{"type": "text", "text": "Respond with raw JSON only, no markdown fences.",
+                          "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": _ns_prompt}],
             )
+            # P4.3: log tokens for news-sentiment call (was bypassing _log_tokens)
+            _log_tokens(symbol, "tier0_news", _HAIKU_MODEL,
+                        _ns_resp.usage.input_tokens, _ns_resp.usage.output_tokens)
             _ns_raw = _ns_resp.content[0].text.strip()
-            if _ns_raw.startswith("```"):
+            # P4.2: robust fence extraction
+            _ns_m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', _ns_raw, re.DOTALL)
+            if _ns_m:
+                _ns_raw = _ns_m.group(1).strip()
+            elif _ns_raw.startswith("```"):
                 _ns_raw = _ns_raw.split("```")[1].lstrip("json").strip()
             try:
                 _ns = json.loads(_ns_raw)
@@ -958,7 +983,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
 
     # ── Tier 2: Sonnet deep analysis ─────────────────────────────────────────
     _log.info("[vcp] %s → Sonnet tier-2 (Haiku score=%d/10)", symbol, h_score)
-    s_prompt = _build_sonnet_prompt(symbol, df, quant, last_candle, fundamentals)
+    s_prompt = _build_sonnet_prompt(symbol, df, quant, last_candle, fundamentals, headlines=_headlines)
     s_data   = _call_sonnet(symbol, s_prompt)
 
     if s_data.get("_api_error"):
