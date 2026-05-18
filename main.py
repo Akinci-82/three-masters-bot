@@ -540,6 +540,22 @@ def _send_morning_briefing() -> None:
                             )
                             _log.warning("[briefing] EMERGENCY EXIT %s: gap %.1f%% — market sell submitted",
                                          _cg_sym, _cg_gap * 100)
+                            # P0-fix: flag in monitor_state so position_monitor skips
+                            # this position until the market sell fills at open
+                            try:
+                                import json as _json_eg
+                                _ms_path = os.path.join(os.path.dirname(__file__), "logs", "monitor_state.json")
+                                if os.path.exists(_ms_path):
+                                    with open(_ms_path) as _f:
+                                        _ms = _json_eg.load(_f)
+                                    if _cg_sym in _ms:
+                                        _ms[_cg_sym]["emergency_exit_submitted"] = True
+                                        _tmp_ms = _ms_path + ".tmp"
+                                        with open(_tmp_ms, "w") as _f:
+                                            _json_eg.dump(_ms, _f, indent=2, default=str)
+                                        os.replace(_tmp_ms, _ms_path)
+                            except Exception as _mse:
+                                _log.debug("[briefing] state flag after emergency exit failed: %s", _mse)
                     except Exception as _cge:
                         _log.warning("[briefing] emergency exit %s failed: %s", _cg_sym, _cge)
             except Exception:
@@ -1173,7 +1189,8 @@ def _run_sunday_opus_analysis() -> None:
             stop   = st.get("stop_loss", 0)
             risk_p = (avg - stop) / avg * 100 if avg and stop else 0
             days   = st.get("days_held", 0)
-            pnl    = st.get("unrealized_pnl_pct", 0) * 100 if st.get("unrealized_pnl_pct") else 0
+            _lp, _ac = float(st.get("last_price") or 0), float(st.get("avg_cost") or 0)
+            pnl    = (_lp - _ac) / _ac * 100 if _lp and _ac else 0  # P0-fix: field never stored
             steps  = [s.replace("_done", "").replace("step_", "") for s in
                       ["step_f_done", "b1_done", "step_p_done", "b2_done", "step_f2_done"]
                       if st.get(s)]

@@ -28,6 +28,7 @@ _MARKET_CLOSE = dt_time(16, 0)
 _STATE_FILE = os.path.join(os.path.dirname(__file__), "logs", "monitor_state.json")
 
 _sync_fail_count = 0  # consecutive sync failures — Telegram alert fires at 2+
+_JOURNAL_LOCK = threading.Lock()  # serialises concurrent postmortem journal writes
 
 
 def _alpaca_headers() -> dict:
@@ -278,7 +279,10 @@ def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> str | None:
 
 
 def _stop_order_alive(order_id: str) -> bool:
-    """Return True if the Alpaca order exists and is still open/pending."""
+    """Return True if the Alpaca order exists and is still open/pending.
+    Returns True on transient network/API errors to avoid GTC order churn.
+    Only returns False for definitive 404 (order genuinely missing).
+    """
     if not order_id:
         return False
     try:
@@ -288,10 +292,19 @@ def _stop_order_alive(order_id: str) -> bool:
         )
         if r.status_code == 404:
             return False
+        if not r.ok:
+            # P0-fix: transient API error — assume alive to avoid cancelling valid GTC order
+            _log.debug("[monitor] _stop_order_alive(%s): HTTP %d — assuming alive", order_id, r.status_code)
+            return True
         data = r.json()
         return data.get("status") in ("new", "accepted", "pending_new", "held")
+    except requests.exceptions.RequestException:
+        # P0-fix: network error — assume order still live, retry next cycle
+        _log.debug("[monitor] _stop_order_alive(%s): network error — assuming alive", order_id)
+        return True
     except Exception:
-        return False
+        _log.debug("[monitor] _stop_order_alive(%s): unexpected error — assuming alive", order_id)
+        return True
 
 
 # ── Core monitoring logic ─────────────────────────────────────────────────────
@@ -429,22 +442,23 @@ def _run_postmortem(symbol: str, sym_data: dict, pnl_pct: float) -> None:
 
         _jpath = os.path.join(os.path.dirname(__file__), "logs", "trade_journal.jsonl")
         if os.path.exists(_jpath):
-            with open(_jpath, "r") as _jf:
-                _lines = _jf.readlines()
-            for _i in range(len(_lines) - 1, -1, -1):
-                try:
-                    _entry = json.loads(_lines[_i])
-                    if _entry.get("symbol") == symbol:
-                        _entry["ai_postmortem"] = postmortem
-                        _lines[_i] = json.dumps(_entry) + "\n"
-                        break
-                except Exception:
-                    continue
-            _tmp = _jpath + ".tmp"
-            with open(_tmp, "w") as _jf:
-                _jf.writelines(_lines)
-            os.replace(_tmp, _jpath)
-            _log.info("[monitor] Post-mortem %s: %s", symbol, postmortem[:80])
+            with _JOURNAL_LOCK:  # P0-fix: serialise concurrent postmortem writes
+                with open(_jpath, "r") as _jf:
+                    _lines = _jf.readlines()
+                for _i in range(len(_lines) - 1, -1, -1):
+                    try:
+                        _entry = json.loads(_lines[_i])
+                        if _entry.get("symbol") == symbol:
+                            _entry["ai_postmortem"] = postmortem
+                            _lines[_i] = json.dumps(_entry) + "\n"
+                            break
+                    except Exception:
+                        continue
+                _tmp = _jpath + ".tmp"
+                with open(_tmp, "w") as _jf:
+                    _jf.writelines(_lines)
+                os.replace(_tmp, _jpath)
+                _log.info("[monitor] Post-mortem %s: %s", symbol, postmortem[:80])
     except Exception as _e:
         _log.debug("[monitor] postmortem failed %s: %s", symbol, _e)
 
@@ -784,6 +798,11 @@ def check_positions() -> None:
         cur_price = float(pos["current_price"])
 
         if avg_cost <= 0 or qty <= 0:
+            continue
+
+        # P0-fix: skip position while an emergency market sell is pending at open
+        if state.get(symbol, {}).get("emergency_exit_submitted"):
+            _log.info("[monitor] %s emergency exit pending — skipping cycle to avoid double-sell", symbol)
             continue
 
         pnl_pct = (cur_price - avg_cost) / avg_cost
@@ -1162,6 +1181,18 @@ def check_positions() -> None:
                             "[monitor] %s Keltner stop ratchet: $%.2f → $%.2f "
                             "(EMA20=%.2f ATR14=%.2f)",
                             symbol, _old_ksl, _keltner_low, _ema20, _katr14)
+                        # P0-fix: also update the live Alpaca GTC stop order
+                        _kelt_qty = int(sym.get("shares", sym.get("qty", 0)))
+                        if _kelt_qty > 0:
+                            _cancel_stop_orders(symbol)
+                            _new_kelt_oid = _place_stop(symbol, _kelt_qty, _keltner_low)
+                            if _new_kelt_oid:
+                                sym["stop_order_id"] = _new_kelt_oid
+                                _log.info("[monitor] %s Keltner GTC stop updated $%.2f id=%s",
+                                          symbol, _keltner_low, _new_kelt_oid)
+                            else:
+                                _log.warning("[monitor] %s Keltner state updated but Alpaca stop NOT placed — retries next cycle",
+                                             symbol)
                         try:
                             import requests as _rqkc, os as _oskc
                             _tkc = _oskc.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -1222,7 +1253,6 @@ def check_positions() -> None:
                         _log.debug("[%s] suppressed", __name__, exc_info=True)
         # Quality-adjusted exits: elite setups get more room to run
         composite      = sym.get("composite_score", 0.0)
-        partial_trigger = 0.20 if composite >= 8.0 else cfg.get("partial_exit_trigger", 0.15)
         _regime_ts      = _get_cached_regime()
         _base_ts        = 25 if _regime_ts == "bull" else (15 if _regime_ts == "neutral" else 10)
         time_stop_days  = max(_base_ts, 20) if composite >= 8.0 else _base_ts
@@ -1756,7 +1786,7 @@ def check_positions() -> None:
                         except Exception:
                             _log.debug("[%s] suppressed", __name__, exc_info=True)
         # ── Step C: Move stop to breakeven at +8% (if no partial yet) ───────────
-        elif pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
+        if pnl_pct >= breakeven_trigger and not sym.get("breakeven_done"):
             breakeven = round(avg_cost, 2)
             remaining = qty - sym.get("partial_qty", 0)
             if remaining > 0:
@@ -1887,11 +1917,11 @@ def check_positions() -> None:
                 _e_triggered = False
                 try:
                     _dfe = _get_hist(symbol)
-                    if len(_dfe) >= 22:
+                    if len(_dfe) >= 43:
                         _ce = _dfe["Close"].values
                         _alpha_e = 2.0 / (21 + 1)
-                        _ema21 = float(_ce[-21])
-                        for _v_e in _ce[-20:]:
+                        _ema21 = float(sum(_ce[-42:-21]) / 21)
+                        for _v_e in _ce[-21:]:
                             _ema21 = _alpha_e * float(_v_e) + (1 - _alpha_e) * _ema21
                         _near_ema21 = abs(cur_price - _ema21) / _ema21 <= 0.02
                         _vol5_e  = float(_dfe["Volume"].tail(5).mean())
@@ -2094,7 +2124,9 @@ def check_positions() -> None:
         # If today's intraday gain >8% AND total pnl >15%, the stock is in a parabolic
         # extension. Sell 25% to lock gains before the vertical drop.
         if (not sym.get("parabolic_done")
-                and pnl_pct > 0.15):
+                and pnl_pct > 0.15
+                and not sym.get("_b1_fill_pending")
+                and not sym.get("_b2_fill_pending")):
             _par_today = datetime.now(_ET).strftime("%Y-%m-%d")
             if sym.get("_par_check_date") != _par_today:
                 sym["_par_check_date"] = _par_today
@@ -2160,7 +2192,10 @@ def check_positions() -> None:
                             sym["pead_checked"] = True
                             if _est > 0 and _rep >= _est * 1.05:
                                 sym["pead_hold"]  = True
-                                sym["pead_date"]  = datetime.now(_ET).strftime("%Y-%m-%d")
+                                _pead_dt = _pd.to_datetime(_le.iloc[0], utc=True, errors="coerce")
+                                sym["pead_date"]  = (_pead_dt.astimezone(_ET).strftime("%Y-%m-%d")
+                                                     if _pd.notna(_pead_dt)
+                                                     else datetime.now(_ET).strftime("%Y-%m-%d"))
                                 _log.info(
                                     "[monitor] %s PEAD: EPS $%.2f vs est $%.2f (+%.0f%%) "
                                     "— 60-day time-stop hold activated",
