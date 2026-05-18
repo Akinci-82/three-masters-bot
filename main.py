@@ -1494,8 +1494,15 @@ def _is_macro_blackout() -> tuple[bool, str]:
     resolved before the scan — lift the blackout.
     """
     today = date.today()
+    # P1-fix: dates are only defined for 2026 — disable blackout for other years
+    # rather than silently substituting wrong-year dates (FOMC dates shift annually).
+    # ACTION REQUIRED each December: update _FOMC_2026 / _CPI_2026 for the new year.
     if today.year != 2026:
-        _log.warning("[macro] FOMC/CPI dates hardcoded for 2026 — uppdatera _FOMC_2026 och _CPI_2026")
+        _log.warning(
+            "[macro] FOMC/CPI blackout dates only defined for 2026 — "
+            "BLACKOUT DISABLED for %d. Update _FOMC_2026 and _CPI_2026 in main.py!",
+            today.year)
+        return False, ""
     for (m, d) in _FOMC_2026 + _CPI_2026:
         try:
             event = date(today.year, m, d)

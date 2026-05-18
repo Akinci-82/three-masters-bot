@@ -176,9 +176,19 @@ class VCPResult:
 
     @property
     def risk_reward(self) -> float:
+        """Compute actual R:R from measured_move_pct and stop distance.
+        R:R = (measured_move_pct * breakout_level) / (breakout_level - stop_loss).
+        Falls back to 3.0 if data is incomplete.
+        """
         if self.stop_loss <= 0 or self.breakout_level <= 0:
             return 0.0
-        return 3.0
+        risk_per_share = self.breakout_level - self.stop_loss
+        if risk_per_share <= 0:
+            return 0.0
+        if self.measured_move_pct > 0:
+            reward = self.measured_move_pct * self.breakout_level
+            return round(reward / risk_per_share, 2)
+        return 3.0  # default when Claude did not provide measured_move_pct
 
     def summary(self) -> str:
         if not self.passed:
@@ -273,7 +283,7 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
     if n_contractions < cfg.get("min_contractions", 2):
         return False, {"reason": f"only_{n_contractions}_contractions"}
 
-    pattern_high = float(high.max())
+    pattern_high = float(high.quantile(0.97))
     current_low  = float(low.tail(10).min())
     depth = (pattern_high - current_low) / pattern_high
     if depth > cfg.get("max_depth_from_high", 0.35):
@@ -674,6 +684,7 @@ def _call_sonnet(symbol: str, prompt: str) -> dict:
         resp = _get_client().messages.create(
             model=_SONNET_MODEL,
             max_tokens=1000,
+            system="Respond with raw JSON only. No prose before or after the JSON object.",
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
@@ -771,6 +782,7 @@ def _call_opus(symbol: str, prompt: str) -> dict:
         resp = _get_client().messages.create(
             model=_OPUS_MODEL,
             max_tokens=700,
+            system="Respond with raw JSON only. No prose before or after the JSON object.",
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
@@ -861,6 +873,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             )
             _ns_resp = _get_client().messages.create(
                 model=_HAIKU_MODEL, max_tokens=60,
+                system="Respond with raw JSON only, no markdown fences.",
                 messages=[{"role": "user", "content": _ns_prompt}],
             )
             _ns_raw = _ns_resp.content[0].text.strip()
@@ -935,7 +948,18 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     depth       = quant.get("pattern_depth_pct", 0)
     contractions = int(s_data.get("contractions_identified") or quant.get("contractions", 0))
     tight_pct   = float(s_data.get("tight_area_pct") or quant.get("tight_rng_pct", 0))
-    quality     = max(1, min(5, int(s_data.get("quality_score", 0) or 0)))
+    _raw_quality = int(s_data.get("quality_score", 0) or 0)
+    if _raw_quality == 0:
+        return VCPResult(
+            symbol=symbol, passed=False, current_price=price,
+            confidence=confidence, breakout_level=breakout, stop_loss=stop_loss,
+            fail_reason="sonnet_quality_zero",
+            ai_verdict="sonnet_rejected",
+            ai_reasoning=s_data.get("pattern_notes", ""),
+            breakout_volume=breakout_vol, last_candle=last_candle,
+            quality_score=0, tier_used="sonnet",
+        )
+    quality     = max(1, min(5, _raw_quality))
 
     # Validate breakout and stop: must be positive and correctly ordered
     if breakout <= 0 or stop_loss <= 0:
@@ -988,17 +1012,6 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
             quality_score=quality, tier_used="sonnet",
         )
 
-    if quality < min_quality:
-        return VCPResult(
-            symbol=symbol, passed=False, current_price=price,
-            confidence=confidence, breakout_level=breakout, stop_loss=stop_loss,
-            fail_reason=f"low_quality_q={quality}<{min_quality}",
-            ai_verdict="sonnet_low_quality",
-            ai_reasoning=s_data.get("pattern_notes", ""),
-            breakout_volume=breakout_vol, last_candle=last_candle,
-            quality_score=quality, tier_used="sonnet",
-        )
-
     # ── Tier 3: Opus final validation for elite setups ────────────────────────
     # quality >= 4: worth spending ~$0.03 to validate before betting real money
     tier_label = "sonnet"
@@ -1040,6 +1053,18 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
 
     stop_loss = _atr_adjusted_stop(df, breakout, stop_loss)
     vol_multiweek = quant.get("vol_at_multiweek_low", False)
+
+    if quality < min_quality:
+        return VCPResult(
+            symbol=symbol, passed=False, current_price=price,
+            confidence=confidence, breakout_level=breakout, stop_loss=stop_loss,
+            fail_reason=f"low_quality_q={quality}<{min_quality}",
+            ai_verdict="sonnet_low_quality",
+            ai_reasoning=s_data.get("pattern_notes", ""),
+            breakout_volume=breakout_vol, last_candle=last_candle,
+            quality_score=quality, tier_used=tier_label,
+        )
+
     passed = confirmed and confidence >= min_conf and breakout > stop_loss
 
     result = VCPResult(

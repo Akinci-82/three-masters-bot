@@ -464,16 +464,28 @@ def _run_postmortem(symbol: str, sym_data: dict, pnl_pct: float) -> None:
 
 
 def _trading_days_held(entry_date_str: str) -> int:
-    """Return US trading days since entry_date (excludes weekends AND market holidays).
-    Uses pandas BDay which skips non-business days including federal holidays.
+    """Return US trading days since entry_date.
+    Uses NYSE calendar (pandas_market_calendars) — correctly excludes weekends
+    AND US market holidays (MLK Day, Memorial Day, Good Friday, etc.).
+    Falls back to BDay if library unavailable.
     """
     try:
-        from pandas.tseries.offsets import BDay
         import pandas as _pd
-        entry = _pd.Timestamp(entry_date_str)
-        today = _pd.Timestamp(datetime.now(_ET).date())
-        delta = today - entry
-        return max(0, int(delta / BDay(1)))
+        entry = _pd.Timestamp(entry_date_str).date()
+        today = datetime.now(_ET).date()
+        if entry >= today:
+            return 0
+        try:
+            import pandas_market_calendars as _mcal
+            nyse = _mcal.get_calendar("NYSE")
+            schedule = nyse.schedule(start_date=str(entry), end_date=str(today))
+            # subtract 1: entry day itself is day 0
+            return max(0, len(schedule) - 1)
+        except Exception:
+            # Fallback: BDay approximation
+            from pandas.tseries.offsets import BDay
+            delta = _pd.Timestamp(today) - _pd.Timestamp(entry)
+            return max(0, int(delta / BDay(1)))
     except Exception:
         return 0
 
@@ -1042,6 +1054,15 @@ def check_positions() -> None:
         sym["mae_pct"] = min(sym.get("mae_pct", pnl_pct), pnl_pct)
         sym["mfe_pct"] = max(sym.get("mfe_pct", pnl_pct), pnl_pct)
 
+        # P1-fix: reset hwm_tightened when stock rallies to a new MFE peak (+4% above trigger)
+        # so the stop can ratchet again if the stock continues higher after a shakeout
+        if (sym.get("hwm_tightened")
+                and sym.get("hwm_mfe_at_trigger", 0) > 0
+                and sym.get("mfe_pct", 0) > sym["hwm_mfe_at_trigger"] + 0.04):
+            sym["hwm_tightened"] = False
+            _log.info("[monitor] %s HWM reset: MFE %.1f%% exceeded trigger %.1f%% + 4%% — ratchet re-armed",
+                      symbol, sym["mfe_pct"] * 100, sym["hwm_mfe_at_trigger"] * 100)
+
         # ── PM-HWM: High-water-mark stop — tighten when >8% pulled back from MFE peak ──
         # If MFE reached >12% but price has since dropped >8% from that peak (yet pnl >3%),
         # ratchet stop up to avg_cost × 1.05 to lock in at least 5% profit.
@@ -1061,9 +1082,10 @@ def check_positions() -> None:
                     _cancel_stop_orders(symbol)
                     _hwm_oid = _place_stop(symbol, _runner_hwm, _hwm_stop)
                     if _hwm_oid:
-                        sym["hwm_tightened"] = True
-                        sym["stop_loss"]      = _hwm_stop
-                        sym["stop_order_id"]  = _hwm_oid
+                        sym["hwm_tightened"]       = True
+                        sym["hwm_mfe_at_trigger"]  = _hwm_mfe  # P1-fix: track MFE when triggered
+                        sym["stop_loss"]            = _hwm_stop
+                        sym["stop_order_id"]        = _hwm_oid
                         changed = True
                         _log.info(
                             "[monitor] %s HWM-STOP: MFE %.1f%% → now %.1f%% "

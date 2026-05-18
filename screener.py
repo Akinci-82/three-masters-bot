@@ -227,12 +227,14 @@ def _check_weekly_context(symbol: str) -> tuple[bool, str]:
             return False, f"weekly_price_below_MA40w(${ma40w:.0f})"
         if ma10w < ma40w:
             return False, "weekly_MA10w_below_MA40w"
-        # Tight base check: last 4 weeks H-L range < 15% of price
+        # Tight base check: last 4 weeks H-L range (P1-fix: configurable, was hardcoded 15%)
+        # Minervini/O'Neil standard for a loose weekly base: 25-35%
+        _wk_max_range = cfg.get("weekly_base_max_range", 0.25)
         last4w  = df_w.tail(4)
         wk_high = float(last4w["High"].max())
         wk_low  = float(last4w["Low"].min())
         wk_rng  = (wk_high - wk_low) / price_w if price_w > 0 else 1.0
-        if wk_rng > 0.15:
+        if wk_rng > _wk_max_range:
             return False, f"weekly_base_too_wide_{wk_rng:.1%}"
         return True, f"weekly_ok_tight_{wk_rng:.1%}"
     except Exception as e:
@@ -325,16 +327,21 @@ def _rs_line_new_high(close: pd.Series, spy_close: pd.Series, lookback: int = 25
     """
     Return True if the RS line (stock/SPY ratio) is at a 52-week high today.
     Minervini's strongest single signal: RS line leads the price breakout.
+    Uses index intersection to guarantee date-aligned comparison (P1-fix).
     """
-    n = min(len(close), len(spy_close), lookback)
-    if n < 60:
+    try:
+        common_idx = close.index.intersection(spy_close.index)
+        n = min(len(common_idx), lookback)
+        if n < 60:
+            return False
+        stock = close.loc[common_idx].iloc[-n:].values
+        spy   = spy_close.loc[common_idx].iloc[-n:].values
+        if spy[-1] == 0:
+            return False
+        rs_line = stock / spy
+        return float(rs_line[-1]) >= float(rs_line.max()) * 0.995  # within 0.5% of 52w high
+    except Exception:
         return False
-    stock = close.iloc[-n:].values
-    spy   = spy_close.iloc[-n:].values
-    if len(stock) != len(spy) or spy[-1] == 0:
-        return False
-    rs_line = stock / spy
-    return float(rs_line[-1]) >= float(rs_line.max()) * 0.995  # within 0.5% of 52w high
 
 
 
@@ -537,8 +544,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         if None in (ma20, ma50, ma150, ma200):
             return TrendResult(symbol=symbol, passed=False, price=price, fail_reason="insufficient_data")
 
-        ma200_series  = close.rolling(200).mean().dropna()
-        ma200_20d_ago = float(ma200_series.iloc[-20]) if len(ma200_series) >= 20 else ma200
+        ma200_series  = close.rolling(200).mean()
+        ma200_20d_ago = float(ma200_series.iloc[-21]) if len(ma200_series) >= 220 else ma200
         ma200_slope   = (ma200 - ma200_20d_ago) / ma200_20d_ago if ma200_20d_ago != 0 else 0.0
 
         high_52w      = float(close.iloc[-252:].max()) if len(close) >= 252 else float(close.max())
@@ -554,7 +561,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         _rs_delta_4w = 0.0
         try:
             if len(close) > 25 and len(spy_close) > 25:
-                _rs_4w_ago = _rs_rating(close.iloc[:-20], spy_close.iloc[:-20])
+                _common4w = close.index.intersection(spy_close.index)
+                _rs_4w_ago = _rs_rating(close.loc[_common4w].iloc[:-20], spy_close.loc[_common4w].iloc[:-20])
                 _rs_delta_4w = round(rs - _rs_4w_ago, 1)
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
@@ -695,7 +703,16 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             _cr      = _bs_info.get("currentRatio")
             _bs_fail = None
             if _fcf is not None and float(_fcf) < 0:
-                _bs_fail = f"fcf_negative(${float(_fcf)/1e6:.0f}M)"
+                # P1-fix: exempt high-growth companies (SaaS/biotech) with FCF < 0
+                # Minervini targets exactly these: negative FCF + revenue growth >20%
+                # = reinvesting aggressively, not distressed. Only reject low-growth burnouts.
+                _rev_growth = _bs_info.get("revenueGrowth")  # yfinance: 0.35 = 35% YoY
+                _high_growth = (_rev_growth is not None and float(_rev_growth) >= 0.20)
+                if not _high_growth:
+                    _bs_fail = f"fcf_negative(${float(_fcf)/1e6:.0f}M)"
+                else:
+                    _log.debug("[screen] %s FCF negative but revenue growth %.0f%% — FCF filter waived",
+                               symbol, float(_rev_growth) * 100)
             elif _de is not None and float(_de) > 200:     # >200 = D/E > 2.0×
                 _bs_fail = f"debt_equity_high({float(_de)/100:.1f}x)"
             elif _cr is not None and float(_cr) < 1.0:
@@ -763,17 +780,22 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         try:
             _cl18 = df["Close"].tail(378)
             if len(_cl18) >= 80:
-                _pk_b  = float(_cl18.iloc[0])
-                _in_b  = False
+                _pk_b       = float(_cl18.iloc[0])
+                _in_b       = False
+                _bars_in_b  = 0  # P1-fix: count bars spent below peak before counting base
                 for _p_b in _cl18.iloc[1:]:
                     _pf = float(_p_b)
                     if _pf > _pk_b * 1.02:
-                        if _in_b:
+                        # Price broke above peak — if base was long enough, count it
+                        if _in_b and _bars_in_b >= 20:
                             _bcnt += 1
-                            _in_b = False
-                        _pk_b = _pf
+                        _in_b      = False
+                        _bars_in_b = 0
+                        _pk_b      = _pf
                     elif _pf < _pk_b * 0.85:
                         _in_b = True
+                    if _in_b:
+                        _bars_in_b += 1
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
         result.base_count = min(_bcnt, 5)
@@ -847,7 +869,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                     _c3y       = _wk3y["Close"]
                     _ma10w     = float(_c3y.tail(10).mean())
                     _ma30w     = float(_c3y.tail(30).mean())
-                    _ma30w_prv = float(_c3y.iloc[-34:-4].mean())
+                    _ma30w_prv = float(_c3y.rolling(30).mean().iloc[-4])
                     _wk_s2     = _ma10w > _ma30w and _ma30w > _ma30w_prv
                 if len(_wk3y) >= 6:
                     # Weekly breakout alignment: current week high >= 5-week prior high

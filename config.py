@@ -68,6 +68,7 @@ TREND_TEMPLATE = {
     "rsi_period":              14,
     # Weekly context — require weekly trend to confirm daily
     "weekly_context":          True,   # price above MA10w + MA40w on weekly chart
+    "weekly_base_max_range":    0.25,   # P1-fix: 4-week H-L range <= 25% (Minervini standard, was 15%)
     # Earnings filter — never buy within N days of earnings
     "earnings_min_days_away":  7,      # skip if earnings within 7 calendar days
     # Ex-dividend guard — never buy within N days of ex-dividend date
