@@ -803,6 +803,14 @@ def check_positions() -> None:
                                 _sdd_sym, _sdd_pnl * 100
                             )
 
+    # P2-fix: fetch SPY close once per cycle — reused in Step F and RS divergence
+    _spy_close_cycle = None
+    try:
+        _spy_close_cycle = yf.Ticker("SPY").history(
+            period="90d", interval="1d", auto_adjust=True)["Close"]
+    except Exception:
+        _log.debug("[monitor] SPY pre-fetch failed — will retry per-step")
+
     for pos in positions:
         symbol    = pos["symbol"]
         qty       = int(float(pos["qty"]))
@@ -829,6 +837,8 @@ def check_positions() -> None:
             "entry_date":            datetime.now(_ET).strftime("%Y-%m-%d"),
         })
         sym["last_price"] = cur_price   # keep last known price for close_trade P&L
+        # P2-fix: compute once and reuse — was called 10+ times per symbol per cycle
+        _days_held = _trading_days_held(sym.get("entry_date", ""))
 
         # Stock split detection: if Alpaca qty diverges significantly from our recorded qty,
         # a corporate action (split / reverse-split) likely occurred. Alert and rescale stop.
@@ -1527,12 +1537,12 @@ def check_positions() -> None:
                 and not sym.get("partial1_done")
                 and not sym.get("failed_breakout_done")
                 and _ed_z
-                and 1 <= _trading_days_held(_ed_z) <= 20
+                and 1 <= _days_held <= 20
                 and cur_price < _buy_stp_z * 0.99
                 and pnl_pct < 0.03):
             _rem_z = qty - sym.get("partial_qty", 0)
             _log.warning("[monitor] %s FAILED BREAKOUT — cur $%.2f < pivot $%.2f (day %d)",
-                         symbol, cur_price, _buy_stp_z, _trading_days_held(_ed_z))
+                         symbol, cur_price, _buy_stp_z, _days_held)
             _cancel_stop_orders(symbol)
             if _rem_z > 0 and _place_market_sell(symbol, _rem_z):
                 sym["failed_breakout_done"] = True
@@ -1551,7 +1561,7 @@ def check_positions() -> None:
                                  json={"chat_id": _cid, "parse_mode": "Markdown",
                                        "text": (f"❌ *Failed Breakout — {symbol}*\n"
                                                 f"Price ${cur_price:.2f} fell back under pivot ${_buy_stp_z:.2f}\n"
-                                                f"Day {_trading_days_held(_ed_z)} — cutting loss")},
+                                                f"Day {_days_held} — cutting loss")},
                                  timeout=8)
                 except Exception:
                     _log.debug("[%s] suppressed", __name__, exc_info=True)
@@ -1581,7 +1591,7 @@ def check_positions() -> None:
                 and not sym.get("partial1_done")
                 and pnl_pct > 0.01):
             _ed_pt = sym.get("entry_date", "")
-            if _ed_pt and _trading_days_held(_ed_pt) >= 5:
+            if _ed_pt and _days_held >= 5:
                 _pt_today = datetime.now(_ET).strftime("%Y-%m-%d")
                 if sym.get("_pivot_trail_date") != _pt_today:
                     sym["_pivot_trail_date"] = _pt_today
@@ -1614,7 +1624,7 @@ def check_positions() -> None:
                                                 "[monitor] %s PIVOT TRAIL: stop $%.2f→$%.2f "
                                                 "(swing low day %d)",
                                                 symbol, _cur_stp, _pivot_stop,
-                                                _trading_days_held(_ed_pt))
+                                                _days_held)
                     except Exception as _pte:
                         _log.debug("[monitor] pivot trail %s: %s", symbol, _pte)
 
@@ -1627,7 +1637,7 @@ def check_positions() -> None:
                 and not sym.get("partial1_done")
                 and not sym.get("breakeven_done")):
             _ed_ma = sym.get("entry_date", "")
-            if _ed_ma and _trading_days_held(_ed_ma) >= 10:
+            if _ed_ma and _days_held >= 10:
                 sym["_ma20_check_date"] = _ma20_today
                 try:
                     _dfm = _get_hist(symbol)
@@ -1651,7 +1661,7 @@ def check_positions() -> None:
                                         "[monitor] %s MA20 trail: stop $%.2f\u2192$%.2f "
                                         "(MA20=$%.2f, day %d)",
                                         symbol, _cur_stop, _ma20_stop,
-                                        _ma20_val, _trading_days_held(_ed_ma))
+                                        _ma20_val, _days_held)
                 except Exception as _me:
                     _log.debug("[monitor] ma20 trail %s: %s", symbol, _me)
 
@@ -1659,7 +1669,7 @@ def check_positions() -> None:
         # Stock that gains ≥20% within first 15 trading days = potential 100%+ winner.
         # Override first partial: hold full position up to 8 weeks (40 trading days).
         _ed_fm = sym.get("entry_date", "")
-        _td_fm = _trading_days_held(_ed_fm) if _ed_fm else 0
+        _td_fm = _days_held
         if (not sym.get("fast_mover")
                 and pnl_pct >= 0.20
                 and 0 < _td_fm <= 15):
@@ -1711,7 +1721,7 @@ def check_positions() -> None:
                 changed = True
                 _log.info("[monitor] %s B2 fill confirmed (order left open list)", symbol)
 
-        _skip_b1_8w = sym.get("fast_mover") and _trading_days_held(sym.get("entry_date", "")) < 40 and pnl_pct > 0.05
+        _skip_b1_8w = sym.get("fast_mover") and _days_held < 40 and pnl_pct > 0.05
         if pnl_pct >= partial1_trigger and not sym.get("partial1_done") and not _skip_b1_8w:
             sell_qty = max(1, round(initial_qty / 3))
             _lim1 = round(cur_price * 0.999, 2)  # 0.1% below market — fast fill, better price
@@ -1774,7 +1784,7 @@ def check_positions() -> None:
                 and not sym.get("pyramid_done")
                 and not sym.get("partial2_done")
                 and 0.12 <= pnl_pct < partial2_trigger):
-            _pyr_days = _trading_days_held(sym.get("entry_date", ""))
+            _pyr_days = _days_held
             if _pyr_days >= 3:
                 _pyr_qty = max(1, round(qty * 0.30))
                 _pyr_above_ma20 = False
@@ -1836,8 +1846,8 @@ def check_positions() -> None:
                 _rs_f_near_high = False
                 try:
                     _df_f  = _get_hist(symbol)
-                    _spy_f = yf.Ticker("SPY").history(
-                        period="90d", interval="1d", auto_adjust=True)["Close"]
+                    _spy_f = _spy_close_cycle if _spy_close_cycle is not None else (
+                        yf.Ticker("SPY").history(period="90d", interval="1d", auto_adjust=True)["Close"])
                     if len(_df_f) >= 22 and len(_spy_f) >= 22:
                         _c_f  = _df_f["Close"]
                         _rs_f = (_c_f / _spy_f.reindex(_c_f.index, method="ffill")).dropna()
@@ -2252,8 +2262,8 @@ def check_positions() -> None:
             sym["_rsd_date"] = _rsd_today
             try:
                 _df_rsd = _get_hist(symbol)
-                _spy_rsd = yf.Ticker("SPY").history(
-                    period="60d", interval="1d", auto_adjust=True)["Close"]
+                _spy_rsd = (_spy_close_cycle.iloc[-60:] if _spy_close_cycle is not None else
+                            yf.Ticker("SPY").history(period="60d", interval="1d", auto_adjust=True)["Close"])
                 if len(_df_rsd) >= 22 and len(_spy_rsd) >= 22:
                     _c_rsd   = _df_rsd["Close"]
                     _h_rsd   = _df_rsd["High"]
@@ -2362,7 +2372,7 @@ def check_positions() -> None:
                 and not sym.get("time_stopped")
                 and not sym.get("max_loss_exited")
                 and not _pead_active):
-            _td_d = _trading_days_held(entry_date_str)
+            _td_d = _days_held
             if _td_d >= time_stop_days and pnl_pct < time_stop_gain:
                 _rem_d = qty - sym.get("partial_qty", 0)
                 _log.warning("[monitor] %s TIME STOP: day %d pnl=%.1f%% (< %.0f%%) — closing",
@@ -2394,7 +2404,7 @@ def check_positions() -> None:
                 and not sym.get("max_hold_exited")
                 and not sym.get("time_stopped")
                 and not _pead_active):
-            _abs_days = _trading_days_held(entry_date_str)
+            _abs_days = _days_held
             if _abs_days >= _HARD_MAX_DAYS:
                 _rem_hm = qty - sym.get("partial_qty", 0)
                 if pnl_pct >= 0.05 and _rem_hm > 0:

@@ -44,6 +44,8 @@ _TOKEN_LOG  = LOG_DIR / "token_usage.jsonl"
 _VCP_CACHE  = LOG_DIR / "vcp_cache.json"
 
 _VCP_CACHE_LOCK = threading.Lock()
+_TOKEN_BUFFER: list = []          # P2-fix: buffer token log entries, flush in batches
+_TOKEN_BUFFER_LOCK = threading.Lock()
 _spy_weekly_cache: dict = {}  # {"df": pd.DataFrame, "ts": float}
 _SPY_WEEKLY_CACHE_LOCK = threading.Lock()
 
@@ -124,6 +126,10 @@ def _get_client() -> anthropic.Anthropic:
 
 def _log_tokens(symbol: str, tier: str, model: str,
                 input_tok: int, output_tok: int) -> None:
+    """Buffer token usage entries and flush to disk every 10 entries.
+    P2-fix: was opening/writing/closing the file on every single Claude call
+    (150+ open/write/close cycles per full run). Now batched.
+    """
     rates = {
         "haiku":  (0.25e-6, 1.25e-6),
         "sonnet": (3.00e-6, 15.00e-6),
@@ -137,12 +143,30 @@ def _log_tokens(symbol: str, tier: str, model: str,
         "input_tokens": input_tok, "output_tokens": output_tok,
         "cost_usd": round(cost, 6),
     }
+    with _TOKEN_BUFFER_LOCK:
+        _TOKEN_BUFFER.append(entry)
+        if len(_TOKEN_BUFFER) >= 10:
+            _flush_token_buffer()
+
+
+def _flush_token_buffer() -> None:
+    """Write buffered token entries to disk. Must be called with _TOKEN_BUFFER_LOCK held."""
+    if not _TOKEN_BUFFER:
+        return
     try:
         _TOKEN_LOG.parent.mkdir(exist_ok=True)
         with open(_TOKEN_LOG, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+            for _e in _TOKEN_BUFFER:
+                f.write(json.dumps(_e) + "\n")
+        _TOKEN_BUFFER.clear()
     except Exception:
         pass
+
+
+def flush_token_log() -> None:
+    """Public flush — call at end of batch_analyze to ensure all entries are written."""
+    with _TOKEN_BUFFER_LOCK:
+        _flush_token_buffer()
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -1108,29 +1132,47 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50,
 
     tick_fn: optional callable invoked every 5 candidates — used by main.py
     to write a watchdog heartbeat during long Claude API batches.
+
+    P2-fix: uses ThreadPoolExecutor(6) for parallel Haiku calls — up to 6×
+    faster than the old sequential loop with time.sleep(0.3). Sonnet/Opus
+    escalation happens inside analyze() so concurrency is naturally limited
+    by how many symbols pass Haiku (typically <30%).
     """
-    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
     results    = []
     candidates = [r for r in trend_passed if r.passed and r.df is not None][:max_symbols]
-    _log.info("[vcp] Analyzing %d trend-passed stocks (Haiku→Sonnet→Opus tiering)...",
+    _log.info("[vcp] Analyzing %d trend-passed stocks in parallel (Haiku→Sonnet→Opus)...",
               len(candidates))
 
-    for i, trend in enumerate(candidates, 1):
-        _log.info("[vcp] %d/%d: %s", i, len(candidates), trend.symbol)
+    def _analyze_one(trend):
         last_candle = getattr(trend, "last_candle", "neutral")
         fund = {"eps_growth": getattr(trend, "eps_growth", None),
                 "revenue_growth": getattr(trend, "revenue_growth", None)}
         result = analyze(trend.symbol, trend.df, last_candle=last_candle, fundamentals=fund)
         result.rs_rating       = getattr(trend, "rs_rating", 0.0)
         result.rs_line_at_high = getattr(trend, "rs_line_at_high", False)
-        results.append(result)
-        if tick_fn and i % 5 == 0:
-            try:
-                tick_fn()
-            except Exception:
-                pass
-        time.sleep(0.3)
+        return result
 
+    completed = 0
+    with ThreadPoolExecutor(max_workers=6) as _pool:
+        future_to_sym = {_pool.submit(_analyze_one, t): t.symbol for t in candidates}
+        for fut in _as_completed(future_to_sym):
+            sym = future_to_sym[fut]
+            try:
+                result = fut.result()
+                results.append(result)
+                completed += 1
+                _log.info("[vcp] %d/%d done: %s (%s)", completed, len(candidates),
+                          sym, result.tier_used)
+                if tick_fn and completed % 5 == 0:
+                    try:
+                        tick_fn()
+                    except Exception:
+                        pass
+            except Exception as _exc:
+                _log.warning("[vcp] %s analysis failed: %s", sym, _exc)
+
+    flush_token_log()
     passed    = [r for r in results if r.passed]
     haiku_rej = sum(1 for r in results if "haiku" in r.tier_used)
     sonnet_n  = sum(1 for r in results if r.tier_used == "sonnet")

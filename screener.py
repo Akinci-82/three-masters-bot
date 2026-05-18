@@ -28,6 +28,18 @@ _log = logging.getLogger(__name__)
 # Stocks that cause issues (dual-class, non-US, warrants)
 _BAD_SYMBOLS = {"BRK.B", "BF.B", "BRK-B", "BF-B"}
 
+# P2-fix: module-level monthly context cache — avoids repeated 5y monthly
+# downloads for the same symbol within the same trading day
+_MONTHLY_CTX_CACHE: dict = {}   # symbol → (result_bool, note, date_str)
+_MONTHLY_CTX_LOCK = threading.Lock()
+
+# P2-fix: module-level cache for sector ETF returns — avoids downloading 11 ETFs
+# once per symbol thread (was: same dataset downloaded hundreds of times per run)
+_SECTOR_ETF_RETURNS: dict = {}   # {etf_sym: 6mo_return}
+_SECTOR_ETF_RETURNS_TS: float = 0.0
+_SECTOR_ETF_RETURNS_LOCK = threading.Lock()
+_SECTOR_ETF_TTL = 4 * 3600  # 4 hours
+
 # Nasdaq 100 extras not typically in S&P 500 — high VCP potential
 _NDQ_EXTRAS = [
     # Original Nasdaq extras
@@ -187,25 +199,39 @@ def _check_monthly_context(symbol: str) -> tuple[bool, str]:
     Verify monthly chart is in Stage 2 uptrend: price above MA10m and MA40m.
     Uses 5-year monthly bars so we have enough history for MA40m.
     Returns (True, note) on failure — never blocks for missing data.
+    P2-fix: results cached per symbol per trading day — avoids repeated 5y downloads.
     """
+    from datetime import date as _date_m
+    _today_str = str(_date_m.today())
+    with _MONTHLY_CTX_LOCK:
+        _cached = _MONTHLY_CTX_CACHE.get(symbol)
+        if _cached and _cached[2] == _today_str:
+            return _cached[0], _cached[1]
     try:
         df_m    = yf.Ticker(symbol).history(period="5y", interval="1mo", auto_adjust=True)
         if len(df_m) < 12:
-            return True, "insufficient_monthly_data"
-        close_m  = df_m["Close"]
-        ma10m    = float(close_m.rolling(10).mean().iloc[-1])
-        price_m  = float(close_m.iloc[-1])
-        if price_m < ma10m:
-            return False, f"monthly_below_MA10m(${ma10m:.0f})"
-        if len(df_m) >= 40:
-            ma40m = float(close_m.rolling(40).mean().iloc[-1])
-            if price_m < ma40m:
-                return False, f"monthly_below_MA40m(${ma40m:.0f})"
-            if ma10m < ma40m:
-                return False, "monthly_MA10m_below_MA40m"
-        return True, "monthly_stage2_ok"
+            result = (True, "insufficient_monthly_data")
+        else:
+            close_m = df_m["Close"]
+            ma10m   = float(close_m.rolling(10).mean().iloc[-1])
+            price_m = float(close_m.iloc[-1])
+            if price_m < ma10m:
+                result = (False, f"monthly_below_MA10m(${ma10m:.0f})")
+            elif len(df_m) >= 40:
+                ma40m = float(close_m.rolling(40).mean().iloc[-1])
+                if price_m < ma40m:
+                    result = (False, f"monthly_below_MA40m(${ma40m:.0f})")
+                elif ma10m < ma40m:
+                    result = (False, "monthly_MA10m_below_MA40m")
+                else:
+                    result = (True, "monthly_stage2_ok")
+            else:
+                result = (True, "monthly_stage2_ok")
     except Exception as e:
-        return True, f"monthly_check_skipped:{e}"
+        result = (True, f"monthly_check_skipped:{e}")
+    with _MONTHLY_CTX_LOCK:
+        _MONTHLY_CTX_CACHE[symbol] = (result[0], result[1], _today_str)
+    return result
 
 
 def _check_weekly_context(symbol: str) -> tuple[bool, str]:
@@ -451,10 +477,11 @@ def _get_fundamentals(ticker) -> tuple:
             roe,
             float(float_sh) if float_sh is not None else None,
             float(inst_raw) if inst_raw is not None else None,
+            info,  # P2-fix: return raw info dict so callers avoid extra ticker.info calls
         )
     except Exception:
         _log.debug("[screen] %s fundamentals fetch failed", getattr(ticker, "ticker", "?"), exc_info=True)
-        return None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, {}
 
 
 def _count_eps_beats(ticker) -> int:
@@ -664,7 +691,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
 
         # 6. Fundamental filter — fetch only for stocks that passed all technical checks
         # Hard-reject only on clearly declining earnings (>10%); unknown data passes through
-        eps_g, rev_g, market_cap, short_ratio, eps_rev, roe, float_sh, inst_pct = _get_fundamentals(ticker)
+        eps_g, rev_g, market_cap, short_ratio, eps_rev, roe, float_sh, inst_pct, _ticker_info = _get_fundamentals(ticker)  # P2-fix: _ticker_info cached
         result.eps_growth     = eps_g
         result.revenue_growth = rev_g
         result.market_cap     = market_cap
@@ -697,7 +724,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         # Balance sheet quality gate: Minervini — avoid financially stressed companies
         # FCF < 0 = burning cash; D/E ≥ 2.0 = over-leveraged; current ratio < 1 = liquidity risk
         try:
-            _bs_info = ticker.info
+            _bs_info = _ticker_info  # P2-fix: reuse cached info dict
             _fcf     = _bs_info.get("freeCashflow")
             _de      = _bs_info.get("debtToEquity")        # reported as percentage, e.g. 150 = 1.5×
             _cr      = _bs_info.get("currentRatio")
@@ -1018,15 +1045,22 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             _sec_sym = get_sector(symbol)
             _etf_sym = _etf_map_il.get(_sec_sym)
             if _etf_sym:
-                _all_etfs = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLI", "XLB", "XLRE", "XLU", "XLP", "XLC"]
-                _idf = yf.download(_all_etfs, period="6mo", interval="1d",
-                                   auto_adjust=True, progress=False)["Close"]
-                _rets = {}
-                for _e in _all_etfs:
-                    if _e in _idf.columns:
-                        _col = _idf[_e].dropna()
-                        if len(_col) >= 100:
-                            _rets[_e] = float(_col.iloc[-1] / _col.iloc[0] - 1)
+                # P2-fix: use cached ETF returns — fetch once per 4h, not once per symbol thread
+                import time as _time_etf
+                global _SECTOR_ETF_RETURNS_TS
+                with _SECTOR_ETF_RETURNS_LOCK:
+                    if _time_etf.time() - _SECTOR_ETF_RETURNS_TS > _SECTOR_ETF_TTL or not _SECTOR_ETF_RETURNS:
+                        _all_etfs = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLI", "XLB", "XLRE", "XLU", "XLP", "XLC"]
+                        _idf = yf.download(_all_etfs, period="6mo", interval="1d",
+                                           auto_adjust=True, progress=False)["Close"]
+                        for _e in _all_etfs:
+                            if _e in _idf.columns:
+                                _col = _idf[_e].dropna()
+                                if len(_col) >= 100:
+                                    _SECTOR_ETF_RETURNS[_e] = float(_col.iloc[-1] / _col.iloc[0] - 1)
+                        _SECTOR_ETF_RETURNS_TS = _time_etf.time()
+                        _log.info("[screen] Sector ETF returns refreshed (%d ETFs cached)", len(_SECTOR_ETF_RETURNS))
+                    _rets = dict(_SECTOR_ETF_RETURNS)
                 if _etf_sym in _rets and _rets:
                     _ranked_il = sorted(_rets, key=lambda x: -_rets[x])
                     _ind_leader = _etf_sym in _ranked_il[:4]
@@ -1078,7 +1112,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         # Short interest monthly change: rapid build = bearish, rapid cover = squeeze fuel
         _si_pts = 0.0
         try:
-            _info_si = ticker.info
+            _info_si = _ticker_info  # P2-fix: reuse cached info dict
             _si_cur  = float(_info_si.get("sharesShort", 0) or 0)
             _si_prev = float(_info_si.get("sharesShortPriorMonth", 0) or 0)
             if _si_prev > 0:
@@ -1094,7 +1128,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         # Analyst consensus price target: >25% above current price = institutional expected upside
         _apt = False
         try:
-            _info_apt = ticker.info
+            _info_apt = _ticker_info  # P2-fix: reuse cached info dict
             _pt_mean  = float(_info_apt.get("targetMeanPrice", 0) or 0)
             _pt_cur   = float(_info_apt.get("currentPrice", price) or price)
             if _pt_mean > 0 and _pt_cur > 0:
