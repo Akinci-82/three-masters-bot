@@ -481,7 +481,7 @@ def _send_morning_briefing() -> None:
                 try:
                     _h = yf.Ticker(_etf).history(period="60d", interval="1d", auto_adjust=True)["Close"]
                     _n = min(len(_h), len(_spy_h), 30)
-                    if _n >= 25:
+                    if _n >= 27:
                         _rel_now  = float(_h.iloc[-1]/_h.iloc[-22] - _spy_h.iloc[-1]/_spy_h.iloc[-22])
                         _rel_prev = float(_h.iloc[-6]/_h.iloc[-27] - _spy_h.iloc[-6]/_spy_h.iloc[-27])
                         if _rel_prev < -0.01 and _rel_now > 0.005:
@@ -611,7 +611,7 @@ def _maybe_morning_briefing() -> None:
     now = datetime.now(pytz.timezone("Europe/Stockholm"))
     if now.weekday() >= 5:   # skip weekends
         return
-    if not (now.hour == 15 and 14 <= now.minute <= 28):
+    if not (now.hour == 15 and 13 <= now.minute <= 44):
         return
     today = now.date()
     if _last_briefing_date == today:
@@ -797,8 +797,9 @@ def _send_weekly_report(portfolio_value: float) -> None:
         errors_total = 0
         days_scanned = 0
 
-        for d in range(5):
-            day = today - timedelta(days=d)
+        import pandas as _pd_wr
+        for _wd in _pd_wr.bdate_range(end=today, periods=5):
+            day = _wd.date()
             rfile = REPORT_DIR / f"{day}.json"
             if not rfile.exists():
                 continue
@@ -1476,6 +1477,8 @@ def _is_macro_blackout() -> tuple[bool, str]:
     resolved before the scan — lift the blackout.
     """
     today = date.today()
+    if today.year != 2026:
+        _log.warning("[macro] FOMC/CPI dates hardcoded for 2026 — uppdatera _FOMC_2026 och _CPI_2026")
     for (m, d) in _FOMC_2026 + _CPI_2026:
         try:
             event = date(today.year, m, d)
@@ -1694,7 +1697,7 @@ def _simons_score(trend) -> float:
     rs_line_leading (RS at high while price in base) = strongest Minervini signal.
     """
     rs     = getattr(trend, "rs_rating", 70.0)
-    rs_pts = min((rs - 70) / 29 * 4.0, 4.0)
+    rs_pts = max(0.0, min((rs - 70) / 29 * 4.0, 4.0))
     # RS line signal: weekly confirmation elevates score
     rs_leading = getattr(trend, "rs_line_leading",  False)
     rs_at_high = getattr(trend, "rs_line_at_high",  False)
@@ -1871,7 +1874,7 @@ def _market_follow_through_confirmed() -> bool:
             return True   # within 5% of MA50 — no restriction
         # In correction: scan last 25 sessions for a follow-through day
         _vl_ftd  = _spy_ftd["Volume"]
-        _avg_vol = float(_vl_ftd.tail(25).mean())
+        _avg_vol = float(_vl_ftd.tail(50).mean())
         _recent  = _spy_ftd.tail(25).reset_index(drop=True)
         # Find rally low first, then count from there
         _low_idx = int(_recent["Close"].argmin())
@@ -2251,7 +2254,7 @@ def _composite_score(vcp, trend, risk_state: dict, regime: str,
     m = _minervini_score(vcp)
     s = _simons_score(trend)
     t = _tudor_score(risk_state, regime, breadth_pct, power_trend, pcr, rate_slope_bps, vix_slope, dist_days, nh_nl_ratio, breadth_trend, ad_divergence)
-    return round(min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus), 2)
+    return round(max(0.0, min(10.0, m * 0.60 + s * 0.30 + t * 0.10 + sector_bonus)), 2)
 
 
 # ── Sector rotation helpers ──────────────────────────────────────────────────
@@ -3117,6 +3120,22 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     # Sort by composite descending — Minervini dominates but Simons/Tudor contribute
     vcp_scored.sort(key=lambda x: -x[2])
 
+    # Peer sector confirmation: when >=2 VCPs fire in the same sector, sector has a tailwind
+    _sec_vcp_cnt: dict[str, int] = {}
+    for _pv, _pt, _pcs in vcp_scored:
+        _ps = get_sector(_pv.symbol)
+        _sec_vcp_cnt[_ps] = _sec_vcp_cnt.get(_ps, 0) + 1
+    _hot_sectors = {_s for _s, _n in _sec_vcp_cnt.items() if _n >= 2}
+    if _hot_sectors:
+        vcp_scored = [
+            (_pv, _pt, min(_pcs + (0.3 if get_sector(_pv.symbol) in _hot_sectors else 0.0), 10.0))
+            for _pv, _pt, _pcs in vcp_scored
+        ]
+        _peer_syms = [_pv.symbol for _pv, _pt, _pcs in vcp_scored
+                      if get_sector(_pv.symbol) in _hot_sectors]
+        _log.info("[score] Peer sector boost +0.3: %s (sectors: %s)", _peer_syms, _hot_sectors)
+        vcp_scored.sort(key=lambda x: -x[2])
+
     # Build candidate list for broker report (all VCP-scored candidates, incl. future rejects)
     report["vcp_candidates"] = [
         {
@@ -3141,22 +3160,6 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         }
         for v, t, cs in vcp_scored
     ]
-
-    # Peer sector confirmation: when >=2 VCPs fire in the same sector, sector has a tailwind
-    _sec_vcp_cnt: dict[str, int] = {}
-    for _pv, _pt, _pcs in vcp_scored:
-        _ps = get_sector(_pv.symbol)
-        _sec_vcp_cnt[_ps] = _sec_vcp_cnt.get(_ps, 0) + 1
-    _hot_sectors = {_s for _s, _n in _sec_vcp_cnt.items() if _n >= 2}
-    if _hot_sectors:
-        vcp_scored = [
-            (_pv, _pt, min(_pcs + (0.3 if get_sector(_pv.symbol) in _hot_sectors else 0.0), 10.0))
-            for _pv, _pt, _pcs in vcp_scored
-        ]
-        _peer_syms = [_pv.symbol for _pv, _pt, _pcs in vcp_scored
-                      if get_sector(_pv.symbol) in _hot_sectors]
-        _log.info("[score] Peer sector boost +0.3: %s (sectors: %s)", _peer_syms, _hot_sectors)
-        vcp_scored.sort(key=lambda x: -x[2])
 
     _log.info("[score] Order of priority: %s",
               [(v.symbol, cs) for v, t, cs in vcp_scored])
@@ -3395,8 +3398,8 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             if not buy_order:
                 continue
             register_trade(vcp.symbol, sizing["risk_pct"])
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
         _b1_trigger = 0.15 if composite >= 8.0 else 0.10
         order_rec = {
             "symbol":         vcp.symbol,
@@ -3440,9 +3443,9 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
             "news_positive":   getattr(vcp, "news_positive", False),
         }
         orders_placed.append(order_rec)
+        held_symbols.add(vcp.symbol)
         if not _is_live():
             cash -= sizing["notional"]
-            held_symbols.add(vcp.symbol)
 
         # OP1: Log active signals for this order to signal_accuracy.json
         try:
@@ -4057,7 +4060,7 @@ def main():
 
 
 # ── Obsidian vault integration ────────────────────────────────────────────────
-_VAULT_DIR = Path("/home/habil/Three Masters")
+_VAULT_DIR = Path("/home/habil/obsidian-vault")
 
 
 def _write_obsidian_daily_note(report: dict, portfolio_value: float) -> None:
