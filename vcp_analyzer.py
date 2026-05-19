@@ -331,7 +331,8 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
     # A fresh pivot means price is still correcting; true VCP needs time to consolidate
     _high_idx       = int(high.argmax())
     _bars_since_high = len(high) - _high_idx - 1
-    if _bars_since_high < 25:
+    _hi_min = cfg.get("pattern_high_min_bars", 5)
+    if _bars_since_high < _hi_min:
         return False, {"reason": f"pattern_high_too_recent_{_bars_since_high}bars"}
 
     # Final handle: last 10 bars.
@@ -1274,10 +1275,11 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50,
                 _log.warning("[vcp] %s analysis failed: %s", sym, _exc)
 
     flush_token_log()
-    passed    = [r for r in results if r.passed]
-    haiku_rej = sum(1 for r in results if "haiku" in r.tier_used)
-    sonnet_n  = sum(1 for r in results if r.tier_used == "sonnet")
-    opus_n    = sum(1 for r in results if r.tier_used == "opus")
-    _log.info("[vcp] Done: %d/%d passed | Haiku rejected: %d | Sonnet: %d | Opus: %d",
-              len(passed), len(results), haiku_rej, sonnet_n, opus_n)
+    passed      = [r for r in results if r.passed]
+    quant_fail_n = sum(1 for r in results if r.tier_used == "quant_fail")
+    haiku_rej   = sum(1 for r in results if "haiku" in r.tier_used)
+    sonnet_n    = sum(1 for r in results if r.tier_used == "sonnet")
+    opus_n      = sum(1 for r in results if r.tier_used == "opus")
+    _log.info("[vcp] Done: %d/%d passed | Quant-fail: %d | Haiku-rej: %d | Sonnet: %d | Opus: %d",
+              len(passed), len(results), quant_fail_n, haiku_rej, sonnet_n, opus_n)
     return results

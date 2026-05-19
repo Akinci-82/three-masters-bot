@@ -80,12 +80,13 @@ TREND_TEMPLATE = {
 
 # ── Minervini layer — VCP Analysis ──────────────────────────────────────────
 VCP = {
-    "min_contractions":         2,
+    "min_contractions":         1,     # was 2; loosen quant gate, Claude AI evaluates
     "max_contractions":         5,
     "min_contraction_ratio":    0.50,
     "max_depth_from_high":      0.35,
     "volume_decline_required":  True,
-    "final_tight_pct":          0.10,
+    "final_tight_pct":          0.15,  # was 0.10; allow up to 15% handle range
+    "pattern_high_min_bars":    5,     # bars since pattern high; was hardcoded 25
     "lookback_days":            60,
     "min_confidence":           0.65,
     "min_quality_score":        3,
