@@ -385,6 +385,7 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
         "contractions":           n_contractions,
         "pattern_depth_pct":      depth,
         "tight_rng_pct":          tight_rng,
+        "pct_from_ath":           _pct_from_ath,
         "seg_ranges":             seg_ranges,
         "vol_declining":          vol_declining,
         "vol_at_multiweek_low":   vol_at_multiweek_low,
@@ -967,6 +968,11 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
     breakout_lvl  = quant.get("breakout_level", price)   # handle HIGH
     stop_cand     = quant.get("stop_loss_candidate", price * 0.93)  # handle LOW
     _q_setup_type = quant.get("setup_type", "vcp")
+    _log.info("[vcp] %s quant PASS | setup=%s | depth=%.1f%% tight=%.1f%% Δath=%+.1f%%",
+              symbol, _q_setup_type,
+              quant.get("pattern_depth_pct", 0) * 100,
+              quant.get("tight_rng_pct", 0) * 100,
+              quant.get("pct_from_ath", 0) * 100)
 
     # -- Cache: skip Claude if same breakout setup seen today ---------------
     _vcp_cache = _load_vcp_cache()
