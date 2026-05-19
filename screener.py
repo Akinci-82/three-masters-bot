@@ -1370,7 +1370,7 @@ def run(symbols: list[str] | None = None, workers: int = 10) -> list[TrendResult
         fail_counts: dict[str, int] = {}
         for r in results:
             if not r.passed:
-                key = r.fail_reason.split("(")[0].split("_")[0] if r.fail_reason else "unknown"
+                key = r.fail_reason.split("(")[0] if r.fail_reason else "unknown"
                 fail_counts[key] = fail_counts.get(key, 0) + 1
         top_fails = sorted(fail_counts.items(), key=lambda x: -x[1])[:5]
         _log.info("[screen] Top fail reasons: %s", top_fails)

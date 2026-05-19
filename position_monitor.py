@@ -655,6 +655,59 @@ def _step_d_time_stop(sym: dict, symbol: str, qty: int, pnl_pct: float,
     return False
 
 
+def _auto_reconcile_stale_state() -> None:
+    """
+    Auto-clean risk_state + monitor_state after ≥5 consecutive sync failures.
+
+    If Alpaca has returned 0 positions for 75+ minutes it's almost certainly not
+    an API glitch — the position was genuinely closed.  This writes a forced
+    journal entry, removes the stale entry from both state files, and alerts.
+    Called only from the SyncError handler; never during a normal cycle.
+    """
+    _log.warning("[monitor] AUTO-RECONCILE triggered — cleaning stale state after persistent sync failure")
+    try:
+        from position_sync import (_fetch_alpaca_state, _load_risk, _save_risk,
+                                   _load_monitor, _save_monitor)
+        try:
+            _pos, _orders = _fetch_alpaca_state()
+        except Exception as _fe:
+            _log.error("[monitor] AUTO-RECONCILE: cannot reach Alpaca — aborting: %s", _fe)
+            return
+
+        _held  = {p["symbol"] for p in _pos}
+        _risk  = _load_risk()
+        _mon   = _load_monitor()
+        stale  = [s for s in list(_risk.get("positions_risk", {}).keys()) if s not in _held]
+
+        if not stale:
+            _log.info("[monitor] AUTO-RECONCILE: no stale symbols found — state already clean")
+            return
+
+        for sym in stale:
+            sym_data   = _mon.pop(sym, {})
+            avg_cost   = float(sym_data.get("avg_cost", 0))
+            last_price = float(sym_data.get("last_price", avg_cost))
+            pnl_pct    = ((last_price - avg_cost) / avg_cost) if avg_cost > 0 else 0.0
+            try:
+                _journal_trade(sym, sym_data, pnl_pct, 0)
+            except Exception as _je:
+                _log.warning("[monitor] AUTO-RECONCILE: journal write failed for %s: %s", sym, _je)
+            _risk["positions_risk"].pop(sym, None)
+            _log.warning("[monitor] AUTO-RECONCILE: removed stale %s "
+                         "(last_price=%.2f pnl=%.1f%%)", sym, last_price, pnl_pct * 100)
+
+        _risk["open_risk_pct"] = round(sum(_risk.get("positions_risk", {}).values()), 4)
+        _save_risk(_risk)
+        _save_monitor(_mon)
+        _tg(f"🔧 *Three Masters — Auto-Reconcile*\n"
+            f"Stale positions forcibly closed after 5+ failed sync cycles:\n"
+            f"`{stale}`\nState cleaned — bot resumes normal operation.")
+        _log.warning("[monitor] AUTO-RECONCILE complete: removed %s heat=%.1f%%",
+                     stale, _risk["open_risk_pct"] * 100)
+    except Exception as _ae:
+        _log.error("[monitor] AUTO-RECONCILE failed unexpectedly: %s", _ae, exc_info=True)
+
+
 def check_positions() -> None:
     """Run one monitoring cycle. Called every 15 min during market hours."""
     if not _market_is_open():
@@ -688,6 +741,13 @@ def check_positions() -> None:
                     )
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
+        # Auto-reconcile after 5 consecutive failures (≈75 min): at this point
+        # the empty-state guard has been firing repeatedly, which means Alpaca
+        # genuinely has 0 positions while bot state still shows open ones.
+        # Clean up automatically so manual intervention is not required.
+        if _sync_fail_count >= 5:
+            _auto_reconcile_stale_state()
+            _sync_fail_count = 0
         return   # skip entire monitoring cycle — do NOT touch orders
 
     try:
@@ -2155,7 +2215,7 @@ def check_positions() -> None:
         # Prevents positions from becoming indefinite anchors. Winners get a tight
         # 3% trailing stop; flat/losers are closed immediately.
         _HARD_MAX_DAYS = 60
-        if (entry_date_str
+        if (sym.get("entry_date")
                 and not sym.get("max_hold_exited")
                 and not sym.get("time_stopped")
                 and not _pead_active):
@@ -2183,6 +2243,11 @@ def check_positions() -> None:
                         _tg(("Max Hold Exit " + symbol + "\n"
                                                    + f"Day {_abs_days} - closed at {pnl_pct*100:+.1f}%\n"
                                                    + "60-day absolute cap reached"))
+    # Checkpoint: persist all live-position changes (sells, stop updates) before cleanup
+    # phases run.  A crash in cleanup won't lose any sell events written above.
+    if changed:
+        _save_state(state)
+        changed = False
     # -- Stale position review (>30 trading days, no major exit milestone) --------
     for _sym_st, _sym_std in state.items():
         if _sym_st not in {p["symbol"] for p in positions}:
@@ -2200,27 +2265,20 @@ def check_positions() -> None:
             continue
         _sym_std["_stale_alert_date"] = _stale_today
         try:
-            import requests as _rqst, os as _ost
-            _tok_st = _ost.getenv("TELEGRAM_BOT_TOKEN", "")
-            _cid_st = _ost.getenv("TELEGRAM_CHAT_ID", "")
-            if _tok_st and _cid_st:
-                _cur_p   = next((p for p in positions if p["symbol"] == _sym_st), None)
-                if _cur_p:
-                    _raw_plpc = float(_cur_p.get("unrealized_plpc", 0))
-                    if not (-1.0 <= _raw_plpc <= 5.0):
-                        _log.warning("[monitor] %s unrealized_plpc=%.4f outside expected [-1, 5] — check Alpaca API format", _sym_st, _raw_plpc)
-                    _pnl_st = _raw_plpc * 100
-                else:
-                    _pnl_st = 0.0
-                _days_st = _trading_days_held(_ed_st)
-                _rqst.post(
-                    f"https://api.telegram.org/bot{_tok_st}/sendMessage",
-                    json={"chat_id": _cid_st, "parse_mode": "Markdown",
-                          "text": ("Stale Position -- " + _sym_st + "\n"
-                                   + f"Held {_days_st} trading days - P&L {_pnl_st:+.1f}%\n"
-                                   + "Review: is the VCP thesis still valid?")},
-                    timeout=5)
-                changed = True
+            from notifications import _tg
+            _cur_p   = next((p for p in positions if p["symbol"] == _sym_st), None)
+            if _cur_p:
+                _raw_plpc = float(_cur_p.get("unrealized_plpc", 0))
+                if not (-1.0 <= _raw_plpc <= 5.0):
+                    _log.warning("[monitor] %s unrealized_plpc=%.4f outside expected [-1, 5] — check Alpaca API format", _sym_st, _raw_plpc)
+                _pnl_st = _raw_plpc * 100
+            else:
+                _pnl_st = 0.0
+            _days_st = _trading_days_held(_ed_st)
+            _tg(("Stale Position -- " + _sym_st + "\n"
+                 + f"Held {_days_st} trading days - P&L {_pnl_st:+.1f}%\n"
+                 + "Review: is the VCP thesis still valid?"))
+            changed = True
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
     # Clean up state for positions that are now closed — call close_trade()

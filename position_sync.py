@@ -136,13 +136,37 @@ def sync_all() -> dict:
 
     # Guard: Alpaca returning 0 positions + 0 orders while risk_state shows open
     # positions is almost certainly an API glitch — abort rather than ghost-wipe everything.
+    # Exception: if all tracked positions have exit flags in monitor_state, the sells
+    # were already submitted and cleanup just hasn't run yet — proceed normally.
     if not held_syms and not buy_syms:
         _risk_check = _load_risk()
         if _risk_check.get("positions_risk"):
-            raise SyncError(
-                f"Alpaca returned 0 positions + 0 orders but risk_state tracks "
-                f"{list(_risk_check['positions_risk'].keys())} — likely API glitch, aborting"
+            _exit_flags = (
+                "weekly_close_exited", "time_stopped", "max_loss_exited",
+                "max_hold_exited", "climax_exited",
             )
+            try:
+                import json as _jsync
+                _mon_sync = (_jsync.loads(_MONITOR_STATE.read_text())
+                             if _MONITOR_STATE.exists() else {})
+            except Exception:
+                _mon_sync = {}
+            _all_exited = all(
+                any(_mon_sync.get(sym, {}).get(flag) for flag in _exit_flags)
+                for sym in _risk_check["positions_risk"]
+            )
+            if _all_exited:
+                _log.warning(
+                    "[sync] Alpaca=0 positions; risk_state symbols %s all have exit flags "
+                    "— cleaning up post-sell state rather than aborting",
+                    list(_risk_check["positions_risk"].keys()))
+                # Fall through — ghost cleanup below will remove them from risk_state
+            else:
+                raise SyncError(
+                    f"Alpaca returned 0 positions + 0 orders but risk_state tracks "
+                    f"{list(_risk_check['positions_risk'].keys())} "
+                    f"— likely API glitch, aborting"
+                )
 
     changes: dict = {
         "ghost_orders_removed":    [],
