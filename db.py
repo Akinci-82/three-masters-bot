@@ -17,7 +17,7 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 # ── Migration flags ───────────────────────────────────────────────────────────
-SHADOW_WRITE_ENABLED: bool = False
+SHADOW_WRITE_ENABLED: bool = True
 READ_FROM_SQLITE:     bool = False
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
