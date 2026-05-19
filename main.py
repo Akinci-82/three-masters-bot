@@ -4356,7 +4356,7 @@ def _write_sector_rotation_report() -> None:
         from config import SECTOR_ETF_MAP as _etf_map
         import yfinance as _yf_sr
 
-        _spy = _yf_sr.Ticker("SPY").history(period="6mo", interval="1d", auto_adjust=True)
+        _spy = _yf_sr.Ticker("SPY").history(period="1y", interval="1d", auto_adjust=True)
         if _spy.empty or len(_spy) < 20:
             _log.warning("[f2] SPY data unavailable for sector report")
             return
@@ -4364,7 +4364,7 @@ def _write_sector_rotation_report() -> None:
         rows: list[dict] = []
         for sector, etf in _etf_map.items():
             try:
-                _df = _yf_sr.Ticker(etf).history(period="6mo", interval="1d", auto_adjust=True)
+                _df = _yf_sr.Ticker(etf).history(period="1y", interval="1d", auto_adjust=True)
                 if _df.empty or len(_df) < 20:
                     continue
                 _c = _df["Close"]
@@ -4390,7 +4390,7 @@ def _write_sector_rotation_report() -> None:
                     "rs_1m": _rs(21), "rs_3m": _rs(63), "rs_6m": _rs(126),
                     "abs_1m": _pct(21),
                     "ma50": "🟢" if _above_ma50 else "🔴",
-                    "score": _rs(21) + _rs(63) + _rs(6),  # simple composite
+                    "score": _rs(21) + _rs(63) + _rs(126),  # simple composite
                 })
             except Exception as _e:
                 _log.debug("[f2] sector %s: %s", sector, _e)
@@ -4599,9 +4599,11 @@ def _obsidian_git_commit(message: str) -> None:
                        capture_output=True, timeout=10)
         subprocess.run(["git", "-C", str(_VAULT_DIR), "commit", "-m", message],
                        capture_output=True, timeout=10)
-        _log.info("[obsidian] git commit: %s", message)
+        subprocess.run(["git", "-C", str(_VAULT_DIR), "push"],
+                       capture_output=True, timeout=20)
+        _log.info("[obsidian] git commit + push: %s", message)
     except Exception:
-        _log.debug("[obsidian] git commit failed", exc_info=True)
+        _log.debug("[obsidian] git commit/push failed", exc_info=True)
 
 def _write_obsidian_positions() -> None:
     """Write current open positions + risk state to vault. Called hourly."""
