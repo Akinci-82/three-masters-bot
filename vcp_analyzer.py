@@ -43,6 +43,7 @@ _SONNET_MODEL = CLAUDE_MODEL_DEEP   # sonnet-4-6
 _OPUS_MODEL   = CLAUDE_MODEL_ULTRA  # opus-4-7
 
 _TOKEN_LOG  = LOG_DIR / "token_usage.jsonl"
+import db as _va_db
 _VCP_CACHE  = LOG_DIR / "vcp_cache.json"
 
 _VCP_CACHE_LOCK = threading.Lock()
@@ -151,6 +152,7 @@ def _log_tokens(symbol: str, tier: str, model: str,
     }
     with _TOKEN_BUFFER_LOCK:
         _TOKEN_BUFFER.append(entry)
+        _va_db.record_api_usage(entry)
         if len(_TOKEN_BUFFER) >= 10:
             _flush_token_buffer()
 

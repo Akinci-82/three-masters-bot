@@ -20,6 +20,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from config import RISK, LOG_DIR
+import db as _rm_db
 
 _log = logging.getLogger(__name__)
 RISK_FILE = LOG_DIR / "risk_state.json"
@@ -31,6 +32,10 @@ _RISK_LOCK = threading.RLock()
 
 def _load() -> dict:
     with _RISK_LOCK:
+        if _rm_db.READ_FROM_SQLITE:
+            _sqlite_state = _rm_db.load_risk_state()
+            if _sqlite_state is not None:
+                return _sqlite_state
         try:
             with open(RISK_FILE) as f:
                 return json.load(f)
@@ -54,6 +59,7 @@ def _save(data: dict):
         with open(_tmp, "w") as f:
             json.dump(data, f, indent=2, default=str)
         _tmp.replace(RISK_FILE)  # atomic on POSIX — prevents half-written state on crash
+        _rm_db.save_risk_state(data)
 
 
 # module-level trade journal cache — avoids re-reading file on every call

@@ -157,9 +157,13 @@ def _read_jsonl(path: Path, tail: int = 20) -> list:
     return []
 
 
+import db as _dash_db
+
+
 def _append_equity_snapshot(equity: float):
     path  = BASE / "logs" / "equity_history.jsonl"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _dash_db.record_equity(today, equity)
     try:
         existing = _read_jsonl(path, tail=500)
         if existing and existing[-1].get("date") == today:

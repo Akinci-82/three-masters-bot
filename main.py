@@ -33,6 +33,7 @@ BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
 from notifications import _tg
+import db as _main_db
 from config import (
     LOG_DIR, REPORT_DIR, CHART_DIR,
     DAILY_TRIGGER_HOUR_CET, DAILY_TRIGGER_MIN_CET,
@@ -2532,6 +2533,7 @@ def _archive_old_jsonl(max_age_days: int = 180):
 
 def _run_daily_impl():
     """Actual pipeline — always called under _SCAN_LOCK."""
+    _main_db.init_db()
     _load_config_override()
     _heartbeat()
 

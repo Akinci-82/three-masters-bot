@@ -33,6 +33,7 @@ _log = logging.getLogger(__name__)
 _MONITOR_STATE = LOG_DIR / "monitor_state.json"
 _RISK_FILE     = LOG_DIR / "risk_state.json"
 _AUDIT_LOG     = LOG_DIR / "sync_audit.jsonl"
+import db as _ps_db
 
 _BROKER_RETRIES    = 3      # attempts before declaring Alpaca unreachable
 _BROKER_RETRY_SEC  = 5      # seconds between retries
@@ -85,6 +86,7 @@ def _audit(entry: dict) -> None:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
+    _ps_db.record_sync_audit(entry)
 
 
 def _alert(msg: str) -> None:

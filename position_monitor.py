@@ -19,6 +19,7 @@ import pytz
 import requests
 from notifications import _tg
 import yfinance as yf
+import db as _pm_db
 
 _log = logging.getLogger(__name__)
 
@@ -84,6 +85,9 @@ def _save_state(state: dict) -> None:
         with open(_tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(_tmp, _STATE_FILE)  # atomic on POSIX
+        if _pm_db.SHADOW_WRITE_ENABLED:
+            for _s, _d in state.items():
+                _pm_db.upsert_position(_s, _d)
     except Exception as e:
         _log.warning("[monitor] state save error: %s", e)
 
@@ -378,6 +382,7 @@ def _journal_trade(symbol: str, sym_data: dict, pnl_pct: float, portfolio_value:
             jf.write(_json.dumps(entry) + "\n")
         _log.info("[monitor] Trade journaled: %s pnl=%.1f%% (%.1fR)",
                   symbol, pnl_pct * 100, r_multiple)
+        _pm_db.append_trade(entry)
         _tg((
                               f"{_sign_jt} *{symbol}* {pnl_pct*100:+.1f}%"
                               f" ({r_multiple:+.1f}R) via {entry['exit_step']}"
@@ -448,6 +453,7 @@ def _run_postmortem(symbol: str, sym_data: dict, pnl_pct: float) -> None:
                     _jf.writelines(_lines)
                 os.replace(_tmp, _jpath)
                 _log.info("[monitor] Post-mortem %s: %s", symbol, postmortem[:80])
+                _pm_db.update_postmortem(_entry.get("ts", ""), symbol, postmortem)
     except Exception as _e:
         _log.debug("[monitor] postmortem failed %s: %s", symbol, _e)
 
@@ -2338,6 +2344,13 @@ def check_positions() -> None:
 
     if changed:
         _save_state(state)
+
+    # Fas 3: parity check — background, never raises
+    try:
+        import parity_check as _pc
+        _pc.run_all()
+    except Exception:
+        pass
 
 
 # ── Background thread entry point ─────────────────────────────────────────────
