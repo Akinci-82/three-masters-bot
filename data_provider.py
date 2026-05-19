@@ -337,7 +337,7 @@ def get_atm_options_oi(symbol: str, price: float) -> int | None:
         ticker = yf.Ticker(symbol)
         exps   = ticker.options
         if not exps:
-            return 0
+            return None  # no data, not truly illiquid
         today = pd.Timestamp.now()
         near  = next(
             (e for e in exps if 7 <= (pd.Timestamp(e) - today).days <= 45), None
@@ -345,8 +345,17 @@ def get_atm_options_oi(symbol: str, price: float) -> int | None:
         if near:
             ch = ticker.option_chain(near).calls
             if not ch.empty:
-                idx = (ch["strike"] - price).abs().idxmin()
-                return int(ch.loc[idx, "openInterest"] or 0)
+                # Sum OI across 5 nearest ATM strikes for more robust measure
+                _top5_idx = (ch["strike"] - price).abs().nsmallest(5).index
+                oi_sum = int(ch.loc[_top5_idx, "openInterest"].fillna(0).sum())
+                if oi_sum > 0:
+                    return oi_sum
+                # OI not yet updated (common early session / after weekend);
+                # sum volume across same 5 strikes as real-time liquidity proxy
+                vol_sum = int(ch.loc[_top5_idx, "volume"].fillna(0).sum())
+                if vol_sum > 0:
+                    return vol_sum
+                return None  # OI=0 and vol=0 — data lag, skip filter
     except Exception:
         _log.debug("[data] %s yfinance options failed", symbol)
 

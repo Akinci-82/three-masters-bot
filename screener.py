@@ -613,7 +613,8 @@ def _apply_options_filter(symbol: str, price: float, result: "TrendResult") -> b
 
 
 def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
-                  prefetched_df: pd.DataFrame | None = None) -> TrendResult:
+                  prefetched_df: pd.DataFrame | None = None,
+                  rs_override: float | None = None) -> TrendResult:
     try:
         ticker = yf.Ticker(symbol)
         if prefetched_df is not None and not prefetched_df.empty and len(prefetched_df) >= 150:
@@ -659,7 +660,8 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
         pct_from_high = (price - high_52w) / high_52w if high_52w != 0 else 0.0
         pct_from_low  = (price - low_52w)  / low_52w  if low_52w  != 0 else 0.0
 
-        rs  = _rs_rating(close, spy_close)
+        rs_raw = _rs_rating(close, spy_close)
+        rs     = rs_override if rs_override is not None else rs_raw
         rsi = _calc_rsi(close, cfg.get("rsi_period", 14))
 
         # RS momentum delta: compare current RS rating vs 4 weeks ago
@@ -699,7 +701,7 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
             ma200_slope_20d=ma200_slope,
             high_52w=high_52w, low_52w=low_52w,
             pct_from_high=pct_from_high, pct_from_low=pct_from_low,
-            rs_rating=rs, rsi=rsi, avg_volume=avg_vol,
+            rs_rating=rs_raw, rsi=rsi, avg_volume=avg_vol,
             days_to_earnings=days_earn, last_candle=last_candle,
             ad_ratio=ad_ratio,
             passed=False, df=df,
@@ -1335,8 +1337,29 @@ def run(symbols: list[str] | None = None, workers: int = 10) -> list[TrendResult
     results: list[TrendResult] = []
 
     _log.info("[screen] Screening %d symbols...", len(symbols))
+    # Pre-compute RS percentile ranks from bulk data so _check_symbol()
+    # can compare against percentile threshold (rs_min=70) rather than raw
+    # decimal excess returns (which are typically 0-6, never reaching 70).
+    _raw_rs_map: dict[str, float] = {}
+    for _sym_rs, _df_rs in bulk.items():
+        if _df_rs is not None and not _df_rs.empty and len(_df_rs) >= 60:
+            try:
+                _raw_rs_map[_sym_rs] = _rs_rating(_df_rs["Close"], spy_close)
+            except Exception:
+                pass
+    _rs_pct_map: dict[str, float] = {}
+    _valid_syms = [(s, v) for s, v in _raw_rs_map.items() if v != 0.0]
+    if len(_valid_syms) > 1:
+        _raw_arr = np.array([v for _, v in _valid_syms])
+        _ranks   = np.argsort(np.argsort(_raw_arr)).astype(float)
+        _pct     = np.clip(np.round((_ranks / (len(_raw_arr) - 1)) * 98 + 1), 1, 99)
+        for (_sym_p, _), _p_val in zip(_valid_syms, _pct):
+            _rs_pct_map[_sym_p] = float(_p_val)
+    _log.debug("[screen] RS percentile map: %d symbols ranked", len(_rs_pct_map))
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_check_symbol, sym, spy_close, cfg, bulk.get(sym)): sym
+        futures = {pool.submit(_check_symbol, sym, spy_close, cfg, bulk.get(sym),
+                               _rs_pct_map.get(sym, 50.0)): sym
                    for sym in symbols}
         for i, fut in enumerate(as_completed(futures), 1):
             try:
