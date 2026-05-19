@@ -94,6 +94,10 @@ VCP = {
     # Candlestick confirmation on entry candle
     "require_bullish_candle":   True,  # last candle should be bullish (close > open)
     "check_candle_patterns":    True,  # check for hammer / engulfing
+    # ATH Base override — Minervini flat base / shelf right under all-time high
+    "ath_proximity_pct":        0.08,  # within 8% of 60d high
+    "ath_max_depth":            0.08,  # base depth ≤ 8%
+    "ath_max_tight_rng":        0.08,  # handle range ≤ 8%
 }
 
 # ── Tudor Jones layer — Risk Management ──────────────────────────────────────

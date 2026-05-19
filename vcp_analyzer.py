@@ -203,6 +203,7 @@ class VCPResult:
     catalyst_score: float = 0.0         # parsed from ai_reasoning: strong/weak catalyst signals
     news_positive: bool = False          # Haiku news sentiment gate: positive headlines present
     news_negative: bool = False          # Haiku news sentiment gate: negative headlines → raised min_conf
+    setup_type: str = "vcp"              # "vcp" | "ath_base"
 
     @property
     def risk_reward(self) -> float:
@@ -310,40 +311,45 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
         if seg_ranges[i] < seg_ranges[i - 1] * 0.95
     )
 
-    if n_contractions < cfg.get("min_contractions", 2):
-        return False, {"reason": f"only_{n_contractions}_contractions"}
-
+    # Pre-compute metrics needed by both ATH Base and classic VCP checks
     pattern_high = float(high.quantile(0.97))
     current_low  = float(low.tail(10).min())
-    depth = (pattern_high - current_low) / pattern_high
-    if depth > cfg.get("max_depth_from_high", 0.35):
-        return False, {"reason": f"pattern_too_deep_{depth:.1%}"}
+    depth        = (pattern_high - current_low) / pattern_high
+    last10_h     = float(high.tail(10).max())
+    last10_l     = float(low.tail(10).min())
+    last10_c     = float(close.tail(10).mean())
+    tight_rng    = (last10_h - last10_l) / last10_c if last10_c > 0 else 1.0
+    _cur_price   = float(close.iloc[-1])
+    _pct_from_ath = (_cur_price - pattern_high) / pattern_high  # ≤ 0 if below high
 
-    # Handle depth rule: handle must not retrace >50% of cup advance
-    # Deep handles = failed breakout attempts or distribution — Minervini rejects these
-    _cup_bottom   = float(df_r["Low"].iloc[:-10].min())
-    _cup_advance  = pattern_high - _cup_bottom
-    _handle_depth = pattern_high - current_low
-    if _cup_advance > 0 and _handle_depth / _cup_advance > 0.50:
-        return False, {"reason": f"handle_too_deep_{_handle_depth/_cup_advance:.0%}_of_cup"}
-
-    # Base freshness: pattern high must have formed >= 25 bars ago (base has matured)
-    # A fresh pivot means price is still correcting; true VCP needs time to consolidate
-    _high_idx       = int(high.argmax())
-    _bars_since_high = len(high) - _high_idx - 1
-    _hi_min = cfg.get("pattern_high_min_bars", 5)
-    if _bars_since_high < _hi_min:
-        return False, {"reason": f"pattern_high_too_recent_{_bars_since_high}bars"}
-
-    # Final handle: last 10 bars.
-    # Breakout = handle HIGH, stop = handle LOW — correct Minervini pivot levels.
-    last10_h = float(high.tail(10).max())
-    last10_l = float(low.tail(10).min())
-    last10_c = float(close.tail(10).mean())
-    tight_rng = (last10_h - last10_l) / last10_c if last10_c > 0 else 1.0
-    max_tight = cfg.get("final_tight_pct", 0.08)
-    if tight_rng > max_tight:
-        return False, {"reason": f"not_tight_enough_{tight_rng:.1%}"}
+    # ATH Base override: tight shelf right under all-time high.
+    # Bypasses contraction-count and bars-since-high — ATH stocks SHOULD have a
+    # recent high; that is the definition of the setup (Minervini flat base / shelf).
+    _ath_prox  = cfg.get("ath_proximity_pct", 0.08)
+    _ath_depth = cfg.get("ath_max_depth",      0.08)
+    _ath_tight = cfg.get("ath_max_tight_rng",  0.08)
+    if abs(_pct_from_ath) <= _ath_prox and depth <= _ath_depth and tight_rng <= _ath_tight:
+        _setup_type = "ath_base"
+    else:
+        _setup_type = "vcp"
+        # Classic VCP checks — only run when ATH Base condition is not met
+        if n_contractions < cfg.get("min_contractions", 1):
+            return False, {"reason": f"only_{n_contractions}_contractions"}
+        if depth > cfg.get("max_depth_from_high", 0.35):
+            return False, {"reason": f"pattern_too_deep_{depth:.1%}"}
+        _cup_bottom   = float(df_r["Low"].iloc[:-10].min())
+        _cup_advance  = pattern_high - _cup_bottom
+        _handle_depth = pattern_high - current_low
+        if _cup_advance > 0 and _handle_depth / _cup_advance > 0.50:
+            return False, {"reason": f"handle_too_deep_{_handle_depth/_cup_advance:.0%}_of_cup"}
+        _high_idx        = int(high.argmax())
+        _bars_since_high = len(high) - _high_idx - 1
+        _hi_min          = cfg.get("pattern_high_min_bars", 5)
+        if _bars_since_high < _hi_min:
+            return False, {"reason": f"pattern_high_too_recent_{_bars_since_high}bars"}
+        max_tight = cfg.get("final_tight_pct", 0.15)
+        if tight_rng > max_tight:
+            return False, {"reason": f"not_tight_enough_{tight_rng:.1%}"}
 
     vol_ma   = float(volume.mean())
     vol_last = float(volume.tail(10).mean())
@@ -375,6 +381,7 @@ def _quantitative_vcp_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
         _n_handles = 1
 
     return True, {
+        "setup_type":             _setup_type,
         "contractions":           n_contractions,
         "pattern_depth_pct":      depth,
         "tight_rng_pct":          tight_rng,
@@ -956,9 +963,10 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
                          fail_reason=quant.get("reason", "quant_fail"),
                          last_candle=last_candle, tier_used="quant_fail")
 
-    breakout_vol = quant.get("breakout_volume", False)
-    breakout_lvl = quant.get("breakout_level", price)   # handle HIGH
-    stop_cand    = quant.get("stop_loss_candidate", price * 0.93)  # handle LOW
+    breakout_vol  = quant.get("breakout_volume", False)
+    breakout_lvl  = quant.get("breakout_level", price)   # handle HIGH
+    stop_cand     = quant.get("stop_loss_candidate", price * 0.93)  # handle LOW
+    _q_setup_type = quant.get("setup_type", "vcp")
 
     # -- Cache: skip Claude if same breakout setup seen today ---------------
     _vcp_cache = _load_vcp_cache()
@@ -1209,6 +1217,7 @@ def analyze(symbol: str, df: pd.DataFrame, last_candle: str = "neutral", fundame
         pattern_type=str(s_data.get("pattern_type", "vcp") or "vcp"),
         news_positive=_news_positive,
         news_negative=_news_negative,
+        setup_type=_q_setup_type,
     )
 
     if passed:
@@ -1280,6 +1289,7 @@ def batch_analyze(trend_passed: list, max_symbols: int = 50,
     haiku_rej   = sum(1 for r in results if "haiku" in r.tier_used)
     sonnet_n    = sum(1 for r in results if r.tier_used == "sonnet")
     opus_n      = sum(1 for r in results if r.tier_used == "opus")
-    _log.info("[vcp] Done: %d/%d passed | Quant-fail: %d | Haiku-rej: %d | Sonnet: %d | Opus: %d",
-              len(passed), len(results), quant_fail_n, haiku_rej, sonnet_n, opus_n)
+    ath_base_n   = sum(1 for r in results if r.setup_type == "ath_base")
+    _log.info("[vcp] Done: %d/%d passed | Quant-fail: %d | ATH-base: %d | Haiku-rej: %d | Sonnet: %d | Opus: %d",
+              len(passed), len(results), quant_fail_n, ath_base_n, haiku_rej, sonnet_n, opus_n)
     return results
