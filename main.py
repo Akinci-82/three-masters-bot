@@ -4398,6 +4398,16 @@ def _write_sector_rotation_report() -> None:
         if not rows:
             return
 
+        # Deduplicate: legacy aliases in SECTOR_ETF_MAP cause the same ETF
+        # to appear twice. Keep first occurrence per ETF ticker.
+        _seen_etfs: set[str] = set()
+        _deduped: list[dict] = []
+        for _row in rows:
+            if _row["etf"] not in _seen_etfs:
+                _seen_etfs.add(_row["etf"])
+                _deduped.append(_row)
+        rows = _deduped
+
         rows.sort(key=lambda r: r["score"], reverse=True)
 
         # Build markdown
