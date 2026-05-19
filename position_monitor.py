@@ -729,7 +729,6 @@ def check_positions() -> None:
         # Alert on 2nd consecutive failure (not every tick — avoids spam)
         if _sync_fail_count >= 2:
             try:
-                from notifications import _tg
                 _tg(f"🚨 *Three Masters — Monitor sync FAILED ×{_sync_fail_count}*\n"
                     f"`{e}`\nPositions NOT managed for {_sync_fail_count} cycles.")
             except Exception:
@@ -748,7 +747,6 @@ def check_positions() -> None:
     except AlpacaConnectionError as e:
         _log.error("[monitor] POSITIONS UNAVAILABLE - skipping entire cycle: %s", e)
         try:
-            from notifications import _tg
             _tg("🚨 *Three Masters — Monitor: can't fetch positions*\n"
                 f"`{e}`\nCycle skipped — positions NOT managed this tick.")
         except Exception:
@@ -2250,7 +2248,6 @@ def check_positions() -> None:
             continue
         _sym_std["_stale_alert_date"] = _stale_today
         try:
-            from notifications import _tg
             _cur_p   = next((p for p in positions if p["symbol"] == _sym_st), None)
             if _cur_p:
                 _raw_plpc = float(_cur_p.get("unrealized_plpc", 0))
