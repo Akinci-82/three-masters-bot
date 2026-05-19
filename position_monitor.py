@@ -729,16 +729,9 @@ def check_positions() -> None:
         # Alert on 2nd consecutive failure (not every tick — avoids spam)
         if _sync_fail_count >= 2:
             try:
-                token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-                chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-                if token and chat_id:
-                    requests.post(
-                        f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={"chat_id": chat_id, "parse_mode": "Markdown",
-                              "text": (f"🚨 *Three Masters — Monitor sync FAILED ×{_sync_fail_count}*\n"
-                                       f"`{e}`\nPositions NOT managed for {_sync_fail_count} cycles.")},
-                        timeout=8,
-                    )
+                from notifications import _tg
+                _tg(f"🚨 *Three Masters — Monitor sync FAILED ×{_sync_fail_count}*\n"
+                    f"`{e}`\nPositions NOT managed for {_sync_fail_count} cycles.")
             except Exception:
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
         # Auto-reconcile after 5 consecutive failures (≈75 min): at this point
@@ -755,17 +748,9 @@ def check_positions() -> None:
     except AlpacaConnectionError as e:
         _log.error("[monitor] POSITIONS UNAVAILABLE - skipping entire cycle: %s", e)
         try:
-            import os as _os_cp
-            _tok_cp = _os_cp.getenv("TELEGRAM_BOT_TOKEN", "")
-            _cid_cp = _os_cp.getenv("TELEGRAM_CHAT_ID", "")
-            if _tok_cp and _cid_cp:
-                requests.post(
-                    f"https://api.telegram.org/bot{_tok_cp}/sendMessage",
-                    json={"chat_id": _cid_cp, "parse_mode": "Markdown",
-                          "text": ("🚨 *Three Masters — Monitor: can't fetch positions*\n"
-                                   f"`{e}`\nCycle skipped — positions NOT managed this tick.")},
-                    timeout=8,
-                )
+            from notifications import _tg
+            _tg("🚨 *Three Masters — Monitor: can't fetch positions*\n"
+                f"`{e}`\nCycle skipped — positions NOT managed this tick.")
         except Exception:
             _log.debug("[%s] suppressed", __name__, exc_info=True)
         return
