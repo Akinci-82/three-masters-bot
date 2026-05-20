@@ -296,8 +296,10 @@ def run(log_dir: Optional[Path] = None, iterations: int = 1000,
             subprocess.run(["git", "-C", str(vault_dir), "commit", "-m",
                             f"backtest: report {date.today()}"],
                            capture_output=True, timeout=10)
+            subprocess.run(["git", "-C", str(vault_dir), "push"],
+                           capture_output=True, timeout=20)
         except Exception as e:
-            print(f"Git commit failed: {e}")
+            print(f"Git commit/push failed: {e}")
 
     if report_file:
         Path(report_file).write_text(report)

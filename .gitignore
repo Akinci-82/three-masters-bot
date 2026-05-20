@@ -10,3 +10,13 @@ charts/
 *.db
 *.pkl
 *.bak
+
+# Patch backup files
+*.p42bak
+*.p42p0bak
+*.p42p1bak
+*.p42p2bak
+*.p42p3bak
+
+# Runtime state
+state/

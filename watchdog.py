@@ -1,30 +1,32 @@
 """
 Three Masters Bot — Watchdog
-Run every 15 minutes via systemd timer (three-masters-watchdog.timer).
+Runs in a loop (--loop) inside its own Docker container, checking every 15 min.
 Reads logs/heartbeat.json. If stale (> STALE_MINUTES):
-  1. Auto-restart via `systemctl --user start three-masters-bot` (no sudo needed)
+  1. Auto-restart via Docker SDK (via /var/run/docker.sock)
   2. Send Telegram alert (with cooldown to avoid spam)
 """
 from __future__ import annotations
 import json
 import os
-import subprocess
-import sys
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from pathlib import Path
 
-BASE          = Path(__file__).parent
-HEARTBEAT     = BASE / "logs" / "heartbeat.json"
-ALERT_FLAG    = BASE / "logs" / "watchdog_alerted.json"
-RESTART_LOG   = BASE / "logs" / "watchdog_restart.log"
-ENV_FILE      = BASE / ".env"
-VENV_PYTHON   = BASE / "venv" / "bin" / "python"
-MAIN_PY       = BASE / "main.py"
-SERVICE_NAME  = "three-masters-bot.service"
+BASE           = Path(__file__).parent
+HEARTBEAT      = BASE / "logs" / "heartbeat.json"
+ALERT_FLAG     = BASE / "logs" / "watchdog_alerted.json"
+RESTART_LOG    = BASE / "logs" / "watchdog_restart.log"
+CONTAINER_NAME = "three-masters-bot"
 
-STALE_MINUTES    = 20   # heartbeat updates every 60s; 20 min covers slow startup
-DEADLOCK_MINUTES = 45   # stale THIS long with process running = real hang → alert
-COOLDOWN_MINUTES = 120  # don't send Telegram more than once per 2 hours
+STALE_MINUTES    = 20
+DEADLOCK_MINUTES = 45
+COOLDOWN_MINUTES = 120
+LOOP_INTERVAL_S  = 15 * 60
+
+
+def _docker_client():
+    import docker
+    return docker.DockerClient(base_url="unix:///var/run/docker.sock")
 
 
 def _heartbeat_age_minutes() -> float | None:
@@ -35,7 +37,7 @@ def _heartbeat_age_minutes() -> float | None:
         ts   = data.get("last_run") or data.get("last_heartbeat")
         if not ts:
             return None
-        dt  = datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(ts)
         from datetime import timezone as _tz
         dt_utc = dt.astimezone(_tz.utc) if dt.tzinfo else dt.replace(tzinfo=_tz.utc)
         return round((datetime.now(_tz.utc) - dt_utc).total_seconds() / 60, 1)
@@ -45,48 +47,27 @@ def _heartbeat_age_minutes() -> float | None:
 
 def _process_running() -> bool:
     try:
-        r = subprocess.run(
-            ["systemctl", "--user", "is-active", SERVICE_NAME],
-            capture_output=True, text=True, timeout=5,
-        )
-        return r.stdout.strip() == "active"
+        client = _docker_client()
+        container = client.containers.get(CONTAINER_NAME)
+        return container.status == "running"
     except Exception:
         return False
 
+
 def _restart() -> str:
-    # systemctl --user — no sudo required
     try:
-        r = subprocess.run(
-            ["systemctl", "--user", "start", SERVICE_NAME],
-            capture_output=True, text=True, timeout=15,
-        )
-        if r.returncode == 0:
-            return "restarted via systemctl --user"
-    except Exception:
-        pass
-
-    if _process_running():
-        return "process already running (heartbeat lag?)"
-
-    # Direct launch fallback
-    try:
-        log_path = BASE / "logs" / "watchdog_stdout.log"
-        with open(log_path, "a") as lf:
-            subprocess.Popen(
-                [str(VENV_PYTHON), str(MAIN_PY)],
-                cwd=str(BASE),
-                stdout=lf, stderr=lf,
-                start_new_session=True,
-            )
-        return "restarted via direct launch"
+        client = _docker_client()
+        container = client.containers.get(CONTAINER_NAME)
+        container.restart()
+        return "restarted via Docker SDK"
     except Exception as e:
-        return f"restart FAILED: {e}"
+        return "restart FAILED: " + str(e)
 
 
 def _log_restart(age: float, status: str) -> None:
     RESTART_LOG.parent.mkdir(exist_ok=True)
     with open(RESTART_LOG, "a") as f:
-        f.write(f"{datetime.now().isoformat()} | age={age:.0f}min | {status}\n")
+        f.write(datetime.now().isoformat() + " | age=" + str(int(age)) + "min | " + status + "\n")
 
 
 def _alert_on_cooldown() -> bool:
@@ -113,19 +94,17 @@ def _clear_alert() -> None:
 def _send_telegram(msg: str) -> None:
     try:
         import requests
-        from dotenv import load_dotenv
-        load_dotenv(ENV_FILE)
         token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         if not token or not chat_id:
             return
         requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
+            "https://api.telegram.org/bot" + token + "/sendMessage",
             json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
             timeout=10,
         )
     except Exception as e:
-        print(f"[watchdog] Telegram error: {e}")
+        print("[watchdog] Telegram error: " + str(e))
 
 
 def run() -> None:
@@ -135,57 +114,65 @@ def run() -> None:
         print("[watchdog] heartbeat.json missing")
         if not _process_running():
             status = _restart()
-            _log_restart(999, f"no heartbeat — {status}")
+            _log_restart(999, "no heartbeat — " + status)
             if not _alert_on_cooldown():
                 _send_telegram(
-                    "🔄 *Three Masters Watchdog*\n"
+                    "\U0001f504 *Three Masters Watchdog*\n"
                     "heartbeat.json missing — bot restarted\n"
-                    f"`{status}`"
+                    "`" + status + "`"
                 )
                 _record_alert()
         return
 
-    print(f"[watchdog] Last heartbeat: {age:.1f} min ago", end="")
+    print("[watchdog] Last heartbeat: " + str(age) + " min ago", end="")
 
     if age <= STALE_MINUTES:
         print(" — OK ✓")
         _clear_alert()
         return
 
-    print(f" — STALE (>{STALE_MINUTES} min)")
+    print(" — STALE (>" + str(STALE_MINUTES) + " min)")
 
     if _process_running():
         if age <= DEADLOCK_MINUTES:
-            # Process alive, scan probably in progress — normal during Claude analysis
-            print(f"[watchdog] Process running, scan likely in progress ({age:.0f} min) — OK")
+            print("[watchdog] Process running, scan likely in progress (" + str(int(age)) + " min) — OK")
             return
         else:
-            # Process alive but heartbeat >45 min stale — genuine hang/deadlock
-            print(f"[watchdog] DEADLOCK SUSPECTED — process running but {age:.0f} min no heartbeat")
-            status = "process running but no heartbeat for {:.0f} min — possible deadlock".format(age)
+            print("[watchdog] DEADLOCK SUSPECTED — process running but " + str(int(age)) + " min no heartbeat")
+            status = "process running but no heartbeat for " + str(int(age)) + " min — possible deadlock"
             _log_restart(age, status)
             if not _alert_on_cooldown():
                 _send_telegram(
-                    f"⚠️ *Three Masters Watchdog — Possible Deadlock*\n"
-                    f"Process is running but no heartbeat for *{age:.0f} min*\n"
-                    f"Bot may be frozen — check logs"
+                    "⚠️ *Three Masters Watchdog — Possible Deadlock*\n"
+                    "Process is running but no heartbeat for *" + str(int(age)) + " min*\n"
+                    "Bot may be frozen — check logs"
                 )
                 _record_alert()
             return
 
-    # Process is NOT running — genuine outage, restart and alert
     status = _restart()
-    print(f"[watchdog] {status}")
+    print("[watchdog] " + status)
     _log_restart(age, status)
 
     if not _alert_on_cooldown():
         _send_telegram(
-            f"🔄 *Three Masters Watchdog* — Bot restarted\n"
-            f"Last heartbeat: *{age:.0f} min ago*\n"
-            f"`{status}`"
+            "\U0001f504 *Three Masters Watchdog* — Bot restarted\n"
+            "Last heartbeat: *" + str(int(age)) + " min ago*\n"
+            "`" + status + "`"
         )
         _record_alert()
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--loop", action="store_true", help="Run continuously every 15 min")
+    args = parser.parse_args()
+
+    if args.loop:
+        print("[watchdog] Loop mode — checking every " + str(LOOP_INTERVAL_S // 60) + " min")
+        while True:
+            run()
+            time.sleep(LOOP_INTERVAL_S)
+    else:
+        run()
