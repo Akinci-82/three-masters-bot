@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.p42bak
+*.p42p0bak
+*.p42p1bak
+*.p42p2bak
+logs/
+state/
+charts/
+reports/
+.env
+tests/
