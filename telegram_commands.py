@@ -190,7 +190,7 @@ def _cmd_watchlist() -> str:
         _rdir = _o.path.join(_o.path.dirname(__file__), "reports")
         _files = sorted(_g.glob(_o.path.join(_rdir, "*.json")), reverse=True)
         if not _files:
-            return "📡 Ingen scan-rapport hittad ännu."
+            return "📡 No scan report found yet."
         with open(_files[0]) as _f:
             _rpt = _j.load(_f)
         _cands = _rpt.get("trend_candidates", [])
@@ -199,7 +199,7 @@ def _cmd_watchlist() -> str:
             return f"📡 Inga Stage 2-kandidater i senaste scan ({_date})."
         _lines = [
             f"📡 *Watchlist — Stage 2 radar ({_date})*",
-            f"_{len(_cands)} aktier i uptrend utan VCP-mönster ännu_",
+            f"_{len(_cands)} stocks in uptrend without VCP pattern yet_",
         ]
         for _c in _cands[:15]:
             _sym  = _tg_escape(_c.get("symbol", "?"))
@@ -216,7 +216,7 @@ def _cmd_watchlist() -> str:
             _lines.append(f"  *{_sym}* RS={_rs:.0f} {_pfh:.1f}%↓  {_sect}  {_b}".rstrip())
         return "\n".join(_lines)
     except Exception as _e:
-        return f"Fel vid hämtning av watchlist: {_e}"
+        return f"Error fetching watchlist: {_e}"
 
 
 def _cmd_briefing() -> str:
@@ -229,7 +229,7 @@ def _cmd_briefing() -> str:
             except Exception as _be:
                 _send(f"❌ Briefing-fel: {_be}")
         _thr.Thread(target=_bg, daemon=True, name="tg-briefing").start()
-        return "🌅 Kör morning briefing… (levereras om några sekunder)"
+        return "🌅 Running morning briefing... (delivered in a few seconds)"
     except Exception as _e:
         return f"Fel vid triggning av briefing: {_e}"
 
@@ -240,7 +240,7 @@ def _cmd_size(arg: str) -> str:
     if len(_parts) < 3:
         return (
             "📐 *Positionsstorlek-kalkylator*\n"
-            "Användning: `/size SYMBOL BUY STOP`\n"
+            "Usage: `/size SYMBOL BUY STOP`\n"
             "Exempel: `/size NVDA 500 475`"
         )
     try:
@@ -248,11 +248,11 @@ def _cmd_size(arg: str) -> str:
         _buy = float(_parts[1])
         _sl  = float(_parts[2])
         if _sl >= _buy:
-            return "❌ Stop loss måste vara under köp-priset."
+            return "❌ Stop loss must be below the buy price."
         from broker import get_account
         _acct      = get_account()
         _portfolio = float(_acct["portfolio_value"])
-        # 1.5% basrisk (standard), 1.75% för score≥7
+        # 1.5% base risk (default), 1.75% for score>=7
         _risk_base  = _portfolio * 0.015
         _risk_mid   = _portfolio * 0.0175
         _risk_hi    = _portfolio * 0.02
@@ -263,7 +263,7 @@ def _cmd_size(arg: str) -> str:
         return (
             f"📐 *Size — {_sym}*\n"
             f"Portfolio: ${_portfolio:,.0f}\n"
-            f"Köp ${_buy:.2f} | Stop ${_sl:.2f} | Risk/sh ${_rps:.2f}\n"
+            f"Buy ${_buy:.2f} | Stop ${_sl:.2f} | Risk/sh ${_rps:.2f}\n"
             f"\n"
             f"1.5% risk  → *{_sh_base} sh*  (${_sh_base*_buy:,.0f} notional)\n"
             f"1.75% risk → *{_sh_mid} sh*  (${_sh_mid*_buy:,.0f} notional)\n"
@@ -282,7 +282,7 @@ def _cmd_report() -> str:
         _rdir  = _o.path.join(_o.path.dirname(__file__), "reports")
         _files = sorted(_g.glob(_o.path.join(_rdir, "*.json")), reverse=True)
         if not _files:
-            return "📋 Ingen scan-rapport hittad ännu."
+            return "📋 No scan report found yet."
         with open(_files[0]) as _f:
             _rpt = _j.load(_f)
         _date    = _rpt.get("date", "?")
@@ -322,7 +322,7 @@ def _cmd_report() -> str:
             _lines.append(f"\n⚠️ Fel: {', '.join(str(_e) for _e in _errors[:3])}")
         return "\n".join(_lines)
     except Exception as _e:
-        return f"Fel vid hämtning av rapport: {_e}"
+        return f"Error fetching report: {_e}"
 
 
 def _cmd_risk() -> str:
@@ -345,7 +345,7 @@ def _cmd_risk() -> str:
         if _now >= _next:
             _next += _dt.timedelta(days=1)
         _mins = int((_next - _now).total_seconds() / 60)
-        _streak_str = (f"📉 {_losses} förluster i rad" if _losses > 0
+        _streak_str = (f"📉 {_losses} consecutive losses" if _losses > 0
                        else (f"📈 {_wins} vinster i rad" if _wins > 0 else "Ingen svit"))
         _halt_str = f"\n⛔ *HALT*: {_halt_r}" if _halted else ""
         return (
@@ -353,11 +353,11 @@ def _cmd_risk() -> str:
             f"{_emo} Regim: *{_regime}*\n"
             f"Heat: {_heat:.1f}% / 8%  |  Dag P&L: {_dpnl:+.1f}%\n"
             f"{_streak_str}\n"
-            f"Nästa scan: om {_mins // 60}h {_mins % 60}m"
+            f"Next scan: in {_mins // 60}h {_mins % 60}m"
             f"{_halt_str}"
         )
     except Exception as _e:
-        return f"Fel vid hämtning av risk-state: {_e}"
+        return f"Error fetching risk state: {_e}"
 
 
 def _cmd_live_orders() -> str:
@@ -365,10 +365,10 @@ def _cmd_live_orders() -> str:
     try:
         from broker import is_live
         if not is_live():
-            return "ℹ️ Bot kör i paper-läge — inga live-ordrar."
+            return "ℹ️ Bot running in paper mode — no live orders."
         pending_file = _LOG_DIR / "pending_live_orders.json"
         if not pending_file.exists():
-            return "✅ Inga väntande live-ordrar."
+            return "✅ No pending live orders."
         pending = json.loads(pending_file.read_text())
         # Purge expired entries
         now = datetime.now(timezone.utc)
@@ -384,8 +384,8 @@ def _cmd_live_orders() -> str:
                 active[sym] = o
         pending_file.write_text(json.dumps(active, indent=2))
         if not active:
-            return "✅ Inga väntande live-ordrar (alla har löpt ut)."
-        lines = ["📋 *Väntande live-ordrar* — bekräfta med /confirm\\_live:\n"]
+            return "✅ No pending live orders (all expired)."
+        lines = ["🌅 *Pending live orders* — confirm with /confirm\\_live:\n"]
         for sym, o in active.items():
             lines.append(
                 f"• *{_tg_escape(sym)}* {o['qty']}sh @ ${o['stop_price']:.2f} "
@@ -407,25 +407,25 @@ def _cmd_confirm_live(arg: str) -> str:
     try:
         from broker import is_live, place_buy_stop
         if not is_live():
-            return "⚠️ Bot kör i paper-läge (ALPACA\\_LIVE=true krävs för live-trading)."
+            return "⚠️ Bot running in paper mode (ALPACA\\_LIVE=true required for live trading)."
         parts = arg.strip().split()
         if len(parts) != 3:
-            return ("Användning: /confirm\\_live SYMBOL QTY PRICE\n"
+            return ("Usage: /confirm\\_live SYMBOL QTY PRICE\n"
                     "Exempel: /confirm\\_live NVDA 50 213.40")
         sym = parts[0].upper()
         try:
             qty   = int(parts[1])
             price = float(parts[2])
         except ValueError:
-            return "Ogiltigt format — QTY måste vara heltal och PRICE ett decimaltal."
+            return "Invalid format — QTY must be an integer and PRICE a decimal."
 
         pending_file = _LOG_DIR / "pending_live_orders.json"
         if not pending_file.exists():
-            return f"Ingen väntande order för {sym}."
+            return f"No pending order for {sym}."
         pending = json.loads(pending_file.read_text())
         order = pending.get(sym)
         if not order:
-            return (f"Ingen väntande order för *{_tg_escape(sym)}*.\n"
+            return (f"No pending order for *{_tg_escape(sym)}*.\n"
                     "Visa alla med /live\\_orders")
 
         # Check expiry
@@ -438,23 +438,23 @@ def _cmd_confirm_live(arg: str) -> str:
                 _tmp = pending_file.with_suffix(".json.tmp")
                 _tmp.write_text(json.dumps(pending, indent=2))
                 _tmp.replace(pending_file)
-                return (f"⏰ Order för *{_tg_escape(sym)}* har löpt ut (24h).\n"
-                        "Kör /scan för att generera en ny order.")
+                return (f"⏰ Order for *{_tg_escape(sym)}* has expired (24h).\n"
+                        "Run /scan to generate a new order.")
         except Exception:
             pass
 
         # Validate qty and price match
         if order["qty"] != qty:
-            return (f"Qty matchar inte: förväntad {order['qty']}, fick {qty}.\n"
+            return (f"Qty mismatch: expected {order['qty']}, got {qty}.\n"
                     f"Korrekt: `/confirm_live {sym} {order['qty']} {order['stop_price']:.2f}`")
         if abs(order["stop_price"] - price) > 0.02:
-            return (f"Pris matchar inte: förväntad ${order['stop_price']:.2f}, fick ${price:.2f}.\n"
+            return (f"Price mismatch: expected ${order['stop_price']:.2f}, got ${price:.2f}.\n"
                     f"Korrekt: `/confirm_live {sym} {qty} {order['stop_price']:.2f}`")
 
         # Place the live order
         result = place_buy_stop(sym, qty, price)
         if not result:
-            return f"❌ Order för *{_tg_escape(sym)}* misslyckades — se Alpaca-loggar."
+            return f"❌ Order for *{_tg_escape(sym)}* failed — check Alpaca logs."
 
         # Register trade in risk manager now that the order is actually placed.
         # This was intentionally deferred from queue time to prevent permanently
@@ -466,9 +466,9 @@ def _cmd_confirm_live(arg: str) -> str:
                 _reg(sym, risk_pct)
             except Exception as _reg_err:
                 _log.error("[confirm_live] register_trade failed for %s: %s", sym, _reg_err)
-                return (f"⚠️ *VARNING*: Order placerad men register\\_trade misslyckades för "
+                return (f"⚠️ *WARNING*: Order placed but register\\_trade failed for "
                         f"*{_tg_escape(sym)}*: `{_reg_err}`\n"
-                        f"Risk-budget ej uppdaterad — order kvar i kön för manuell åtgärd.")
+                        f"Risk budget not updated — order remains in queue for manual action.")
 
         # Remove from pending queue (atomic write)
         del pending[sym]
@@ -489,29 +489,29 @@ def _cmd_help() -> str:
         live_section = (
             "\n"
             "*Live-trading:*\n"
-            "/live\\_orders — visa väntande live-ordrar\n"
-            "/confirm\\_live SYMBOL QTY PRICE — bekräfta och skicka live-order\n"
+            "/live\\_orders — show pending live orders\n"
+            "/confirm\\_live SYMBOL QTY PRICE — confirm and send live order\n"
         ) if is_live() else ""
     except Exception:
         live_section = ""
     return (
         "🤖 *Three Masters Bot — Kommandon*\n"
         "\n"
-        "*Övervakning:*\n"
+        "*Monitoring:*\n"
         "/status — equity, heat, P&L\n"
         "/risk — snabb riskstatus (heat, drawdown, streak)\n"
         "/report — senaste scan-rapport (regime, VCP, ordrar)\n"
-        "/watchlist — Stage 2-radar utan VCP-mönster ännu\n"
+        "/watchlist — Stage 2 radar without VCP pattern yet\n"
         "\n"
         "*Positioner & ordrar:*\n"
-        "/positions — öppna positioner med P&L och steg\n"
-        "/orders — väntande buy-stop-ordrar\n"
-        "/cancel SYMBOL — avboka köp-stop för symbol\n"
+        "/positions — open positions with P&L and steps\n"
+        "/orders — pending buy-stop orders\n"
+        "/cancel SYMBOL — cancel buy-stop for symbol\n"
         "/size SYMBOL BUY STOP — positionsstorlek-kalkylator\n"
         "\n"
-        "*Åtgärder:*\n"
-        "/scan — kör dagens VCP-scan manuellt\n"
-        "/briefing — utlös morning briefing nu\n"
+        "*Actions:*\n"
+        "/scan — run today's VCP scan manually\n"
+        "/briefing — trigger morning briefing now\n"
         + live_section +
         "/help — denna lista"
     )
@@ -558,7 +558,7 @@ def _handle_update(update: dict) -> None:
         _send(_cmd_live_orders())
     elif cmd == "/confirm_live":
         if not arg:
-            _send("Användning: /confirm\\_live SYMBOL QTY PRICE\nEx: /confirm\\_live NVDA 50 213.40")
+            _send("Usage: /confirm\\_live SYMBOL QTY PRICE\nEx: /confirm\\_live NVDA 50 213.40")
         else:
             _send(_cmd_confirm_live(arg))
     elif cmd == "/scan":

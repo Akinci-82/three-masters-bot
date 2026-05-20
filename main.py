@@ -289,8 +289,8 @@ def _check_portfolio_drawdown_warning(portfolio_value: float) -> None:
         if _dd <= -0.05:
             _tg(
                 f"⚠️ *Portfolio Drawdown Warning*\n"
-                f"Portfölj ${portfolio_value:,.0f} — {_dd*100:.1f}% från peak ${_peak:,.0f}\n"
-                f"Handel fortsätter — men överväg att minska risken."
+                f"Portfolio ${portfolio_value:,.0f} — {_dd*100:.1f}% from peak ${_peak:,.0f}\n"
+                f"Trading continues — consider reducing risk."
             )
     except Exception as _dde:
         _log.debug("[main] dd_warn: %s", _dde)
@@ -334,8 +334,8 @@ def _check_bot_idle_alert() -> None:
             _tg(
                 f"ℹ️ *Bot inaktiv — {_bdays} handelsdagar utan trade*\n"
                 f"Senaste trade: {_last_dt.strftime('%Y-%m-%d')}\n"
-                f"Möjliga orsaker: bear-läge, högt min\\_confidence, inga VCP-mönster,"
-                f" eller för strikta screener-filter."
+                f"Possible causes: bear regime, high min\\_confidence, no VCP patterns,"
+                f" or overly strict screener filters."
             )
     except Exception as _idle_e:
         _log.debug("[main] idle_alert: %s", _idle_e)
@@ -673,7 +673,7 @@ def _send_morning_briefing() -> None:
                         )
                         lines.append(f"     Orsak: `{_fail_vr}`")
                         if _qual_vr > 0 or _conf_vr > 0:
-                            lines.append(f"     Poäng: quality={_qual_vr:.1f}/10 | conf={_conf_vr:.0%} | setup={_setup_vr}")
+                            lines.append(f"     Score: quality={_qual_vr:.1f}/10 | conf={_conf_vr:.0%} | setup={_setup_vr}")
                         if _rsn_vr:
                             lines.append(f"     _{_rsn_vr}_")
 
@@ -703,9 +703,9 @@ def _send_morning_briefing() -> None:
                             f"RS={_rs_t:.0f}{_d4w_str} | {_pfh_t:.1f}% u\u00e4 topp{_flag_str_t}"
                         )
 
-                # ── Screener near-misses: hög RS men failade ett gate ──────
+                # ── Screener near-misses: high RS but failed a gate ──────
                 if _near_miss:
-                    lines.append(f"\n*\u26a0\ufe0f Screener — nära men failade ({len(_near_miss)}):*")
+                    lines.append(f"\n*\u26a0\ufe0f Screener — near misses ({len(_near_miss)}):*")
                     for _nm in _near_miss[:10]:
                         _sym_nm  = _nm["symbol"]
                         _rs_nm   = _nm.get("rs_rating", 0)
@@ -1162,7 +1162,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                         lines.append(
                             f"  ⚠️ AVVIKELSE {_dir}{_abs_diff:.0%}  "
                             f"BT={_bt_wr_ref:.0%} vs Live={_live_wr:.0%}")
-                        lines.append(f"  Möjlig overfitting — granska signals!")
+                        lines.append(f"  Possible overfitting — review signals!")
                     elif _abs_diff >= 0.10:
                         lines.append(
                             f"  🔶 Avvikelse {_dir}{_abs_diff:.0%}  "
@@ -1200,7 +1200,7 @@ def _send_weekly_report(portfolio_value: float) -> None:
                         _bkt_lines.append(
                             f"  Score {_lbkt}: live {_lwr:.0%}  ({_ln} trades)")
                 if _bkt_lines:
-                    lines.append("  *Score-bucket jämförelse:*")
+                    lines.append("  *Score-bucket comparison:*")
                     lines.extend(_bkt_lines)
 
                 # Flag underperforming signals from signal_accuracy.json
@@ -1268,7 +1268,7 @@ def _run_sunday_opus_analysis() -> None:
         risk_state    = json.loads(rs_file.read_text())  if rs_file.exists() else {}
 
         if not monitor_state:
-            _tg("🧠 *Opus Söndagsanalys*\nInga öppna positioner att analysera idag.")
+            _tg("🧠 *Opus Sunday Analysis*\nNo open positions to analyze today.")
             return
 
         # Recent 30-day trades
@@ -1313,8 +1313,8 @@ def _run_sunday_opus_analysis() -> None:
             pos_lines.append(
                 f"- {sym} ({sect}): {shares}st @ ${avg:.2f}, "
                 f"stop ${stop:.2f} ({risk_p:.1f}% risk), "
-                f"P&L ~{pnl:+.1f}%, {days}d hållen, "
-                f"steg: {'+'.join(steps) if steps else 'A (initial)'}"
+                f"P&L ~{pnl:+.1f}%, {days}d held, "
+                f"steps: {'+'.join(steps) if steps else 'A (initial)'}"
             )
 
         heat   = risk_state.get("portfolio_heat", 0) * 100
@@ -1325,25 +1325,25 @@ def _run_sunday_opus_analysis() -> None:
             f"  {t.get('symbol','?')}: {t.get('r_multiple',0):+.2f}R "
             f"({t.get('pnl_pct',0):+.1f}%) exit={t.get('exit_step','?')}"
             for t in recent_trades[-10:]
-        ) or "  (inga avslutade trades)"
+        ) or "  (no closed trades)"
 
-        prompt = f"""Du är en senior portföljförvaltare med Minervini/Simons/Tudor Jones-metodik.
-Analysera portföljkvaliteten och ge EXAKT 3 konkreta rekommendationer numrerade 1–3.
+        prompt = f"""You are a senior portfolio manager using Minervini/Simons/Tudor Jones methodology.
+Analyze portfolio quality and give EXACTLY 3 concrete numbered recommendations 1-3.
 
-PORTFÖLJ ({len(monitor_state)} positioner | heat={heat:.1f}% | regim={regime} | cons.losses={cons_l}):
+PORTFOLIO ({len(monitor_state)} positions | heat={heat:.1f}% | regime={regime} | cons.losses={cons_l}):
 {chr(10).join(pos_lines)}
 
-SENASTE 30D AVSLUTADE TRADES ({len(recent_trades)} st):
+LAST 30D CLOSED TRADES ({len(recent_trades)} total):
 {trade_lines}
 
 {bt_summary}
 
-Fokusera på:
-(1) Vilken/vilka positioner är starkast/svagast risk-reward just nu?
-(2) Finns sektorkoncen­tration eller korrelationsrisk?
-(3) Konkret exit-planering — vad bör göras DENNA vecka?
+Focus on:
+(1) Which position(s) have the strongest/weakest risk-reward right now?
+(2) Is there sector concentration or correlation risk?
+(3) Concrete exit planning — what should be done THIS week?
 
-Max 280 ord totalt. Svara på svenska. Var direkt och specifik — nämn symbolnamn."""
+Max 280 words total. Be direct and specific — name symbols."""
 
         client   = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
         resp     = client.messages.create(
@@ -1353,8 +1353,8 @@ Max 280 ord totalt. Svara på svenska. Var direkt och specifik — nämn symboln
         )
         analysis = resp.content[0].text.strip()
         _tg(
-            f"🧠 *Opus Söndagsanalys — {date.today()}*\n"
-            f"_{len(monitor_state)} öppna positioner | heat {heat:.1f}% | {regime}_\n\n"
+            f"🧠 *Opus Sunday Analysis — {date.today()}*\n"
+            f"_{len(monitor_state)} open positions | heat {heat:.1f}% | {regime}_\n\n"
             f"{analysis}"
         )
         _log.info("[opus_weekly] Portfolio analysis sent (%d in / %d out tokens)",
@@ -1384,7 +1384,7 @@ _last_midday_check_date: date | None = None
 
 
 def _run_midday_momentum_check() -> None:
-    """Haiku midday check (13:00 ET) — håll/stram stop per open position."""
+    """Haiku midday check (13:00 ET) — hold/tighten stop per open position."""
     try:
         import anthropic as _ant
         from config import CLAUDE_MODEL, ANTHROPIC_API_KEY
@@ -1426,11 +1426,11 @@ def _run_midday_momentum_check() -> None:
 
                 prompt = (
                     f"{sym}: pris ${curr_price:.2f} (entry ${avg_cost:.2f}, P&L {pnl_p:+.1f}%), "
-                    f"stop ${stop:.2f} ({stop_dist_p:.1f}% distans), "
-                    f"sista 5m vol {curr_vol:,} ({vol_ratio:.1f}x av dagssnitt), "
-                    f"gårdagens high ${prev_high:.2f}, gårdagens vol {int(prev_vol):,}. "
-                    f"Det är 13:00 ET mitt på handelsdagen. "
-                    f"Svara EXAKT med 'HÅLL' eller 'STRAM STOP' följt av EN mening varför. "
+                    f"stop ${stop:.2f} ({stop_dist_p:.1f}% distance), "
+                    f"last 5m vol {curr_vol:,} ({vol_ratio:.1f}x of day avg), "
+                    f"yesterday's high ${prev_high:.2f}, yesterday's vol {int(prev_vol):,}. "
+                    f"It is 13:00 ET midday. "
+                    f"Reply EXACTLY with 'HOLD' or 'TIGHTEN STOP' followed by ONE sentence explaining why. "
                     f"Max 30 ord."
                 )
 
@@ -1440,7 +1440,7 @@ def _run_midday_momentum_check() -> None:
                     messages=[{"role": "user", "content": prompt}],
                 )
                 verdict = resp.content[0].text.strip()
-                emoji   = "✅" if verdict.upper().startswith("HÅLL") else "⚠️"
+                emoji   = "✅" if verdict.upper().startswith("HOLD") else "⚠️"
                 results.append(
                     f"{emoji} *{sym}* ${curr_price:.2f} ({pnl_p:+.1f}%): {verdict}"
                 )
@@ -3710,20 +3710,20 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
     breadth  = report.get("breadth_pct", 0.5)
     _regime_emoji = {"bull": "🟢", "neutral": "🟡", "bear": "🔴"}.get(regime, "⚪")
 
-    # ── Meddelande 1: Marknadsöversikt ───────────────────────────────────────
+    # ── Message 1: Market overview ───────────────────────────────────────────
     ov = [
-        f"📊 *THREE MASTERS — DAGLIG RAPPORT*",
+        f"📊 *THREE MASTERS — DAILY REPORT*",
         f"📅 {report['date']} | Regim: {_regime_emoji} {regime.upper()}",
         f"",
-        f"*Marknadsdata*",
+        f"*Market Data*",
         f"  SPY: {spy_pct*100:+.1f}% vs MA200"
         + (f" | VIX: {vix:.1f}" if vix else ""),
-        f"  Marknadsbredd: {breadth*100:.0f}% ovan MA50",
-        f"  Portfölj: ${portfolio:,.0f}" + (f" | {ret_line}" if ret_line else ""),
+        f"  Market breadth: {breadth*100:.0f}% above MA50",
+        f"  Portfolio: ${portfolio:,.0f}" + (f" | {ret_line}" if ret_line else ""),
         f"",
         f"*Pipeline*",
-        f"  Trend Template: {trend_n} godkända",
-        f"  VCP-mönster: {vcp_n} bekräftade",
+        f"  Trend Template: {trend_n} passed",
+        f"  VCP patterns: {vcp_n} confirmed",
         f"  Ordrar lagda: {len(orders)}",
     ]
     if not orders and not report.get("vcp_candidates"):
@@ -3732,21 +3732,21 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             _n_trend = _summary.replace("no_vcp_", "").replace("_trend", "")
             _cands = report.get("trend_candidates", [])
             if _cands:
-                ov.append(f"\n📡 {_n_trend} aktier i Stage 2 uptrend — inget VCP-mönster ännu. Se radar nedan.")
+                ov.append(f"\n📡 {_n_trend} stocks in Stage 2 uptrend — no VCP pattern yet. See radar below.")
             else:
-                ov.append(f"\n⛔ {_n_trend} aktier i uptrend — inget VCP-mönster idag")
+                ov.append(f"\n⛔ {_n_trend} stocks in uptrend — no VCP pattern today")
         else:
             _gate = (_summary
-                     .replace("macro_blackout_", "Makro-stopp: ")
-                     .replace("bear_regime_no_orders", "Björnmarknad — inga långa ordrar")
-                     .replace("breadth_gate_neutral_no_orders", "Breddgate: Neutral regim")
-                     .replace("breadth_gate_bear_no_orders", "Breddgate: Björnmarknad")
+                     .replace("macro_blackout_", "Macro blackout: ")
+                     .replace("bear_regime_no_orders", "Bear regime — no long orders")
+                     .replace("breadth_gate_neutral_no_orders", "Breadth gate: Neutral regime")
+                     .replace("breadth_gate_bear_no_orders", "Breadth gate: Bear regime")
                      .replace("earnings_cluster_", "Earnings-kluster: ").replace("_positions", " positioner"))
             if _gate:
                 ov.append(f"\n⛔ {_gate}")
     _tg("\n".join(ov))
 
-    # ── Meddelande per order: Detaljerat handelskort ─────────────────────────
+    # ── Per-order message: Detailed trade card ───────────────────────────────
     for i, o in enumerate(orders, 1):
         sym     = o["symbol"]
         entry   = o["buy_stop"]
@@ -3775,9 +3775,9 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         # Signalbadge-lista
         sigs = []
         if o.get("rs_line_high"):
-            sigs.append("⭐ RS-linje på 52v-high")
+            sigs.append("⭐ RS line at 52w-high")
         if o.get("breakout_vol"):
-            sigs.append("🔥 Volymbekräftad breakout")
+            sigs.append("🔥 Volume-confirmed breakout")
         if o.get("three_weeks_tight"):
             sigs.append("🔒 3-weeks tight (Minervini)")
         if o.get("eps_accelerating"):
@@ -3788,7 +3788,7 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             sigs.append("📊 Weekly Stage 2")
         eps_g = o.get("eps_growth")
         if eps_g is not None and eps_g >= 0.10:
-            sigs.append(f"💰 EPS-tillväxt {eps_g*100:.0f}%")
+            sigs.append(f"💰 EPS growth {eps_g*100:.0f}%")
         if o.get("unusual_options"):
             sigs.append("🐋 Ovanlig options-aktivitet (institutionell)")
         if o.get("pead_hold"):
@@ -3797,7 +3797,7 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         if o.get("news_positive"):
             sigs.append("📰 Positiva nyheter")
         if not sigs:
-            sigs.append("Standardsetup (alla grundfilter godkända)")
+            sigs.append("Standard setup (all base filters passed)")
 
         # AI-analys (max 220 tecken)
         ai_full = o.get("ai_reasoning_full", "") or o.get("vcp_notes", "")
@@ -3807,30 +3807,30 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             f"━━━━━━━━━━━━━━━━━━━━━━━━━",
             f"🎯 *{sym}* ({i}/{len(orders)}) — {sect}",
             f"━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"⚡ Score {cs:.1f}/10 | Q{q}/5 | Konf {conf*100:.0f}% | RS {rs:.0f}"
+            f"⚡ Score {cs:.1f}/10 | Q{q}/5 | Conf {conf*100:.0f}% | RS {rs:.0f}"
             + (f" ↗+{rs_delta:.0f}p" if rs_delta > 5 else "") + f" | {pattern}",
             f"",
             f"📥 *ENTRY*",
             f"  Buy-stop: *${entry:.2f}*",
             f"  Nuvarande: ${cur_p:.2f} ({cur_gap:+.1f}% vs entry)",
-            f"  Ordern triggas automatiskt när ${entry:.2f} bryts uppåt",
+            f"  Order triggers automatically when ${entry:.2f} breaks out",
             f"",
             f"🛡️ *STOP LOSS*",
-            f"  *${sl:.2f}*  (−{sl_pct:.1f}% från entry)",
-            f"  Maxförlust om stop träffas: *${risk_kr:.0f}*",
+            f"  *${sl:.2f}*  (−{sl_pct:.1f}% from entry)",
+            f"  Max loss if stop hit: *${risk_kr:.0f}*",
             f"",
-            f"💰 *SÄLJPLAN*",
+            f"💰 *SELL PLAN*",
             f"  C  (+8%)  → ${c_be:.2f}  Flytta stop till breakeven",
-            f"  T1 (+{b1_pct*100:.0f}%) → ${b1_ex:.2f}  Sälj 33% av position",
-            f"  T2 (+12-20%) → Pyramid +30% om stöd på MA20",
-            f"  T3 → *${target:.2f}*  Sälj 33% till (measured move {mm_pct*100:.0f}%)",
-            f"  Trailer: 5% trailing stop på resten efter T3",
-            f"  ⏱ Time stop: Stäng om <+2% efter 15 handelsdagar",
-            f"  📉 Weekly: Stäng om veckoavslut under MA10w",
+            f"  T1 (+{b1_pct*100:.0f}%) → ${b1_ex:.2f}  Sell 33% of position",
+            f"  T2 (+12-20%) → Pyramid +30% if support on MA20",
+            f"  T3 → *${target:.2f}*  Sell 33% more (measured move {mm_pct*100:.0f}%)",
+            f"  Trailer: 5% trailing stop on remainder after T3",
+            f"  ⏱ Time stop: Close if <+2% after 15 trading days",
+            f"  📉 Weekly: Close if weekly close below MA10w",
             f"",
             f"📐 *STORLEK & RISK*",
             f"  {shares} aktier | ~${notional:,.0f} investerat",
-            f"  Risk: ${risk_kr:.0f} ({risk_p:.1f}% portfölj) | R/R: {rr:.1f}:1",
+            f"  Risk: ${risk_kr:.0f} ({risk_p:.1f}% portfolio) | R/R: {rr:.1f}:1",
             f"",
             f"🔑 *SIGNALER*",
         ]
@@ -3841,21 +3841,21 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             card.append(f"💬 *ANALYS*")
             card.append(f"  _{ai_clip}_")
         card.append(f"")
-        card.append(f"🕯 Stearinljus: {o.get('last_candle','?')} | Sektor: {sect}")
+        card.append(f"🕯 Candle: {o.get('last_candle','?')} | Sector: {sect}")
         _tg("\n".join(card))
 
     if not orders:
-        _tg("*Inga ordrar idag* — villkoren för att handla är inte uppfyllda.")
+        _tg("*No orders today* — trading conditions not met.")
 
-    # ── Radar: Trend Template-kandidater utan VCP-mönster än ─────────────────
-    # Visas när inga VCP bekräftades idag. Dessa aktier är i Stage 2 uptrend
-    # och kan bilda VCP-mönster inom dagar/veckor. Bevaka dem.
+    # ── Radar: Trend Template candidates without VCP pattern yet ──────────────
+    # Shown when no VCP confirmed today. These stocks are in Stage 2 uptrend
+    # and may form a VCP pattern within days/weeks. Watch them.
     _trend_cands = report.get("trend_candidates", [])
     if _trend_cands and vcp_n == 0:
         radar_lines = [
             f"📡 *RADAR — {len(_trend_cands)} Stage 2 Aktier (ingen VCP idag)*",
-            f"Dessa aktier uppfyller Trend Template men har inget bekräftat VCP-mönster.",
-            f"Bevaka för möjlig entry när basen komprimerar.",
+            f"These stocks pass Trend Template but have no confirmed VCP pattern.",
+            f"Watch for possible entry when the base compresses.",
             f"",
         ]
         for c in _trend_cands[:12]:
@@ -3877,13 +3877,13 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             radar_lines.append(
                 f"🔹 *{sym}*  ${price:.2f}  RS {rs:.0f}"
                 + (f" ↗+{rd:.0f}p" if rd > 5 else "")
-                + f"  {pfh:.1f}% under 52v-high (${h52:.2f})"
+                + f"  {pfh:.1f}% below 52w-high (${h52:.2f})"
                 + f"\n   {sect}"
                 + (f"\n{sig_str3}" if sig_str3 else "")
             )
         _tg("\n".join(radar_lines))
 
-    # ── Watchlist: VCP-kandidater som avvisades av riskfiltren ───────────────
+    # ── Watchlist: VCP candidates rejected by risk filters ────────────────────
     _noise   = {"already held", "order retained", "price extended past breakout"}
     _rej_map = {sym: rsn for sym, rsn in report.get("reject_reasons", {}).items()
                 if rsn not in _noise}
@@ -3892,12 +3892,12 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
                    if c["symbol"] not in {o["symbol"] for o in orders}]
 
     if _watchlist or _rej_map:
-        wl_lines = [f"📋 *WATCHLIST — Avvisade VCP-kandidater*", ""]
+        wl_lines = [f"📋 *WATCHLIST — Rejected VCP Candidates*", ""]
         _shown = set()
         for c in _watchlist[:8]:
             sym = c["symbol"]
             _shown.add(sym)
-            rej = _rej_map.get(sym, "risk/marknads-filter")
+            rej = _rej_map.get(sym, "risk/market-filter")
             entry  = c.get("breakout_level", 0.0)
             sl     = c.get("stop_loss", 0.0)
             target_mm = round(entry * (1 + c.get("measured_move_pct", 0.15)), 2) if entry > 0 else 0
@@ -3910,8 +3910,8 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
             sig_str = " | ".join(sigs2) if sigs2 else ""
             wl_lines.append(
                 f"🔸 *{sym}* (Score {c['composite_score']:.1f} | Q{c['quality_score']}/5 | RS {c['rs_rating']:.0f})\n"
-                f"   Entry: ${entry:.2f} | SL: ${sl:.2f} | Mål: ${target_mm:.2f}\n"
-                f"   Avvisad: _{rej}_"
+                f"   Entry: ${entry:.2f} | SL: ${sl:.2f} | Target: ${target_mm:.2f}\n"
+                f"   Rejected: _{rej}_"
                 + (f"\n   {sig_str}" if sig_str else "")
             )
         for sym, rsn in list(_rej_map.items())[:6]:
@@ -3920,14 +3920,14 @@ def _send_daily_summary(report: dict, trend_n: int, vcp_n: int, portfolio: float
         _blocked = report.get("vcp_found_no_orders", [])
         if _blocked:
             wl_lines.append("")
-            wl_lines.append("*Blockerade av marknadsgaten:*")
+            wl_lines.append("*Blocked by market gate:*")
             for sym in _blocked[:6]:
                 wl_lines.append(f"  ⏸ {sym}")
         _tg("\n".join(wl_lines))
 
-    # ── Fel ──────────────────────────────────────────────────────────────────
+    # ── Errors ───────────────────────────────────────────────────────────────
     if report.get("errors"):
-        _tg(f"⚠️ *Fel under scan*\n" + "\n".join(f"  • {e}" for e in report["errors"]))
+        _tg(f"⚠️ *Errors during scan*\n" + "\n".join(f"  • {e}" for e in report["errors"]))
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -4292,22 +4292,22 @@ def _write_obsidian_daily_note(report: dict, portfolio_value: float) -> None:
             f"# Scan {today}",
             f"",
             f"## Portfolio",
-            f"- Värde: ${portfolio_value:,.0f}",
+            f"- Value: ${portfolio_value:,.0f}",
         ]
         if ret_line:
-            lines.append(f"- Avkastning: {ret_line}")
+            lines.append(f"- Return: {ret_line}")
 
         lines += [
             f"",
-            f"## Scan-resultat",
-            f"- Trend Template godkände: {trend_n} aktier",
-            f"- VCP bekräftade: {vcp_n} aktier",
+            f"## Scan Results",
+            f"- Trend Template passed: {trend_n} stocks",
+            f"- VCP confirmed: {vcp_n} stocks",
             f"- Ordrar lagda: {len(orders)}",
         ]
 
         if orders:
             lines += ["", "## Placerade ordrar", ""]
-            lines.append("| Symbol | Buy-stop | Stop-loss | Composite | Sektor |")
+            lines.append("| Symbol | Buy-stop | Stop-loss | Composite | Sector |")
             lines.append("|--------|----------|-----------|-----------|--------|")
             for o in orders:
                 sym  = o.get("symbol", "?")
@@ -4356,11 +4356,11 @@ def _update_obsidian_performance() -> None:
             f"",
             f"# Three Masters — Performance Stats",
             f"",
-            f"*Uppdateras automatiskt efter varje daglig scan.*",
+            f"*Auto-updated after each daily scan.*",
             f"",
-            f"## Statistik ({total} avslutade trades)",
+            f"## Stats ({total} closed trades)",
             f"",
-            f"| Metric | Värde |",
+            f"| Metric | Value |",
             f"|--------|-------|",
             f"| Win rate | {wr:.0%} |",
             f"| Avg win | {avg_w:+.2f}R |",
@@ -4591,7 +4591,7 @@ def _write_sector_rotation_report() -> None:
             f"# Sektor-rotation Dashboard", "",
             f"*Uppdaterad: {_today} (dagligen efter market close)*", "",
             f"## RS vs SPY", "",
-            f"| # | Sektor | ETF | 1m RS | 3m RS | 6m RS | MA50 |",
+            f"| # | Sector | ETF | 1m RS | 3m RS | 6m RS | MA50 |",
             f"|---|--------|-----|-------|-------|-------|------|",
         ]
         for i, r in enumerate(rows, 1):
@@ -4706,16 +4706,16 @@ def _write_live_vs_paper_report() -> None:
 
         _lines = [
             f"---", f"updated: {_today}", f"---", "",
-            f"# Live vs Paper — Veckojämförelse", "",
-            f"*Uppdaterad: {_today}*", "",
-            f"## Konton",
+            f"# Live vs Paper — Weekly Comparison", "",
+            f"*Updated: {_today}*", "",
+            f"## Accounts",
             f"| | Live | Paper |",
             f"|--|------|-------|",
             f"| Equity | ${float(_live_acc.get('equity',0)):,.0f} | ${float(_paper_acc.get('equity',0)):,.0f} |",
             f"| Dag P&L | ${float(_live_acc.get('equity',0))-float(_live_acc.get('last_equity',float(_live_acc.get('equity',0)))):+,.0f} | ${float(_paper_acc.get('equity',0))-float(_paper_acc.get('last_equity',float(_paper_acc.get('equity',0)))):+,.0f} |",
             "",
-            f"## Positioner",
-            f"| Symbol | Live P&L | Paper P&L | Delta | Anm |",
+            f"## Positions",
+            f"| Symbol | Live P&L | Paper P&L | Delta | Notes |",
             f"|--------|----------|-----------|-------|-----|",
         ]
 

@@ -551,7 +551,7 @@ def create_app():
       <div class="stat-sub" id="s-losses" style="margin-top:10px">—</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label" title="Andel S&amp;P 500-aktier ovanför sitt 50-dagars glidande medelvärde">Market Breadth</div>
+      <div class="stat-label" title="Share of S&amp;P 500 stocks above their 50-day moving average">Market Breadth</div>
       <div class="stat-value" id="s-breadth">—</div>
       <div class="stat-sub" id="s-breadth-sub">% above MA50</div>
     </div>
@@ -700,13 +700,13 @@ def create_app():
       <table>
         <thead><tr>
           <th>Symbol</th><th>Qty</th><th>Sector</th><th>Days</th>
-          <th title="BE=Breakeven höjd (+8%), P1=50% partiell exit (+15%), P2=2:a partiell exit">Steps</th>
+          <th title="BE=Breakeven raised (+8%), P1=50% partial exit (+15%), P2=2nd partial exit">Steps</th>
           <th title="Relative Strength Rating mot SPY (0–100)">RS</th>
-          <th title="Nästa earnings-datum">Earnings</th>
+          <th title="Next earnings date">Earnings</th>
           <th>Avg Cost</th><th>Current</th><th>P&amp;L %</th><th>P&amp;L $</th>
-          <th title="Maximum Adverse Excursion / Maximum Favorable Excursion — sämsta och bästa kurs sedan entry">MAE / MFE</th>
+          <th title="Maximum Adverse Excursion / Maximum Favorable Excursion — worst and best price since entry">MAE / MFE</th>
           <th title="Stop-loss: nuvarande pris och initial pris">Stop $</th>
-          <th title="Avstånd i % från nuvarande pris till stop-loss">SL Distance</th>
+          <th title="Distance in % from current price to stop-loss">SL Distance</th>
           <th title="Maximalt riskbelopp i USD om stop triggas">Max Risk</th>
         </tr></thead>
         <tbody id="positions-body"><tr class="empty-row"><td colspan="15">Loading…</td></tr></tbody>
@@ -723,9 +723,9 @@ def create_app():
       <table>
         <thead><tr>
           <th>Symbol</th><th>Qty</th><th>Stop</th><th>Current</th><th>Gap</th>
-          <th title="Vol=volymsbekräftad breakout, ⭐=RS-line på 52v-high">Vol / RS</th>
-          <th title="Risk:Reward-ratio (mål: ≥2.5:1)">R:R</th>
-          <th title="AI-konfidenspoäng från Minervini Tier 2-analys (0–100%)">Conf</th>
+          <th title="Vol=volume-confirmed breakout, ⭐=RS-line at 52w-high">Vol / RS</th>
+          <th title="Risk:Reward ratio (target: ≥2.5:1)">R:R</th>
+          <th title="AI confidence score from Minervini Tier 2 analysis (0–100%)">Conf</th>
           <th title="Quality Score 0–5 (Minervini breakout-kvalitet)">Q</th>
           <th title="Composite Score 0–10 (Simons 60% + Minervini 30% + Tudor Jones 10%)">Score</th>
         </tr></thead>
@@ -737,7 +737,7 @@ def create_app():
   <!-- ── Signal Accuracy ─────────────────────────────────────────────────── -->
   <div class="table-card">
     <button class="screener-toggle" onclick="this.nextElementSibling.classList.toggle('open')">
-      &#9660; Signal Accuracy — win rate per screener-signal (klicka för att visa)
+      &#9660; Signal Accuracy — win rate per screener signal (click to expand)
     </button>
     <div class="screener-body" id="signal-accuracy-body">
       <div class="sig-empty">Laddar…</div>
@@ -863,9 +863,9 @@ def create_app():
     }
 
     function stepsBadge(p) {
-      const be = p.breakeven_done  ? '<span class="step-done"  title="Breakeven höjd">BE</span>'  : '<span class="step-pending" title="Väntar på +8%">BE</span>';
-      const p1 = p.partial1_done   ? '<span class="step-done"  title="50% såld vid +15%">P1</span>' : '<span class="step-pending" title="Väntar på +15%">P1</span>';
-      const p2 = p.partial2_done   ? '<span class="step-done"  title="2:a partiell exit gjord">P2</span>' : '<span class="step-pending" title="Ännu ej">P2</span>';
+      const be = p.breakeven_done  ? '<span class="step-done"  title="Breakeven raised">BE</span>'  : '<span class="step-pending" title="Waiting for +8%">BE</span>';
+      const p1 = p.partial1_done   ? '<span class="step-done"  title="50% sold at +15%">P1</span>' : '<span class="step-pending" title="Waiting for +15%">P1</span>';
+      const p2 = p.partial2_done   ? '<span class="step-done"  title="2nd partial exit done">P2</span>' : '<span class="step-pending" title="Not yet">P2</span>';
       return `<div class="steps-wrap">${be}${p1}${p2}</div>`;
     }
 
@@ -1214,7 +1214,7 @@ def create_app():
                 ? (() => {
                     const raised = p.stop_loss_initial && p.stop_loss > p.stop_loss_initial;
                     return `<span class="num" style="font-size:12px;font-variant-numeric:tabular-nums">$${p.stop_loss}`
-                      + (raised ? `<span class="stop-raised" title="Höjd från $${p.stop_loss_initial}">&#9650;</span>` : '')
+                      + (raised ? `<span class="stop-raised" title="Raised from $${p.stop_loss_initial}">&#9650;</span>` : '')
                       + (p.stop_loss_initial && p.stop_loss === p.stop_loss_initial ? `<span class="muted" style="font-size:10px;margin-left:4px">(initial)</span>` : '')
                       + '</span>';
                   })()
@@ -1244,8 +1244,8 @@ def create_app():
         if (ord.length) {
           document.getElementById('orders-count').textContent = ord.length+' order'+(ord.length!==1?'s':'');
           document.getElementById('orders-body').innerHTML = ord.map(o=>{
-            const volCell  = o.breakout_vol ? '<span class="vol-confirmed" title="Volym bekräftad">🔥</span>' : '<span class="muted">—</span>';
-            const rsHi     = o.rs_line_high ? '<span class="rs-at-high" title="RS-line på 52v-high">⭐</span>' : '';
+            const volCell  = o.breakout_vol ? '<span class="vol-confirmed" title="Volume confirmed">🔥</span>' : '<span class="muted">—</span>';
+            const rsHi     = o.rs_line_high ? '<span class="rs-at-high" title="RS-line at 52w-high">⭐</span>' : '';
             const tooltip  = o.vcp_notes ? ` title="${o.vcp_notes.replace(/"/g,"'")}"` : '';
             return `<tr${tooltip} style="${o.vcp_notes?'cursor:help':''}">
               <td><span class="sym">${o.symbol}</span>${rsHi}</td>
@@ -1280,20 +1280,20 @@ def create_app():
         const saEl = document.getElementById('signal-accuracy-body');
         const saEntries = Object.entries(sa).filter(([,v])=>v.wins+v.losses>0);
         const SIG_LABELS = {
-          rs_line_at_high:'RS-line på 52v-high', rs_line_leading:'RS-line ledande',
-          eps_accelerating:'EPS-acceleration', rev_accelerating:'Omsättningstillväxt',
+          rs_line_at_high:'RS-line at 52w-high', rs_line_leading:'RS-line leading',
+          eps_accelerating:'EPS acceleration', rev_accelerating:'Revenue growth',
           three_weeks_tight:'3 Weeks Tight', pocket_pivot:'Pocket Pivot',
           insider_buying:'Insider Buying', industry_leader:'Industry Leader',
           eps_revision_up:'EPS-revision upp', accum_weeks_strong:'Starka ackumulationsveckor',
-          analyst_pt_upside:'Analytiker PT-upside', inst_ownership_increasing:'Inst. ägande ökar',
-          near_ath:'Nära ATH', weekly_stage2:'Veckodiagram Stage 2',
+          analyst_pt_upside:'Analyst PT upside', inst_ownership_increasing:'Inst. ownership rising',
+          near_ath:'Near ATH', weekly_stage2:'Weekly Stage 2',
           pead_hold:'PEAD Hold', vol_contraction_quality:'Vol-kontraktion',
           weekly_stage2:'Veckodiagram Stage 2', analyst_upgrades:'Analytiker-uppgraderingar',
           at_52w_high:'52v-high', obv_new_high:'OBV New High',
           weekly_breakout_aligned:'Weekly Breakout Aligned',
         };
         if (saEntries.length === 0) {
-          saEl.innerHTML = '<div class="sig-empty">Ingen data ännu — win rates byggs upp efter avslutade trades.</div>';
+          saEl.innerHTML = '<div class="sig-empty">No data yet — win rates build up after closed trades.</div>';
         } else {
           const sorted = saEntries.sort(([,a],[,b])=>(b.wins+b.losses)-(a.wins+a.losses));
           saEl.innerHTML = '<div class="sig-grid">' + sorted.map(([key,v])=>{

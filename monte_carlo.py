@@ -2,13 +2,13 @@
 """
 Three Masters Bot — Monte Carlo Simulering
 
-Slumpar ordningen på avslutade backtest-trades 1000× och beräknar distribution av:
+Shuffles the order of closed backtest trades 1000x and computes the distribution of:
   - Slutkapital (startkapital = $100k, 2% risk per trade)
   - Max drawdown per simulering
-  - Sharpe-ratio (riskfri ränta = 4%)
+  - Sharpe ratio (risk-free rate = 4%)
 
-Användning:
-    python monte_carlo.py                             # läser logs/backtest_results.json
+Usage:
+    python monte_carlo.py                             # reads logs/backtest_results.json
     python monte_carlo.py --file logs/custom.json    # alternativ fil
     python monte_carlo.py --n 5000                   # fler iterationer
     python monte_carlo.py --risk 0.015               # 1.5% risk per trade
@@ -23,11 +23,11 @@ import numpy as np
 
 from config import LOG_DIR
 
-_RISK_FREE_RATE = 0.04   # 4% annual riskfri ränta för Sharpe
+_RISK_FREE_RATE = 0.04   # 4% annual risk-free rate for Sharpe
 
 
 def _max_drawdown(equity: list[float]) -> float:
-    """Beräknar max drawdown som procentandel av peak."""
+    """Computes max drawdown as a percentage of peak equity."""
     peak = equity[0]
     max_dd = 0.0
     for e in equity:
@@ -40,7 +40,7 @@ def _max_drawdown(equity: list[float]) -> float:
 
 
 def _sharpe(returns: list[float], risk_free_annual: float = _RISK_FREE_RATE) -> float:
-    """Sharpe-ratio (annualiserad) från trade-returns."""
+    """Annualised Sharpe ratio from trade returns."""
     if len(returns) < 2:
         return 0.0
     arr = np.array(returns)
@@ -48,7 +48,7 @@ def _sharpe(returns: list[float], risk_free_annual: float = _RISK_FREE_RATE) -> 
     std = arr.std(ddof=1)
     if std == 0:
         return 0.0
-    # Antagande: ~252 handelsdagar/år, varje trade ≈ 1 observation
+    # Assumption: ~252 trading days/year, each trade ≈ 1 observation
     return float((avg - risk_free_annual / 252) / std * np.sqrt(252))
 
 
@@ -59,15 +59,15 @@ def run_monte_carlo(
     risk_per_trade: float = 0.02,
 ) -> dict:
     """
-    Kör n_sims Monte Carlo-iterationer.
+    Run n_sims Monte Carlo iterations.
     Varje iteration: blanda trade-ordningen, simulera equity-kurva med fast risk%.
 
-    Returnerar dict med percentil-stats för slutkapital, drawdown och Sharpe.
+    Returns dict with percentile stats for final equity, drawdown and Sharpe.
     """
     if not trades:
         return {}
 
-    pnl_pcts = [t["pnl_pct"] for t in trades]   # redan beräknade som decimaler
+    pnl_pcts = [t["pnl_pct"] for t in trades]   # already computed as decimals
 
     final_caps: list[float]  = []
     max_dds:    list[float]  = []
@@ -128,7 +128,7 @@ def run_monte_carlo(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Three Masters Monte Carlo")
     parser.add_argument("--file",   default=str(LOG_DIR / "backtest_results.json"),
-                        help="Sökväg till backtest_results.json")
+                        help="Path to backtest_results.json")
     parser.add_argument("--n",      type=int,   default=1000, help="Antal simuleringar")
     parser.add_argument("--risk",   type=float, default=0.02, help="Risk per trade (0.02 = 2%%)")
     parser.add_argument("--capital", type=float, default=100_000.0, help="Startkapital")
@@ -136,7 +136,7 @@ def main() -> None:
 
     data_path = Path(args.file)
     if not data_path.exists():
-        print(f"Filen {data_path} hittades inte. Kör backtest.py först.")
+        print(f"File {data_path} not found. Run backtest.py first.")
         return
 
     with open(data_path) as f:
@@ -144,7 +144,7 @@ def main() -> None:
 
     trades = bt.get("trades", [])
     if not trades:
-        print("Inga trades i filen — kör backtest.py --min-score 0 för att generera data.")
+        print("No trades in file — run backtest.py --min-score 0 to generate data.")
         return
 
     print(f"Monte Carlo: {len(trades)} trades × {args.n} iterationer "
@@ -166,7 +166,7 @@ Slutkapital (startade ${res['start_capital']:,.0f}):
   Median:          ${fc['median']:>12,.0f}
   75:e percentil:  ${fc['p75']:>12,.0f}
   95:e percentil:  ${fc['p95']:>12,.0f}
-  Medelvärde:      ${fc['mean']:>12,.0f}
+  Mean:            ${fc['mean']:>12,.0f}
 
 Max Drawdown:
   Median:          {dd['p50']:>5.1f}%
@@ -176,7 +176,7 @@ Max Drawdown:
 Sharpe-ratio (annualiserad):
   Median:          {sh['p50']:>6.2f}
   95:e percentil:  {sh['p95']:>6.2f}
-  Medelvärde:      {sh['mean']:>6.2f}
+  Mean:            {sh['mean']:>6.2f}
 
 Ruinrisk (kapital → 0): {res['ruin_pct']:.1f}%
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""")
