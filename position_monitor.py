@@ -1068,10 +1068,12 @@ def check_positions() -> None:
                     if _sv_oid:
                         sym["stop_order_id"] = _sv_oid
                         changed = True
+                    _sv_status = (f"Re-placed trailing stop 7% (id={_sv_oid})" if _sv_oid
+                                  else "Re-placement FAILED — position unprotected")
                     _tg((
                                           f"\u26a0\ufe0f *Stop Missing — {symbol}*\n"
-                                          f"GTC stop not found on Alpaca\n"
-                                          f"{_status}"
+                                          f"GTC stop not found on Alpaca (was {_tracked_id or 'unknown'})\n"
+                                          f"{_sv_status}"
                                       ))
             except Exception as _sve:
                 _log.debug("[monitor] stop_revalidation %s: %s", symbol, _sve)
@@ -1208,7 +1210,7 @@ def check_positions() -> None:
                             "(EMA20=%.2f ATR14=%.2f)",
                             symbol, _old_ksl, _keltner_low, _ema20, _katr14)
                         # P0-fix: also update the live Alpaca GTC stop order
-                        _kelt_qty = int(sym.get("shares", sym.get("qty", 0)))
+                        _kelt_qty = qty - sym.get("partial_qty", 0)
                         if _kelt_qty > 0:
                             _cancel_stop_orders(symbol)
                             _new_kelt_oid = _place_stop(symbol, _kelt_qty, _keltner_low)
@@ -1439,14 +1441,33 @@ def check_positions() -> None:
         if needs_stop:
             _cancel_stop_orders(symbol)
             if use_hard_stop:
-                oid = _place_stop(symbol, qty, stop_loss_level)
-                if oid:
-                    sym["trailing_stop_placed"] = True
-                    sym["stop_order_id"] = oid
-                    sym["stop_type"] = "hard_pivot"
-                    changed = True
-                    _log.info("[monitor] %s HARD STOP at $%.2f (VCP pivot low)",
-                              symbol, stop_loss_level)
+                # Guard: if stop level is at or above current price the stop has already
+                # been breached (e.g. gap-down past pivot). Alpaca rejects such orders.
+                # Fall back to immediate market sell so the position doesn't bleed unchecked.
+                if stop_loss_level >= cur_price:
+                    _ns_rem = qty - sym.get("partial_qty", 0)
+                    _log.warning(
+                        "[monitor] %s STOP BREACHED: SL $%.2f >= cur $%.2f — "
+                        "market sell %d sh (stop cannot be placed)",
+                        symbol, stop_loss_level, cur_price, _ns_rem)
+                    if _ns_rem > 0 and _place_market_sell(symbol, _ns_rem):
+                        sym["max_loss_exited"] = True
+                        changed = True
+                        _tg((
+                            f"🔴 *Stop Breached — {symbol}*\n"
+                            f"SL ${stop_loss_level:.2f} ≥ price ${cur_price:.2f} — "
+                            f"stop cannot be placed\n"
+                            f"Forced market sell {_ns_rem} sh"
+                        ))
+                else:
+                    oid = _place_stop(symbol, qty, stop_loss_level)
+                    if oid:
+                        sym["trailing_stop_placed"] = True
+                        sym["stop_order_id"] = oid
+                        sym["stop_type"] = "hard_pivot"
+                        changed = True
+                        _log.info("[monitor] %s HARD STOP at $%.2f (VCP pivot low)",
+                                  symbol, stop_loss_level)
             else:
                 _eff_trail = sym.get("atr_trail_pct", trail_pct)
                 oid = _place_trailing_stop(symbol, qty, _eff_trail)
