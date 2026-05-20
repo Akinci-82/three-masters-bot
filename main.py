@@ -2640,6 +2640,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
               cash: float, positions: list) -> None:
     """Inner scan — separated so the hard timeout can wrap it cleanly."""
 
+    from screener import get_sector
     _breadth_pct    = 0.5   # updated after screener run
     _breadth_trend  = 0     # +1=rising -1=falling 0=flat vs 3-day avg
     _ad_divergence  = False # True if SPY up but breadth falling (computed after screener)
@@ -2970,7 +2971,6 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     _log.info("\n[LAYER 3 — TUDOR JONES] Position sizing & order placement...")
     from risk_manager import position_size, register_trade, check_can_trade
     from broker import place_buy_stop
-    from screener import get_sector
     from config import RISK
 
     held_symbols = {p["symbol"] for p in positions}
