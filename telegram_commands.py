@@ -222,16 +222,20 @@ def _cmd_watchlist() -> str:
 def _cmd_briefing() -> str:
     """Trigger morning briefing immediately in background thread."""
     try:
-        import main as _m, threading as _thr
+        import sys, threading as _thr
+        # Use sys.modules['__main__'] — avoids re-importing main.py as a new
+        # module which would re-run module-level signal.signal() calls and
+        # raise "signal only works in main thread" from a background thread.
+        _m = sys.modules["__main__"]
         def _bg():
             try:
                 _m._send_morning_briefing()
             except Exception as _be:
-                _send(f"❌ Briefing-fel: {_be}")
+                _send(f"❌ Briefing error: {_be}")
         _thr.Thread(target=_bg, daemon=True, name="tg-briefing").start()
         return "🌅 Running morning briefing... (delivered in a few seconds)"
     except Exception as _e:
-        return f"Fel vid triggning av briefing: {_e}"
+        return f"❌ Error triggering briefing: {_e}"
 
 
 def _cmd_size(arg: str) -> str:
