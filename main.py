@@ -609,16 +609,22 @@ def _send_morning_briefing() -> None:
                 _rpt_date    = _rpt_br.get("date", "?")
                 _trend_n     = len(_rpt_br.get("trend_passed", []))
                 _vcp_cands   = _rpt_br.get("vcp_candidates", [])
+                _vcp_rej     = _rpt_br.get("vcp_rejected", [])
                 _trend_cands = _rpt_br.get("trend_candidates", [])
                 _near_miss   = _rpt_br.get("near_misses", [])
                 _held_syms   = {p["symbol"] for p in positions}
+                _vcp_n       = len(_rpt_br.get("vcp_passed", []))
 
-                lines.append(f"\n\U0001f4ca *Scan {_rpt_date} — {_trend_n} i uptrend*")
+                lines.append(
+                    f"\n\U0001f4ca *Scan {_rpt_date}*\n"
+                    f"Trend Template: {_trend_n} | VCP: {_vcp_n} | "
+                    f"VCP-reject: {len(_vcp_rej)} | Near-miss: {len(_near_miss)}"
+                )
 
-                # VCP-kandidater (Minervini-konfirmerade)
+                # ── VCP-kandidater (Minervini + Claude-konfirmerade) ──────
                 _vcp_show = [c for c in _vcp_cands if c["symbol"] not in _held_syms]
                 if _vcp_show:
-                    lines.append(f"*\u2705 VCP-kandidater ({len(_vcp_show)}):*")
+                    lines.append(f"\n*\u2705 VCP-kandidater ({len(_vcp_show)}):*")
                     for _vc in _vcp_show[:6]:
                         _sym_v  = _vc["symbol"]
                         _pr_v   = _vc.get("current_price", 0)
@@ -628,6 +634,7 @@ def _send_morning_briefing() -> None:
                         _mm_v   = _vc.get("measured_move_pct", 0) * 100
                         _cs_v   = _vc.get("composite_score", 0)
                         _sect_v = _vc.get("sector", "")
+                        _pat_v  = _vc.get("pattern_type", "")
                         _flags_v = []
                         if _vc.get("eps_accelerating"):  _flags_v.append("EPS\u2191")
                         if _vc.get("three_weeks_tight"): _flags_v.append("3WT")
@@ -635,55 +642,88 @@ def _send_morning_briefing() -> None:
                         if _vc.get("rs_line_high"):      _flags_v.append("RS\u2728")
                         if _vc.get("unusual_options"):   _flags_v.append("\U0001f525OPT")
                         _flag_str_v = " " + " ".join(_flags_v) if _flags_v else ""
-                        _reason_v = (_vc.get("ai_reasoning") or "")[:100]
+                        _reason_v = (_vc.get("ai_reasoning") or "")[:120]
                         lines.append(
                             f"  \U0001f3af *{_sym_v}* ${_pr_v:.2f} | RS={_rs_v:.0f} | "
                             f"Breakout ${_bl_v:.2f} | Stop ${_sl_v:.2f} | "
                             f"Target +{_mm_v:.0f}%{_flag_str_v}"
                         )
-                        if _sect_v:
-                            lines.append(f"     Sektor: {_sect_v} | Score: {_cs_v:.1f}")
+                        if _sect_v or _pat_v:
+                            lines.append(f"     {_sect_v} | {_pat_v} | Score: {_cs_v:.1f}")
                         if _reason_v:
                             lines.append(f"     _{_reason_v}_")
 
-                # Trend-kandidater (uptrend men inte VCP ännu)
-                _vcp_syms_br = {c["symbol"] for c in _vcp_cands}
+                # ── VCP-rejected: passade Trend Template men stoppades av Claude ──
+                _vcp_rej_show = [r for r in _vcp_rej if r["symbol"] not in _held_syms]
+                if _vcp_rej_show:
+                    lines.append(f"\n*\U0001f916 VCP-analys — stoppades ({len(_vcp_rej_show)}):*")
+                    for _vr in _vcp_rej_show[:10]:
+                        _sym_vr   = _vr["symbol"]
+                        _rs_vr    = _vr.get("rs_rating", 0)
+                        _pr_vr    = _vr.get("price", 0)
+                        _tier_vr  = _vr.get("tier_label", _vr.get("tier_used", "?"))
+                        _fail_vr  = _vr.get("fail_reason", "?")
+                        _conf_vr  = _vr.get("confidence", 0)
+                        _qual_vr  = _vr.get("quality_score", 0)
+                        _rsn_vr   = (_vr.get("ai_reasoning") or "")[:150]
+                        _setup_vr = _vr.get("setup_type", "")
+                        lines.append(
+                            f"  \u274c *{_sym_vr}* ${_pr_vr:.2f} | RS={_rs_vr:.0f} | "
+                            f"[{_tier_vr}]"
+                        )
+                        lines.append(f"     Orsak: `{_fail_vr}`")
+                        if _qual_vr > 0 or _conf_vr > 0:
+                            lines.append(f"     Poäng: quality={_qual_vr:.1f}/10 | conf={_conf_vr:.0%} | setup={_setup_vr}")
+                        if _rsn_vr:
+                            lines.append(f"     _{_rsn_vr}_")
+
+                # ── Trend-kandidater (uptrend men ej VCP-analyserade) ─────
+                _vcp_syms_br = {c["symbol"] for c in _vcp_cands} | {r["symbol"] for r in _vcp_rej}
                 _trend_only  = [c for c in _trend_cands
                                 if c["symbol"] not in _vcp_syms_br
                                 and c["symbol"] not in _held_syms]
                 if _trend_only:
-                    lines.append(f"*\U0001f4c8 Uptrend (väntar på VCP) ({len(_trend_only)}):*")
+                    lines.append(f"\n*\U0001f4c8 Uptrend — ej VCP-analyserade ({len(_trend_only)}):*")
                     for _tc in _trend_only[:8]:
                         _sym_t  = _tc["symbol"]
                         _pr_t   = _tc.get("price", 0)
                         _rs_t   = _tc.get("rs_rating", 0)
                         _pfh_t  = _tc.get("pct_from_high", 0) * 100
+                        _d4w_t  = _tc.get("rs_delta_4w", 0)
                         _flags_t = []
                         if _tc.get("eps_accelerating"):  _flags_t.append("EPS\u2191")
                         if _tc.get("three_weeks_tight"): _flags_t.append("3WT")
                         if _tc.get("rs_line_leading"):   _flags_t.append("RS\u2728")
                         if _tc.get("weekly_stage2"):     _flags_t.append("S2")
+                        if _tc.get("pead_hold"):         _flags_t.append("PEAD")
                         _flag_str_t = " " + " ".join(_flags_t) if _flags_t else ""
+                        _d4w_str = f" RS4w={_d4w_t:+.0f}" if _d4w_t else ""
                         lines.append(
                             f"  \U0001f4c8 *{_sym_t}* ${_pr_t:.2f} | "
-                            f"RS={_rs_t:.0f} | {_pfh_t:.1f}% u\u00e4 topp{_flag_str_t}"
+                            f"RS={_rs_t:.0f}{_d4w_str} | {_pfh_t:.1f}% u\u00e4 topp{_flag_str_t}"
                         )
 
-                # Near-misses — hög RS men failade ett filter
+                # ── Screener near-misses: hög RS men failade ett gate ──────
                 if _near_miss:
-                    lines.append(f"*\u26a0\ufe0f Nära men failade ({len(_near_miss)}):*")
-                    for _nm in _near_miss[:8]:
+                    lines.append(f"\n*\u26a0\ufe0f Screener — nära men failade ({len(_near_miss)}):*")
+                    for _nm in _near_miss[:10]:
                         _sym_nm  = _nm["symbol"]
                         _rs_nm   = _nm.get("rs_rating", 0)
                         _rsi_nm  = _nm.get("rsi", 0)
                         _pr_nm   = _nm.get("price", 0)
                         _fail_nm = _nm.get("fail_reason", "?")
+                        _pfh_nm  = _nm.get("pct_from_high", 0) * 100
                         _earn_nm = _nm.get("days_to_earnings")
-                        _earn_str = f" | earn {_earn_nm}d" if _earn_nm else ""
+                        _sect_nm = _nm.get("sector", "")
+                        _ma200s  = _nm.get("ma200_slope", 0)
+                        _earn_str = f" | earn om {_earn_nm}d" if _earn_nm else ""
+                        _ma_str  = " | MA200\u2191" if _ma200s > 0 else " | MA200\u2193"
                         lines.append(
                             f"  \u274c *{_sym_nm}* ${_pr_nm:.2f} | "
-                            f"RS={_rs_nm:.0f} RSI={_rsi_nm:.0f} | "
-                            f"`{_fail_nm}`{_earn_str}"
+                            f"RS={_rs_nm:.0f} RSI={_rsi_nm:.0f} | {_pfh_nm:.1f}% u\u00e4 topp"
+                        )
+                        lines.append(
+                            f"     Stoppades: `{_fail_nm}`{_earn_str}{_ma_str} | {_sect_nm}"
                         )
 
         except Exception as _scan_br_e:
@@ -2883,7 +2923,31 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         trend_map      = {r.symbol: r for r in top_candidates}
         vcp_results = batch_analyze(top_candidates, max_symbols=40, tick_fn=_heartbeat)
         vcp_passed  = [r for r in vcp_results if r.passed]
+        vcp_rejected_results = [r for r in vcp_results if not r.passed]
         report["vcp_passed"] = [r.symbol for r in vcp_passed]
+        # Store rejected VCP candidates with tier + fail details for morning briefing
+        _tier_label = {
+            "quant_fail": "Tier 0 (kvant)", "haiku_rejected": "Tier 1 (Haiku)",
+            "sonnet": "Tier 2 (Sonnet)", "sonnet_error": "Tier 2 (Sonnet-fel)",
+            "opus": "Tier 3 (Opus)",
+        }
+        report["vcp_rejected"] = [
+            {
+                "symbol":       r.symbol,
+                "price":        round(r.current_price, 2),
+                "rs_rating":    round(r.rs_rating, 1),
+                "tier_used":    r.tier_used,
+                "tier_label":   _tier_label.get(r.tier_used, r.tier_used),
+                "fail_reason":  r.fail_reason,
+                "ai_verdict":   r.ai_verdict,
+                "ai_reasoning": (r.ai_reasoning or "")[:200],
+                "quality_score": r.quality_score,
+                "confidence":   round(r.confidence, 2),
+                "pattern_type": r.pattern_type,
+                "setup_type":   r.setup_type,
+            }
+            for r in sorted(vcp_rejected_results, key=lambda x: -x.rs_rating)
+        ]
         _log.info("[minervini] %d/%d have confirmed VCP",
                   len(vcp_passed), len(top_candidates))
     except Exception as e:
