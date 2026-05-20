@@ -600,6 +600,95 @@ def _send_morning_briefing() -> None:
         except Exception as _pme:
             _log.debug("[briefing] PM12 scan candidates: %s", _pme)
 
+        # ── Last night's full scan results ───────────────────────────────
+        try:
+            import json as _jbr
+            _rpt_files_br = sorted(REPORT_DIR.glob("*.json"), reverse=True)
+            if _rpt_files_br:
+                _rpt_br      = _jbr.loads(_rpt_files_br[0].read_text())
+                _rpt_date    = _rpt_br.get("date", "?")
+                _trend_n     = len(_rpt_br.get("trend_passed", []))
+                _vcp_cands   = _rpt_br.get("vcp_candidates", [])
+                _trend_cands = _rpt_br.get("trend_candidates", [])
+                _near_miss   = _rpt_br.get("near_misses", [])
+                _held_syms   = {p["symbol"] for p in positions}
+
+                lines.append(f"\n\U0001f4ca *Scan {_rpt_date} — {_trend_n} i uptrend*")
+
+                # VCP-kandidater (Minervini-konfirmerade)
+                _vcp_show = [c for c in _vcp_cands if c["symbol"] not in _held_syms]
+                if _vcp_show:
+                    lines.append(f"*\u2705 VCP-kandidater ({len(_vcp_show)}):*")
+                    for _vc in _vcp_show[:6]:
+                        _sym_v  = _vc["symbol"]
+                        _pr_v   = _vc.get("current_price", 0)
+                        _rs_v   = _vc.get("rs_rating", 0)
+                        _bl_v   = _vc.get("breakout_level", 0)
+                        _sl_v   = _vc.get("stop_loss", 0)
+                        _mm_v   = _vc.get("measured_move_pct", 0) * 100
+                        _cs_v   = _vc.get("composite_score", 0)
+                        _sect_v = _vc.get("sector", "")
+                        _flags_v = []
+                        if _vc.get("eps_accelerating"):  _flags_v.append("EPS\u2191")
+                        if _vc.get("three_weeks_tight"): _flags_v.append("3WT")
+                        if _vc.get("weekly_stage2"):     _flags_v.append("S2")
+                        if _vc.get("rs_line_high"):      _flags_v.append("RS\u2728")
+                        if _vc.get("unusual_options"):   _flags_v.append("\U0001f525OPT")
+                        _flag_str_v = " " + " ".join(_flags_v) if _flags_v else ""
+                        _reason_v = (_vc.get("ai_reasoning") or "")[:100]
+                        lines.append(
+                            f"  \U0001f3af *{_sym_v}* ${_pr_v:.2f} | RS={_rs_v:.0f} | "
+                            f"Breakout ${_bl_v:.2f} | Stop ${_sl_v:.2f} | "
+                            f"Target +{_mm_v:.0f}%{_flag_str_v}"
+                        )
+                        if _sect_v:
+                            lines.append(f"     Sektor: {_sect_v} | Score: {_cs_v:.1f}")
+                        if _reason_v:
+                            lines.append(f"     _{_reason_v}_")
+
+                # Trend-kandidater (uptrend men inte VCP ännu)
+                _vcp_syms_br = {c["symbol"] for c in _vcp_cands}
+                _trend_only  = [c for c in _trend_cands
+                                if c["symbol"] not in _vcp_syms_br
+                                and c["symbol"] not in _held_syms]
+                if _trend_only:
+                    lines.append(f"*\U0001f4c8 Uptrend (väntar på VCP) ({len(_trend_only)}):*")
+                    for _tc in _trend_only[:8]:
+                        _sym_t  = _tc["symbol"]
+                        _pr_t   = _tc.get("price", 0)
+                        _rs_t   = _tc.get("rs_rating", 0)
+                        _pfh_t  = _tc.get("pct_from_high", 0) * 100
+                        _flags_t = []
+                        if _tc.get("eps_accelerating"):  _flags_t.append("EPS\u2191")
+                        if _tc.get("three_weeks_tight"): _flags_t.append("3WT")
+                        if _tc.get("rs_line_leading"):   _flags_t.append("RS\u2728")
+                        if _tc.get("weekly_stage2"):     _flags_t.append("S2")
+                        _flag_str_t = " " + " ".join(_flags_t) if _flags_t else ""
+                        lines.append(
+                            f"  \U0001f4c8 *{_sym_t}* ${_pr_t:.2f} | "
+                            f"RS={_rs_t:.0f} | {_pfh_t:.1f}% u\u00e4 topp{_flag_str_t}"
+                        )
+
+                # Near-misses — hög RS men failade ett filter
+                if _near_miss:
+                    lines.append(f"*\u26a0\ufe0f Nära men failade ({len(_near_miss)}):*")
+                    for _nm in _near_miss[:8]:
+                        _sym_nm  = _nm["symbol"]
+                        _rs_nm   = _nm.get("rs_rating", 0)
+                        _rsi_nm  = _nm.get("rsi", 0)
+                        _pr_nm   = _nm.get("price", 0)
+                        _fail_nm = _nm.get("fail_reason", "?")
+                        _earn_nm = _nm.get("days_to_earnings")
+                        _earn_str = f" | earn {_earn_nm}d" if _earn_nm else ""
+                        lines.append(
+                            f"  \u274c *{_sym_nm}* ${_pr_nm:.2f} | "
+                            f"RS={_rs_nm:.0f} RSI={_rsi_nm:.0f} | "
+                            f"`{_fail_nm}`{_earn_str}"
+                        )
+
+        except Exception as _scan_br_e:
+            _log.debug("[briefing] scan results section: %s", _scan_br_e)
+
         _tg("\n".join(lines))
         _log.info("[briefing] Morning briefing sent")
     except Exception as e:
@@ -2745,6 +2834,26 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 "sector":          get_sector(r.symbol),
             }
             for r in trend_passed[:20]
+        ]
+        # Store near-misses: top failed stocks by RS rating, with fail reason + key metrics
+        _passed_syms = {r.symbol for r in trend_passed}
+        _near_misses = sorted(
+            [r for r in screen_results if not r.passed and r.rs_rating >= 60 and r.fail_reason],
+            key=lambda r: -r.rs_rating
+        )[:15]
+        report["near_misses"] = [
+            {
+                "symbol":       r.symbol,
+                "price":        round(r.price, 2),
+                "rs_rating":    round(r.rs_rating, 1),
+                "rsi":          round(r.rsi, 1),
+                "fail_reason":  r.fail_reason,
+                "pct_from_high": round(r.pct_from_high, 4),
+                "ma200_slope":  round(r.ma200_slope_20d, 4),
+                "days_to_earnings": r.days_to_earnings,
+                "sector":       get_sector(r.symbol),
+            }
+            for r in _near_misses
         ]
         _log.info("[simons] %d/%d passed Trend Template",
                   len(trend_passed), len(screen_results))
