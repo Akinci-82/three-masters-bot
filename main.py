@@ -2441,7 +2441,7 @@ def _sector_momentum_scores() -> tuple[dict[str, float], dict[str, bool]]:
     Stage 2 flag (above MA200) required for positive sector bonus to apply.
     """
     try:
-        unique_etfs = list(set(_SECTOR_ETF_MAP.values()))
+        unique_etfs = list(set(SECTOR_ETF_MAP.values()))
         df = yf.download(unique_etfs + ["SPY"], period="1y", interval="1d",
                          auto_adjust=True, progress=False)["Close"]
         spy_ret = (float(df["SPY"].iloc[-1] / df["SPY"].iloc[-21] - 1)
@@ -2477,7 +2477,7 @@ def _sector_bonus(symbol: str, sector_scores: dict[str, float],
     try:
         from screener import get_sector
         sector   = get_sector(symbol)
-        etf      = _SECTOR_ETF_MAP.get(sector)
+        etf      = SECTOR_ETF_MAP.get(sector)
         if etf is None:
             return 0.0
         rel      = sector_scores.get(etf, 0.0)
@@ -3226,7 +3226,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
     try:
         import pandas as _pd_rs
         _etf_closes: dict = {}
-        for _etf in set(_SECTOR_ETF_MAP.values()):
+        for _etf in set(SECTOR_ETF_MAP.values()):
             try:
                 _h = yf.Ticker(_etf).history(period="1y", interval="1d", auto_adjust=True)
                 if not _h.empty:
@@ -3235,7 +3235,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
                 _log.debug("[%s] suppressed", __name__, exc_info=True)
         for _tr in vcp_passed:
             _sec = get_sector(_tr.symbol)
-            _etf = _SECTOR_ETF_MAP.get(_sec)
+            _etf = SECTOR_ETF_MAP.get(_sec)
             if _etf and _etf in _etf_closes and _tr.df is not None:
                 try:
                     _etf_c  = _etf_closes[_etf]
@@ -3475,7 +3475,7 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         # Sector RS hard filter: two-tier block
         # Tier 1 (hard): bottom-3 sectors AND momentum < -1% → always skip
         # Tier 2 (soft): bottom-half AND momentum < -0.5% → skip (unchanged)
-        _sec_etf_v = _SECTOR_ETF_MAP.get(sec)
+        _sec_etf_v = SECTOR_ETF_MAP.get(sec)
         if _sec_etf_v and sector_momentum:
             _all_rnk = sorted(sector_momentum.keys(), key=lambda e: -sector_momentum[e])
             _n_rnk   = len(_all_rnk)
