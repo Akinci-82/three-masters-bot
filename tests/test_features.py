@@ -11,6 +11,7 @@ import sys
 import os
 import json
 import math
+import logging
 import unittest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, time as dt_time
@@ -19,6 +20,14 @@ sys.path.insert(0, '/home/habil/three-masters-bot')
 
 import pandas as pd
 import numpy as np
+
+# ── Suppress noisy third-party loggers during tests ──────────────────────────
+# yfinance emits ERROR-level logs for TST (synthetic ticker, not a real stock).
+# parity_check writes to logs/parity_errors.jsonl when sync_all runs against
+# real Alpaca — mock sync_all in tests that call check_positions instead.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("parity_check").setLevel(logging.CRITICAL)
+logging.getLogger("position_sync").setLevel(logging.CRITICAL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,22 +253,37 @@ class TestCheckPositions(unittest.TestCase):
         def fake_market_sell(sym, qty):
             calls.append(("sell", sym, qty))
             return True
+        def fake_limit_sell(sym, qty, price):
+            # Capture as "sell" (same bucket) — B1/B2 partial exits use limit sell
+            calls.append(("sell", sym, qty))
+            return "fake-limit-order-id"
         def fake_stop(sym, qty, price):
             calls.append(("stop", sym, qty, price))
-            return True
+            return "fake-stop-id"
         def fake_trailing(sym, qty, pct):
             calls.append(("trailing", sym, qty, pct))
-            return True
+            return "fake-trail-id"
         def fake_cancel(*a, **kw):
             pass
+
+        # yfinance mock: avoid real network calls and suppress ERROR log noise
+        _mock_ticker = MagicMock()
+        _mock_ticker.history.return_value = pd.DataFrame()
+        _mock_ticker.options = []
+        _mock_ticker.calendar = None
+        _mock_ticker.info = {}
 
         with patch("position_monitor._get_positions", return_value=fake_position), \
              patch("position_monitor._market_is_open", return_value=True), \
              patch("position_monitor._get_open_orders", return_value=[]), \
              patch("position_monitor._cancel_stop_orders", side_effect=fake_cancel), \
              patch("position_monitor._place_market_sell", side_effect=fake_market_sell), \
+             patch("position_monitor._place_limit_sell", side_effect=fake_limit_sell), \
              patch("position_monitor._place_stop", side_effect=fake_stop), \
-             patch("position_monitor._place_trailing_stop", side_effect=fake_trailing):
+             patch("position_monitor._place_trailing_stop", side_effect=fake_trailing), \
+             patch("position_sync.sync_all", return_value=None), \
+             patch("yfinance.download", return_value=pd.DataFrame()), \
+             patch("yfinance.Ticker", return_value=_mock_ticker):
             pm.check_positions()
 
         return calls, pm._load_state()
@@ -291,10 +315,11 @@ class TestCheckPositions(unittest.TestCase):
         }}
         calls, state = self._run_check(avg_cost=100.0, cur_price=116.0, initial_state=initial)
         sell_calls = [c for c in calls if c[0] == "sell"]
-        self.assertTrue(len(sell_calls) >= 1, "Should sell 50% at +15%")
-        # Should sell ~50 shares (50% of 100)
-        self.assertEqual(sell_calls[0][2], 50)
-        self.assertTrue(state["TST"]["partial_done"])
+        self.assertTrue(len(sell_calls) >= 1, "Should sell B1 partial at +15%")
+        # B1 sells 1/3 of initial_qty: round(100 / 3) = 33 shares (Step B1 — 33% partial)
+        self.assertEqual(sell_calls[0][2], 33)
+        self.assertTrue(state["TST"]["partial1_done"])
+        self.assertTrue(state["TST"]["partial_done"])  # backward-compat flag
 
     def test_no_action_below_triggers(self):
         initial = {"TST": {
@@ -376,7 +401,8 @@ class TestBatchAnalyzeLastCandle(unittest.TestCase):
 
         captured = {}
 
-        def fake_analyze(symbol, df, use_deep_model=False, last_candle="neutral"):
+        def fake_analyze(symbol, df, use_deep_model=False, last_candle="neutral",
+                         fundamentals=None):
             captured["last_candle"] = last_candle
             return VCPResult(symbol=symbol, passed=False, fail_reason="test_skip")
 
