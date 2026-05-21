@@ -1131,15 +1131,19 @@ def _check_symbol(symbol: str, spy_close: pd.Series, cfg: dict,
                 with _SECTOR_ETF_RETURNS_LOCK:
                     if _time_etf.time() - _SECTOR_ETF_RETURNS_TS > _SECTOR_ETF_TTL or not _SECTOR_ETF_RETURNS:
                         _all_etfs = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLI", "XLB", "XLRE", "XLU", "XLP", "XLC"]
-                        _idf = yf.download(_all_etfs, period="6mo", interval="1d",
-                                           auto_adjust=True, progress=False)["Close"]
-                        for _e in _all_etfs:
-                            if _e in _idf.columns:
-                                _col = _idf[_e].dropna()
-                                if len(_col) >= 100:
-                                    _SECTOR_ETF_RETURNS[_e] = float(_col.iloc[-1] / _col.iloc[0] - 1)
-                        _SECTOR_ETF_RETURNS_TS = _time_etf.time()
-                        _log.info("[screen] Sector ETF returns refreshed (%d ETFs cached)", len(_SECTOR_ETF_RETURNS))
+                        _idf_raw = yf.download(_all_etfs, period="6mo", interval="1d",
+                                               auto_adjust=True, progress=False)
+                        if _idf_raw.empty:
+                            _log.warning("[screen] Sector ETF download returned empty — skipping refresh (possible 429)")
+                        else:
+                            _idf = _idf_raw["Close"]
+                            for _e in _all_etfs:
+                                if _e in _idf.columns:
+                                    _col = _idf[_e].dropna()
+                                    if len(_col) >= 100:
+                                        _SECTOR_ETF_RETURNS[_e] = float(_col.iloc[-1] / _col.iloc[0] - 1)
+                            _SECTOR_ETF_RETURNS_TS = _time_etf.time()
+                            _log.info("[screen] Sector ETF returns refreshed (%d ETFs cached)", len(_SECTOR_ETF_RETURNS))
                     _rets = dict(_SECTOR_ETF_RETURNS)
                 if _etf_sym in _rets and _rets:
                     _ranked_il = sorted(_rets, key=lambda x: -_rets[x])
@@ -1294,8 +1298,18 @@ def get_sector(symbol: str) -> str:
 def _bulk_download_daily(symbols: list[str], chunk_size: int = 150) -> dict[str, pd.DataFrame]:
     """Bulk-download 1-year daily OHLCV for all symbols in chunks of chunk_size.
     Returns {symbol: DataFrame}. Falls back gracefully per-chunk on error.
+
+    C2 — 429 throttle detection:
+    If ≥3 consecutive chunks return empty DataFrames we treat it as a Yahoo
+    rate-limit event, log a WARNING, and send a Telegram alert so the operator
+    knows the scan may be incomplete.  A short backoff (10 s) is applied before
+    retrying each throttled chunk once.
     """
+    from notifications import _tg as _screen_tg
     result: dict[str, pd.DataFrame] = {}
+    _consecutive_empty = 0          # C2: track consecutive empty chunks
+    _throttle_alerted  = False      # C2: send Telegram at most once per scan
+
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
         try:
@@ -1304,7 +1318,37 @@ def _bulk_download_daily(symbols: list[str], chunk_size: int = 150) -> dict[str,
                 auto_adjust=True, progress=False, threads=True,
             )
             if raw.empty:
-                continue
+                # C2: retry once after backoff in case of transient throttle
+                _consecutive_empty += 1
+                _log.debug("[screen] Chunk %d-%d returned empty — empty streak: %d",
+                           i, i + chunk_size, _consecutive_empty)
+                if _consecutive_empty >= 3 and not _throttle_alerted:
+                    _log.warning("[screen] C2: %d consecutive empty chunks — yfinance may be throttled (429). "
+                                 "Scan may be incomplete.", _consecutive_empty)
+                    try:
+                        _screen_tg("⚠️ *Three Masters — yfinance throttled*\n"
+                                   f"{_consecutive_empty} chunks returned empty in a row.\n"
+                                   "Scan may be incomplete — check logs.")
+                    except Exception:
+                        pass
+                    _throttle_alerted = True
+                if _consecutive_empty >= 2:
+                    _log.info("[screen] Backoff 10 s before retrying chunk %d-%d", i, i + chunk_size)
+                    time.sleep(10)
+                    try:
+                        raw = yf.download(
+                            chunk, period="1y", interval="1d",
+                            auto_adjust=True, progress=False, threads=True,
+                        )
+                    except Exception as _retry_e:
+                        _log.warning("[screen] Retry chunk %d-%d also failed: %s", i, i + chunk_size, _retry_e)
+                if raw.empty:
+                    continue
+                # Retry succeeded — reset streak
+                _consecutive_empty = 0
+            else:
+                _consecutive_empty = 0  # successful chunk resets streak
+
             if isinstance(raw.columns, pd.MultiIndex):
                 for sym in chunk:
                     try:
@@ -1317,6 +1361,9 @@ def _bulk_download_daily(symbols: list[str], chunk_size: int = 150) -> dict[str,
                 result[chunk[0]] = raw
         except Exception as e:
             _log.warning("[screen] Bulk download chunk %d-%d failed: %s", i, i + chunk_size, e)
+    if _throttle_alerted:
+        _log.warning("[screen] C2: throttle detected during bulk download — %d/%d symbols fetched",
+                     len(result), len(symbols))
     return result
 
 

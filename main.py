@@ -3017,6 +3017,44 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
 
     _heartbeat()   # Layer 1 done — screener can take 10-20 min
 
+    # ── C1: Regime check BEFORE Claude/VCP — avoid wasting API tokens in bear ─
+    # Confirmed regime is read from risk_state.json (written by previous scan's
+    # _check_market_regime call). If no previous scan exists we fall back to a
+    # fresh SPY check. Either way this happens before any Claude API call.
+    _scan_phase = "regime_precheck"
+    try:
+        from risk_manager import _load as _rm_load
+        _cached_regime = _rm_load().get("confirmed_regime", "")
+    except Exception:
+        _cached_regime = ""
+
+    if _cached_regime == "bear":
+        # Fast path: regime already confirmed bear from previous scan.
+        # Run a quick refresh to keep hysteresis state up to date, but
+        # do NOT proceed to expensive VCP/Claude analysis.
+        _log.warning("[C1] Cached regime=BEAR — running quick regime refresh then skipping VCP/Claude.")
+        regime, spy_price, spy_ma200, spy_pct = _check_market_regime()
+        report["regime"]    = regime
+        report["spy_price"] = round(spy_price, 2)
+        report["spy_pct"]   = round(spy_pct, 4)
+        report["breadth_pct"] = round(_breadth_pct, 3)
+        if regime == "bear":
+            _log.warning("[C1] Regime confirmed BEAR — skipping all Claude API calls. "
+                         "%d trend candidates logged but no VCP analysis.", len(trend_passed))
+            _tg(f"🔴 *Bear regime* — VCP scan skipped\n"
+                f"SPY ${spy_price:.0f} ({spy_pct*100:+.1f}% vs MA200)\n"
+                f"{len(trend_passed)} trend candidates found but no orders will be placed.\n"
+                f"_Claude API calls skipped to save cost._")
+            report["summary"] = "bear_regime_vcp_skipped"
+            report["vcp_candidates"] = []
+            _save_report(report)
+            _send_daily_summary(report, len(trend_passed), 0, portfolio_value)
+            return
+        else:
+            _log.info("[C1] Regime flipped out of BEAR (%s) — continuing to VCP analysis.", regime.upper())
+    else:
+        _log.debug("[C1] Cached regime=%s — proceeding to VCP analysis.", _cached_regime or "unknown")
+
     # ── Layer 2: Minervini — VCP Analysis ────────────────────────────────────
     _scan_phase = "vcp"
     _log.info("\n[LAYER 2 — MINERVINI] VCP pattern analysis...")
