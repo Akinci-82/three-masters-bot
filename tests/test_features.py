@@ -281,6 +281,7 @@ class TestCheckPositions(unittest.TestCase):
              patch("position_monitor._place_limit_sell", side_effect=fake_limit_sell), \
              patch("position_monitor._place_stop", side_effect=fake_stop), \
              patch("position_monitor._place_trailing_stop", side_effect=fake_trailing), \
+             patch("position_monitor._tg", return_value=True), \
              patch("position_sync.sync_all", return_value=None), \
              patch("yfinance.download", return_value=pd.DataFrame()), \
              patch("yfinance.Ticker", return_value=_mock_ticker):
