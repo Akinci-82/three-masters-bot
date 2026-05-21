@@ -3309,6 +3309,18 @@ def _run_scan(report: dict, today: str, portfolio_value: float,
         _log.warning("[tudor] CHOPPY MARKET detected — max positions halved to %d", _eff_max)
     max_new_pos    = max(0, _eff_max - len(positions) - len(orders_to_skip))
 
+    # ── B1: Manual pause check — operator triggered via /pause Telegram command ─
+    from risk_manager import _load as _rm_load_b1
+    if _rm_load_b1().get("trading_paused"):
+        _log.warning("[B1] trading_paused=True — skipping all new orders this scan.")
+        _tg("⏸ *Handel pausad — scan klar men inga ordrar placerade*\n"
+            f"{len(vcp_passed)} VCP(s) hittade men blockerade.\n"
+            "_Återuppta med /resume_")
+        report["summary"] = "manually_paused"
+        _save_report(report)
+        _send_daily_summary(report, len(trend_passed), len(vcp_passed), portfolio_value)
+        return
+
     # Sector concentration tracking: count existing positions + retained orders
     sector_counts: dict[str, int] = {}
     for sym in held_symbols | orders_to_skip:

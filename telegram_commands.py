@@ -511,6 +511,188 @@ def _cmd_confirm_live(arg: str) -> str:
         return f"❌ Fel vid /confirm\\_live: {e}"
 
 
+# ── B1: /pause and /resume ────────────────────────────────────────────────────
+
+def _cmd_pause() -> str:
+    """Set trading_paused=True in risk_state.json. New orders are blocked;
+    position monitor continues running to protect open positions."""
+    try:
+        from risk_manager import _load, _save, _RISK_LOCK
+        with _RISK_LOCK:
+            state = _load()
+            if state.get("trading_paused"):
+                return "⏸ Handel är redan *pausad*. Använd /resume för att återuppta."
+            state["trading_paused"] = True
+            state["trading_paused_at"] = datetime.now(timezone.utc).isoformat()
+            _save(state)
+        return (
+            "⏸ *Handel pausad*\n"
+            "Inga nya köpordrar placeras vid nästa scan.\n"
+            "Position monitor fortsätter skydda öppna positioner.\n"
+            "_Återuppta med /resume_"
+        )
+    except Exception as e:
+        return f"❌ Fel vid pause: {e}"
+
+
+def _cmd_resume() -> str:
+    """Clear trading_paused flag in risk_state.json."""
+    try:
+        from risk_manager import _load, _save, _RISK_LOCK
+        with _RISK_LOCK:
+            state = _load()
+            if not state.get("trading_paused"):
+                return "▶️ Handel är redan *aktiv* — ingenting att återuppta."
+            paused_at = state.pop("trading_paused_at", "")
+            state["trading_paused"] = False
+            _save(state)
+        since = f"\n_Pausad sedan: {paused_at[:16].replace('T', ' ')} UTC_" if paused_at else ""
+        return f"▶️ *Handel återupptagen*\nNästa scan placerar ordrar som vanligt.{since}"
+    except Exception as e:
+        return f"❌ Fel vid resume: {e}"
+
+
+# ── B2: /cancel_all ───────────────────────────────────────────────────────────
+
+def _cmd_cancel_all() -> str:
+    """Cancel all open buy-stop orders in one command."""
+    try:
+        from broker import cancel_all_orders, get_open_orders
+        orders = get_open_orders()
+        buy_stops = [o for o in orders if o.get("side") == "buy"]
+        if not buy_stops:
+            return "ℹ️ Inga öppna köpordrar att avbryta."
+        symbols = sorted({o["symbol"] for o in buy_stops})
+        n = cancel_all_orders()   # cancels all open orders
+        # Clean up risk state
+        try:
+            from risk_manager import _load, _save, _RISK_LOCK
+            with _RISK_LOCK:
+                state = _load()
+                pos_risk = state.get("positions_risk", {})
+                for sym in symbols:
+                    pos_risk.pop(sym, None)
+                state["open_risk_pct"] = sum(pos_risk.values())
+                _save(state)
+        except Exception:
+            pass
+        sym_list = ", ".join(f"`{s}`" for s in symbols)
+        return (
+            f"✅ *{n} köporder(s) avbrutna*\n"
+            f"Symboler: {sym_list}"
+        )
+    except Exception as e:
+        return f"❌ Fel vid cancel_all: {e}"
+
+
+# ── B3: /health ───────────────────────────────────────────────────────────────
+
+def _cmd_health() -> str:
+    """System health check: Alpaca, heartbeat, disk, logs, SQLite, git version."""
+    lines = ["🩺 *System Health — docker-nuc*\n"]
+
+    # Alpaca API
+    try:
+        from broker import get_account
+        acct = get_account()
+        lines.append(f"✅ Alpaca: nåbar | ${acct['portfolio_value']:,.0f} | {acct['status']}")
+    except Exception as e:
+        lines.append(f"❌ Alpaca: *FEL* — `{e}`")
+
+    # Heartbeat age
+    try:
+        import json as _j
+        _hb = _LOG_DIR / "heartbeat.json"
+        if _hb.exists():
+            _ts = _j.loads(_hb.read_text()).get("ts", 0)
+            _age = int((datetime.now(timezone.utc).timestamp() - _ts) / 60)
+            _icon = "✅" if _age < 20 else "⚠️"
+            lines.append(f"{_icon} Heartbeat: {_age} min sedan")
+        else:
+            lines.append("⚠️ Heartbeat: fil saknas")
+    except Exception as e:
+        lines.append(f"⚠️ Heartbeat: `{e}`")
+
+    # Disk usage
+    try:
+        import shutil as _sh
+        _du = _sh.disk_usage("/")
+        _pct = _du.used / _du.total * 100
+        _free_gb = _du.free / 1_073_741_824
+        _icon = "✅" if _pct < 80 else ("⚠️" if _pct < 90 else "🔴")
+        lines.append(f"{_icon} Disk: {_pct:.0f}% använt | {_free_gb:.1f} GB ledigt")
+    except Exception as e:
+        lines.append(f"⚠️ Disk: `{e}`")
+
+    # Log sizes
+    try:
+        def _mb(p: Path) -> str:
+            sz = p.stat().st_size if p.exists() else 0
+            return f"{sz/1_048_576:.1f} MB" if sz >= 1_048_576 else f"{sz/1024:.0f} KB"
+        _main_log = _LOG_DIR / "three_masters.log"
+        _audit    = _LOG_DIR / "sync_audit.jsonl"
+        _journal  = _LOG_DIR / "trade_journal.jsonl"
+        lines.append(
+            f"📄 Loggar: `three_masters.log` {_mb(_main_log)} | "
+            f"`sync_audit` {_mb(_audit)} | "
+            f"`journal` {_mb(_journal)}"
+        )
+    except Exception as e:
+        lines.append(f"⚠️ Loggar: `{e}`")
+
+    # SQLite rows
+    try:
+        import sqlite3 as _sq
+        _db_path = _BASE / "state" / "three_masters.db"
+        if _db_path.exists():
+            with _sq.connect(str(_db_path)) as _conn:
+                _pos_n = _conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+                try:
+                    _par_n = _conn.execute("SELECT COUNT(*) FROM parity_errors").fetchone()[0]
+                except Exception:
+                    _par_n = "?"
+            lines.append(f"🗄 SQLite: {_pos_n} positioner | {_par_n} parity-fel")
+        else:
+            lines.append("⚠️ SQLite: databas saknas")
+    except Exception as e:
+        lines.append(f"⚠️ SQLite: `{e}`")
+
+    # Parity errors JSONL (backup check)
+    try:
+        _parity_f = _LOG_DIR / "parity_errors.jsonl"
+        _par_lines = len(_parity_f.read_text().splitlines()) if _parity_f.exists() else 0
+        _icon = "✅" if _par_lines == 0 else "⚠️"
+        lines.append(f"{_icon} Parity errors (JSONL): {_par_lines} rader")
+    except Exception:
+        pass
+
+    # Bot version (git commit hash)
+    try:
+        import subprocess as _sp
+        _git = _sp.run(
+            ["git", "-C", str(_BASE), "log", "--oneline", "-1"],
+            capture_output=True, text=True, timeout=5,
+        )
+        _ver = _git.stdout.strip() if _git.returncode == 0 else "okänd"
+        lines.append(f"🔖 Version: `{_ver}`")
+    except Exception:
+        lines.append("🔖 Version: okänd")
+
+    # Pause state
+    try:
+        from risk_manager import _load
+        _rs = _load()
+        if _rs.get("trading_paused"):
+            _since = _rs.get("trading_paused_at", "")[:16].replace("T", " ")
+            lines.append(f"⏸ *Handel pausad sedan {_since} UTC*")
+        else:
+            lines.append("▶️ Handel: aktiv")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
 def _cmd_help() -> str:
     try:
         from broker import is_live
@@ -530,12 +712,18 @@ def _cmd_help() -> str:
         "/risk — snabb riskstatus (heat, drawdown, streak)\n"
         "/report — senaste scan-rapport (regime, VCP, ordrar)\n"
         "/watchlist — Stage 2 radar without VCP pattern yet\n"
+        "/health — systemhälsa (Alpaca, disk, loggar, SQLite)\n"
         "\n"
         "*Positioner & ordrar:*\n"
         "/positions — open positions with P&L and steps\n"
         "/orders — pending buy-stop orders\n"
         "/cancel SYMBOL — cancel buy-stop for symbol\n"
+        "/cancel\\_all — avbryt ALLA öppna köpordrar\n"
         "/size SYMBOL BUY STOP — positionsstorlek-kalkylator\n"
+        "\n"
+        "*Handelskontroll:*\n"
+        "/pause — pausa nya handelsbeslut (monitor fortsätter)\n"
+        "/resume — återuppta handel\n"
         "\n"
         "*Actions:*\n"
         "/scan — run today's VCP scan manually\n"
@@ -578,6 +766,14 @@ def _handle_update(update: dict) -> None:
             _send("Anv\u00e4ndning: /cancel SYMBOL  (t.ex. /cancel NVDA)")
         else:
             _send(_cmd_cancel(arg))
+    elif cmd == "/cancel_all":
+        _send(_cmd_cancel_all())
+    elif cmd == "/pause":
+        _send(_cmd_pause())
+    elif cmd == "/resume":
+        _send(_cmd_resume())
+    elif cmd == "/health":
+        _send(_cmd_health())
     elif cmd == "/size":
         _send(_cmd_size(arg))
     elif cmd == "/briefing":
