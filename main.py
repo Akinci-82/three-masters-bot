@@ -2673,14 +2673,19 @@ def run_daily():
         _SCAN_LOCK.release()
 
 
-def _archive_old_jsonl(max_age_days: int = 180):
+def _archive_old_jsonl(max_age_days: int = 30):
     """Move JSONL log entries older than max_age_days to logs/archive/.
-    Keeps the active files lean; archived files are never deleted.
+    Active files are kept lean; archive files older than 1 year are deleted.
+
+    Threshold reduced 180 → 30 days (patch 54): sync_audit.jsonl grows ~55 KB/day,
+    which equals ~20 MB/year at the old threshold. 30 days keeps active files <2 MB.
     """
     import json as _j
     archive_dir = LOG_DIR / "archive"
     archive_dir.mkdir(exist_ok=True)
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+    # ── Move entries older than max_age_days to archive ───────────────────────
     for fname in ("trade_journal.jsonl", "sync_audit.jsonl"):
         src = LOG_DIR / fname
         if not src.exists():
@@ -2708,6 +2713,54 @@ def _archive_old_jsonl(max_age_days: int = 180):
                 _log.info("[main] Archived %d old entries from %s", len(old), fname)
         except Exception as e:
             _log.warning("[main] JSONL archive failed for %s: %s", fname, e)
+
+    # ── Delete archive files older than 1 year ────────────────────────────────
+    _year_ago = datetime.now(timezone.utc) - timedelta(days=365)
+    for arc_f in archive_dir.glob("*.jsonl"):
+        try:
+            import json as _j2
+            lines = arc_f.read_text().splitlines()
+            recent = []
+            for ln in lines:
+                if not ln.strip():
+                    continue
+                try:
+                    rec = _j2.loads(ln)
+                    ts_str = rec.get("closed_at") or rec.get("timestamp") or rec.get("date", "")
+                    if not ts_str:
+                        recent.append(ln)
+                        continue
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts >= _year_ago:
+                        recent.append(ln)
+                except Exception:
+                    recent.append(ln)
+            removed = len(lines) - len(recent)
+            if removed > 0:
+                arc_f.write_text("\n".join(recent) + ("\n" if recent else ""))
+                _log.info("[main] Purged %d entries >1 year from archive %s", removed, arc_f.name)
+            if not recent:
+                arc_f.unlink()
+                _log.info("[main] Deleted empty archive file %s", arc_f.name)
+        except Exception as e:
+            _log.debug("[main] Archive cleanup %s: %s", arc_f.name, e)
+
+    # ── Disk usage warning ─────────────────────────────────────────────────────
+    try:
+        import shutil as _sh
+        _disk = _sh.disk_usage(str(LOG_DIR))
+        _pct  = _disk.used / _disk.total * 100
+        if _pct >= 85:
+            _log.warning("[main] DISK WARNING: %s is %.0f%% full (%.1f GB free)",
+                         LOG_DIR.anchor, _pct, _disk.free / 1_073_741_824)
+            _tg(f"⚠️ *Disk Warning — docker-nuc*\n"
+                f"`{LOG_DIR.anchor}` är **{_pct:.0f}%** full\n"
+                f"{_disk.free / 1_073_741_824:.1f} GB ledigt\n"
+                f"Kör `docker system prune` eller rensa gamla backups")
+    except Exception as _disk_e:
+        _log.debug("[main] disk usage check: %s", _disk_e)
 
 
 def _run_daily_impl():

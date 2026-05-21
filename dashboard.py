@@ -1649,11 +1649,14 @@ def start(stop_event: threading.Event, port: int = 5002) -> threading.Thread | N
         import logging as _logging
         _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
         try:
+            # Bind to all interfaces on the local network — NUC is not
+            # port-forwarded externally, so 0.0.0.0 is safe but 127.0.0.1
+            # would require SSH tunnel from Mac. Keep 0.0.0.0 for LAN access.
             app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
         except OSError as e:
             _log.warning("[dash] Could not bind port %d: %s", port, e)
 
     t = threading.Thread(target=_run, daemon=True, name="dashboard")
     t.start()
-    _log.info("[dash] Dashboard started at http://0.0.0.0:%d", port)
+    _log.info("[dash] Dashboard started at http://docker-nuc:%d", port)
     return t
