@@ -29,6 +29,15 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("parity_check").setLevel(logging.CRITICAL)
 logging.getLogger("position_sync").setLevel(logging.CRITICAL)
 
+# ── Disable SQLite shadow-writes during tests ─────────────────────────────────
+# _save_state() calls db.upsert_position() when SHADOW_WRITE_ENABLED=True,
+# writing synthetic test positions (TST, AAPL) into the production database.
+# Disable once at module level — each test runs in its own process so this
+# has no effect on the live bot.
+sys.path.insert(0, '/home/habil/three-masters-bot')
+import db as _test_db_module
+_test_db_module.SHADOW_WRITE_ENABLED = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers — build synthetic DataFrames

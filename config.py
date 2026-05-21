@@ -142,6 +142,21 @@ MONITOR = {
     "premarket_gap_pct":       0.02,  # cancel if stock >2% above stop price
     # F1: Intraday 5-min entry timing (Haiku analysis at 09:20-09:29 ET)
     "use_intraday_timing":     False,  # enable when ready for live use
+    # ATR trailing stop bounds (applied to 2×ATR calculation, clamped to range)
+    "atr_trail_min_pct":       0.04,  # floor: never tighter than 4%
+    "atr_trail_max_pct":       0.12,  # ceiling: never wider than 12%
+    # Time stop: soft-DD mode tightening
+    "time_stop_soft_dd_scale": 0.70,  # scale holding period by 70% when in soft-DD
+    "time_stop_soft_dd_min_gain_pct": 0.04,  # override min_gain to 4% in soft-DD
+    # Stock split detection thresholds (ratio of Alpaca qty vs recorded qty)
+    "split_upper_ratio":       1.40,  # ≥1.4× = forward split (e.g. 3:2)
+    "split_lower_ratio":       0.65,  # ≤0.65× = reverse split (e.g. 2:3)
+    # Step F2: follow-on entry at MA10w pull-back
+    "step_f2_min_pnl_pct":     0.04,  # position must be +4% before F2 can trigger
+    "step_f2_mfe_guard_pct":   0.08,  # MFE must have reached +8% first
+    # Parabolic extension exit (Step PAR)
+    "parabolic_day_gain_pct":  0.08,  # intraday gain ≥8% triggers partial exit
+    "parabolic_min_pnl_pct":   0.15,  # only activate if total position gain ≥15%
 }
 
 # ── Sector ETF map (SPDR) — shared across screener, main, position_monitor ───

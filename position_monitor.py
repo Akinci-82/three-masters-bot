@@ -654,8 +654,10 @@ def _step_d_time_stop(sym: dict, symbol: str, qty: int, pnl_pct: float,
     tsg = cfg.get("time_stop_min_gain_pct", 0.02)
     tsd = time_stop_days
     if soft_dd_mode:
-        tsd = max(int(tsd * 0.7), 10)
-        tsg = max(tsg, 0.04)
+        _ts_scale   = cfg.get("time_stop_soft_dd_scale",       0.70)
+        _ts_min_gain = cfg.get("time_stop_soft_dd_min_gain_pct", 0.04)
+        tsd = max(int(tsd * _ts_scale), 10)
+        tsg = max(tsg, _ts_min_gain)
     if not sym.get("entry_date", ""):
         return False
     if (sym.get("partial_done") or sym.get("time_stopped")
@@ -808,7 +810,9 @@ def check_positions() -> None:
             return _price_cache[sym]
         try:
             return yf.Ticker(sym).history(period="90d", interval="1d", auto_adjust=True)
-        except Exception:
+        except Exception as _e:
+            _log.warning("[monitor] _get_hist(%s) failed — exit checks may skip this symbol: %s",
+                         sym, _e)
             import pandas as _pd_miss
             return _pd_miss.DataFrame()
 
@@ -816,6 +820,14 @@ def check_positions() -> None:
     trail_pct         = cfg.get("trailing_stop_pct", 0.07)
     breakeven_trigger = cfg.get("breakeven_trigger", 0.08)
     partial_pct       = cfg.get("partial_exit_pct", 0.50)
+    _atr_trail_min    = cfg.get("atr_trail_min_pct", 0.04)
+    _atr_trail_max    = cfg.get("atr_trail_max_pct", 0.12)
+    _split_upper      = cfg.get("split_upper_ratio",  1.40)
+    _split_lower      = cfg.get("split_lower_ratio",  0.65)
+    _par_day_gain     = cfg.get("parabolic_day_gain_pct",  0.08)
+    _par_min_pnl      = cfg.get("parabolic_min_pnl_pct",   0.15)
+    _f2_min_pnl       = cfg.get("step_f2_min_pnl_pct",     0.04)
+    _f2_mfe_guard     = cfg.get("step_f2_mfe_guard_pct",   0.08)
     # composite-adjusted thresholds are set per-position inside the loop
 
     # Soft-drawdown defensive mode: when portfolio approaching daily loss limit,
@@ -916,7 +928,7 @@ def check_positions() -> None:
             _expected_qty = _recorded_qty + _pyramid_qty
             if _expected_qty > 0:
                 _qty_ratio = qty / _expected_qty
-                if _qty_ratio >= 1.4 or _qty_ratio <= 0.65:  # catches 1.5× splits and 2:3 reverse
+                if _qty_ratio >= _split_upper or _qty_ratio <= _split_lower:  # catches 1.5× splits and 2:3 reverse
                     _split_factor = round(_qty_ratio)
                     sym["split_detected"] = True
                     sym["split_factor"]   = _qty_ratio
@@ -994,7 +1006,7 @@ def check_positions() -> None:
                              for i in range(1, len(_cl_m))]
                     _atr14 = sum(_tr_m[-14:]) / 14
                     _raw_trail = (_atr14 * 2) / avg_cost if avg_cost > 0 else trail_pct
-                    sym["atr_trail_pct"] = round(max(0.04, min(0.12, _raw_trail)), 4)
+                    sym["atr_trail_pct"] = round(max(_atr_trail_min, min(_atr_trail_max, _raw_trail)), 4)
                     _log.info("[monitor] %s ATR trail: 2×ATR=%.1f%%",
                               symbol, sym["atr_trail_pct"] * 100)
                 else:
@@ -1826,8 +1838,8 @@ def check_positions() -> None:
         # Volume dry-up: 5-day avg < 60% of 50-day avg (mirrors VCP Tier 0 logic).
         if (not sym.get("step_f2_done")
                 and not sym.get("partial2_done")
-                and pnl_pct > 0.04
-                and sym.get("mfe_pct", 0) >= 0.08):
+                and pnl_pct > _f2_min_pnl
+                and sym.get("mfe_pct", 0) >= _f2_mfe_guard):
             _f2_today = datetime.now(_ET).strftime("%Y-%m-%d")
             if sym.get("_f2_check_date") != _f2_today:
                 sym["_f2_check_date"] = _f2_today
@@ -2078,7 +2090,7 @@ def check_positions() -> None:
         # If today's intraday gain >8% AND total pnl >15%, the stock is in a parabolic
         # extension. Sell 25% to lock gains before the vertical drop.
         if (not sym.get("parabolic_done")
-                and pnl_pct > 0.15
+                and pnl_pct > _par_min_pnl
                 and not sym.get("_b1_fill_pending")
                 and not sym.get("_b2_fill_pending")):
             _par_today = datetime.now(_ET).strftime("%Y-%m-%d")
@@ -2089,7 +2101,7 @@ def check_positions() -> None:
                     if len(_dfpar) >= 1:
                         _open_par = float(_dfpar["Open"].iloc[-1])
                         _day_gain = (cur_price - _open_par) / _open_par if _open_par > 0 else 0.0
-                        if _day_gain > 0.08:
+                        if _day_gain > _par_day_gain:
                             _par_qty = max(1, round(qty * 0.25))
                             _log.warning(
                                 "[monitor] %s PARABOLIC: day gain +%.1f%%, pnl +%.1f%% — "

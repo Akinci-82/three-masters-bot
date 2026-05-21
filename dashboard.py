@@ -1573,8 +1573,11 @@ def _build_state() -> dict:
             sym   = o["symbol"]
             stop  = float(o["stop_price"])
             rpt_o = rpt_order_map.get(sym, {})
-            try:   cur_p = float(yf.Ticker(sym).fast_info.last_price)
-            except: cur_p = stop
+            try:
+                cur_p = float(yf.Ticker(sym).fast_info.last_price)
+            except (AttributeError, ValueError, TypeError, OSError) as _dash_e:
+                _log.debug("[dash] price fetch %s: %s — using stop price", sym, _dash_e)
+                cur_p = stop
             orders.append({
                 "symbol":          sym,
                 "qty":             int(float(o["qty"])),
