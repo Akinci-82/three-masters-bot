@@ -173,11 +173,42 @@ _monitor_stop = threading.Event()
 _SCAN_LOCK    = threading.Lock()  # prevents concurrent scan runs
 
 
+def _cancel_open_buy_stops() -> int:
+    """A4: Cancel all open buy-stop orders before shutdown.
+
+    Called from _signal_handler with a 5-second hard timeout so it never
+    blocks a clean exit. Returns the number of orders cancelled.
+    """
+    try:
+        from broker import get_open_orders, cancel_all_orders
+        buy_stops = [o for o in get_open_orders() if o.get("side") == "buy"]
+        if not buy_stops:
+            _log.info("[main] A4: No open buy-stops to cancel at shutdown.")
+            return 0
+        syms = [o["symbol"] for o in buy_stops]
+        _log.info("[main] A4: Cancelling %d buy-stop(s) before shutdown: %s",
+                  len(buy_stops), syms)
+        n = cancel_all_orders()
+        _log.info("[main] A4: Cancelled %d order(s).", n)
+        return n
+    except Exception as e:
+        _log.warning("[main] A4: Could not cancel buy-stops at shutdown: %s", e)
+        return 0
+
+
 def _signal_handler(sig, frame):
     global _SHUTDOWN
     _log.info("[main] Signal %s — shutting down gracefully.", sig)
     _SHUTDOWN = True
     _monitor_stop.set()
+
+    # A4: cancel open buy-stops with a hard 5-second timeout
+    import threading as _thr_sig
+    _cancel_t = _thr_sig.Thread(target=_cancel_open_buy_stops, daemon=True, name="shutdown-cancel")
+    _cancel_t.start()
+    _cancel_t.join(timeout=5)
+    if _cancel_t.is_alive():
+        _log.warning("[main] A4: buy-stop cancellation timed out (>5s) — proceeding with shutdown.")
 
 
 signal.signal(signal.SIGTERM, _signal_handler)
@@ -203,11 +234,19 @@ _HEARTBEAT_FILE = LOG_DIR / "heartbeat.json"
 
 
 def _heartbeat() -> None:
-    """Write heartbeat.json so the watchdog knows the process is alive."""
+    """Write heartbeat.json so the watchdog and Docker healthcheck know the process is alive.
+    Includes 'ts' (Unix timestamp) for the A3 Docker healthcheck CMD and 'last_run' ISO string
+    for the /health Telegram command and watchdog.
+    """
     try:
+        _now = datetime.now(timezone.utc)
         _HEARTBEAT_FILE.parent.mkdir(exist_ok=True)
         _HEARTBEAT_FILE.write_text(
-            json.dumps({"last_run": datetime.now(timezone.utc).isoformat(), "pid": os.getpid()})
+            json.dumps({
+                "last_run": _now.isoformat(),
+                "ts":       _now.timestamp(),   # A3: Docker healthcheck reads this field
+                "pid":      os.getpid(),
+            })
         )
     except Exception as e:
         _log.warning("[heartbeat] Failed: %s", e)

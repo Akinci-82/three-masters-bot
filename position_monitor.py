@@ -1750,12 +1750,18 @@ def check_positions() -> None:
         # Uses market order — pyramid shares are entered at current price.
         # Strict pnl < partial2_trigger guard: belt-and-suspenders to prevent pyramid
         # firing in the same cycle as B2 if partial2_done was somehow not yet written.
+        # A2: max_positions guard — do not pyramid if portfolio is already at capacity.
         if (sym.get("partial1_done")
                 and not sym.get("pyramid_done")
                 and not sym.get("partial2_done")
                 and 0.12 <= pnl_pct < partial2_trigger):
             _pyr_days = _days_held
-            if _pyr_days >= 3:
+            # A2: check position count before adding more exposure
+            _max_pos = cfg.get("max_positions", 8)
+            if len(positions) >= _max_pos:
+                _log.info("[monitor] A2: %s pyramid SKIPPED — portfolio at capacity "
+                          "(%d/%d positions)", symbol, len(positions), _max_pos)
+            elif _pyr_days >= 3:
                 _pyr_qty = max(1, round(qty * 0.30))
                 _pyr_above_ma20 = False
                 try:

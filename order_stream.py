@@ -9,12 +9,19 @@ Reconnect strategy:
   around this by running stream.run() in a sub-thread and polling stream._running.
   If auth doesn't succeed within CONNECT_TIMEOUT seconds we call stream.stop()
   to break the internal loop cleanly and apply exponential backoff.
+
+A1 — Missed-fill recovery on reconnect:
+  _last_disconnect_ts is updated whenever the stream drops. On the next successful
+  auth we call _fetch_missed_fills(since=_last_disconnect_ts) which queries the
+  Alpaca REST API for closed orders filled after the disconnect timestamp and
+  replays them through _handle_trade_update so no fills are silently lost.
 """
 from __future__ import annotations
 import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 from alpaca.trading.stream import TradingStream
 
@@ -24,6 +31,10 @@ _CONNECT_TIMEOUT     = 30   # seconds to wait for successful auth before giving 
 _RECONNECT_BASE      = 30   # base reconnect delay after normal disconnect
 _RECONNECT_MAX       = 300  # cap exponential backoff at 5 minutes
 _ALERT_FAIL_THRESHOLD = 3   # send Telegram alert after this many consecutive auth fails
+
+# A1: track last disconnect time so we can replay missed fills on reconnect
+_last_disconnect_ts: datetime | None = None
+_last_disconnect_lock = threading.Lock()
 
 
 from notifications import _tg
@@ -87,6 +98,73 @@ def _handle_trade_update(data) -> None:
         _log.debug("[stream] handle_trade_update error: %s", e)
 
 
+def _fetch_missed_fills(since: datetime) -> None:
+    """A1: Replay fills that arrived while the WebSocket was disconnected.
+
+    Queries Alpaca REST for all closed orders filled after `since`, then
+    replays each one through _handle_trade_update. This ensures fills that
+    occurred during a disconnect window are processed — typically within
+    seconds of reconnect rather than waiting up to 15 min for the monitor.
+    """
+    try:
+        from broker import get_api, _retry
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        _log.info("[stream] A1: Fetching orders filled since %s (reconnect recovery)",
+                  since.strftime("%H:%M:%S UTC"))
+
+        closed_orders = _retry(
+            get_api().get_orders,
+            GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                after=since,
+                limit=50,
+            ),
+        )
+
+        if not closed_orders:
+            _log.debug("[stream] A1: No missed fills since %s", since.strftime("%H:%M:%S"))
+            return
+
+        replayed = 0
+        for order in closed_orders:
+            # Only replay filled orders (not cancelled/expired)
+            filled_qty = float(order.filled_qty or 0)
+            if filled_qty <= 0:
+                continue
+
+            # Build a synthetic trade-update-like object and replay it
+            class _SyntheticUpdate:
+                pass
+
+            upd = _SyntheticUpdate()
+            upd.event = "fill"
+            upd.order = {
+                "symbol":             order.symbol,
+                "side":               order.side.value,
+                "filled_qty":         filled_qty,
+                "filled_avg_price":   float(order.filled_avg_price or 0),
+                "qty":                float(order.qty or filled_qty),
+                "order_type":         order.order_type.value if order.order_type else "",
+                "type":               order.order_type.value if order.order_type else "",
+            }
+            _log.info("[stream] A1: Replaying missed fill — %s %s %.0fsh @ $%.2f",
+                      order.symbol, order.side.value, filled_qty,
+                      float(order.filled_avg_price or 0))
+            _handle_trade_update(upd)
+            replayed += 1
+
+        if replayed:
+            _log.info("[stream] A1: Replayed %d missed fill(s) from disconnect window", replayed)
+            _tg(f"🔄 *Missed fills recovered* — {replayed} fill(s) replayed after stream reconnect")
+        else:
+            _log.debug("[stream] A1: No filled orders in disconnect window")
+
+    except Exception as e:
+        _log.warning("[stream] A1: Missed-fill recovery failed: %s", e)
+
+
 def _is_connected(stream: TradingStream) -> bool:
     """Return True if TradingStream has successfully authenticated."""
     try:
@@ -108,6 +186,7 @@ def _stop_stream(stream: TradingStream) -> None:
 
 
 def _stream_loop(stop_event: threading.Event) -> None:
+    global _last_disconnect_ts   # A1: declared at top so reads and writes are both valid
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -177,7 +256,7 @@ def _stream_loop(stop_event: threading.Event) -> None:
             stop_event.wait(delay)
             continue
 
-        # Successfully authenticated
+        # Successfully authenticated — A1: replay any fills missed during disconnect
         if fail_count > 0:
             _log.info("[stream] Auth recovered after %d failure(s)", fail_count)
             if alerted:
@@ -185,6 +264,14 @@ def _stream_loop(stop_event: threading.Event) -> None:
         fail_count = 0
         alerted    = False
         _log.info("[stream] Connected to Alpaca trade stream")
+
+        # A1: fetch fills that arrived while the stream was down
+        with _last_disconnect_lock:
+            _missed_since = _last_disconnect_ts
+        if _missed_since is not None:
+            _fetch_missed_fills(_missed_since)
+            with _last_disconnect_lock:
+                _last_disconnect_ts = None  # reset after recovery (global declared at top)
 
         # Monitor the connected stream every 60 s instead of a bare join().
         # A bare join() hangs forever if the WS stalls without firing a disconnect.
@@ -211,6 +298,10 @@ def _stream_loop(stop_event: threading.Event) -> None:
 
         # Give stream thread a moment to clean up before we reconnect
         stream_thread.join(timeout=10)
+
+        # A1: record disconnect time so the next successful auth can replay missed fills
+        with _last_disconnect_lock:
+            _last_disconnect_ts = datetime.now(timezone.utc)
 
         elapsed = time.monotonic() - t_start
         _log.info(
