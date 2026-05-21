@@ -373,6 +373,17 @@ def _send_morning_briefing() -> None:
 
         if positions:
             lines.append(f"\n*Open positions ({len(positions)}):*")
+            # C-fix: fetch all open sell-stops once for the stop-health check
+            try:
+                _all_open_ords = get_open_orders()
+                _syms_with_stop = {
+                    o["symbol"] for o in _all_open_ords
+                    if o.get("side") == "sell" and o.get("type") in ("stop", "trailing_stop", "stop_limit")
+                }
+            except Exception:
+                _syms_with_stop = None  # API error — skip stop check silently
+
+            _missing_stops = []
             for p in positions:
                 sym      = p["symbol"]
                 qty      = int(float(p["qty"]))
@@ -381,7 +392,20 @@ def _send_morning_briefing() -> None:
                 pnl_pct  = (cur - avg_cost) / avg_cost * 100
                 pnl_usd  = (cur - avg_cost) * qty
                 tag      = "📈" if pnl_pct >= 0 else "📉"
-                lines.append(f"  {tag} *{sym}* {qty}sh  ${cur:.2f}  ({pnl_pct:+.1f}%  ${pnl_usd:+.0f})")
+                # Stop indicator
+                if _syms_with_stop is not None:
+                    _stop_tag = "🛡" if sym in _syms_with_stop else "⚠️"
+                    if sym not in _syms_with_stop:
+                        _missing_stops.append(sym)
+                else:
+                    _stop_tag = ""
+                lines.append(f"  {tag}{_stop_tag} *{sym}* {qty}sh  ${cur:.2f}  ({pnl_pct:+.1f}%  ${pnl_usd:+.0f})")
+
+            if _missing_stops:
+                lines.append(
+                    f"\n🚨 *Stop-order saknas: {', '.join(_missing_stops)}*\n"
+                    f"Positioner utan aktiv säljstop på Alpaca — kontrollera omedelbart"
+                )
         else:
             lines.append("\nNo open positions")
 
@@ -728,6 +752,32 @@ def _send_morning_briefing() -> None:
 
         except Exception as _scan_br_e:
             _log.debug("[briefing] scan results section: %s", _scan_br_e)
+
+        # A-fix: alert if screener has been silent for >2 trading days
+        try:
+            _rpt_files_silence = sorted(REPORT_DIR.glob("*.json"), reverse=True)
+            if _rpt_files_silence:
+                import pandas as _pd_sil
+                _last_rpt_date = _pd_sil.Timestamp(_rpt_files_silence[0].stem).date()
+                _today_sil = date.today()
+                # Count trading days between last report and today (simple weekday count)
+                _td_count = 0
+                _check = _last_rpt_date
+                while _check < _today_sil:
+                    _check = (_pd_sil.Timestamp(_check) + _pd_sil.offsets.BDay(1)).date()
+                    _td_count += 1
+                if _td_count > 2:
+                    lines.append(
+                        f"\n⚠️ *Screener tystnat — {_td_count} handelsdagar utan setup*\n"
+                        f"Senaste dagliga rapport: `{_last_rpt_date}`\n"
+                        f"Kontrollera loggar: `docker logs three-masters-bot --tail 50`"
+                    )
+                    _log.warning("[briefing] SCREENER SILENT: last report %s (%d trading days ago)",
+                                 _last_rpt_date, _td_count)
+            else:
+                lines.append("\n⚠️ *Screener tystnat — inga rapporter hittades*")
+        except Exception as _sil_e:
+            _log.debug("[briefing] screener silence check: %s", _sil_e)
 
         _tg("\n".join(lines))
         _log.info("[briefing] Morning briefing sent")

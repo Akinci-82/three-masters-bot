@@ -868,6 +868,8 @@ def check_positions() -> None:
                                 "stop updated to 5%% trailing (pnl=+%.1f%%)",
                                 _sdd_sym, _sdd_pnl * 100
                             )
+                        else:
+                            _log.warning("[monitor] %s SOFT-DD tighten: stop canceled but trailing NOT placed — needs_stop catches next cycle", _sdd_sym)
 
     # P2-fix: fetch SPY close once per cycle — reused in Step F and RS divergence
     _spy_close_cycle = None
@@ -1445,6 +1447,16 @@ def check_positions() -> None:
                            and not sym.get("breakeven_done")
                            and not sym.get("partial_done"))
 
+        # D-fix: warn when VCP metadata stop is missing — ATR trailing used as fallback
+        if not sym.get("trailing_stop_placed") and stop_loss_level == 0.0:
+            _log.warning("[monitor] %s stop_loss=0.0 (metadata missing) — ATR trailing fallback", symbol)
+            if not sym.get("_sl_zero_alerted"):
+                sym["_sl_zero_alerted"] = True
+                _tg(f"⚠️ *No VCP Stop — {symbol}*\n"
+                    f"Metadata not found in daily reports\n"
+                    f"ATR trailing stop used as fallback — verify position manually")
+                changed = True
+
         needs_stop = (not sym.get("slippage_exited") and (
             not sym.get("trailing_stop_placed") or (
                 sym.get("trailing_stop_placed") and
@@ -1717,6 +1729,8 @@ def check_positions() -> None:
                     sym["trailing_stop_placed"] = True
                     if oid2:
                         sym["stop_order_id"] = oid2
+                    else:
+                        _log.warning("[monitor] %s B2 runner: stop canceled but trailing NOT placed — needs_stop catches next cycle", symbol)
 
         # ── Step P: Pyramid — add 30% of initial qty after first partial ────────
         # Conditions: partial1 already taken (position proved itself), gain 12–20%,

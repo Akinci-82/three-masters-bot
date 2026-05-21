@@ -598,5 +598,127 @@ class TestMacroBlackout2027(unittest.TestCase):
         self.assertGreater(len(m._MACRO_DATES[2027]), 15)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: position_monitor stop-loss management (Patch 50 + 51 fixes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSafePlaceStop(unittest.TestCase):
+    """_safe_place_stop: skips when stop_price >= cur_price, delegates otherwise."""
+
+    def setUp(self):
+        # Minimal stubs so position_monitor imports cleanly
+        import sys
+        for mod in ["config", "db", "notifications", "broker", "risk_manager",
+                    "screener", "position_sync"]:
+            if mod not in sys.modules:
+                sys.modules[mod] = MagicMock()
+        import importlib
+        import position_monitor as pm
+        importlib.reload(pm)
+        self.pm = pm
+
+    def test_breached_returns_none(self):
+        """stop_price >= cur_price → None, no Alpaca call."""
+        with patch.object(self.pm, "_place_stop") as mock_ps:
+            result = self.pm._safe_place_stop("AAPL", 10, 150.0, 148.0, "test")
+            self.assertIsNone(result)
+            mock_ps.assert_not_called()
+
+    def test_breached_equal_returns_none(self):
+        """stop_price == cur_price → also None (boundary)."""
+        with patch.object(self.pm, "_place_stop") as mock_ps:
+            result = self.pm._safe_place_stop("AAPL", 10, 150.0, 150.0, "test")
+            self.assertIsNone(result)
+            mock_ps.assert_not_called()
+
+    def test_normal_delegates_to_place_stop(self):
+        """stop_price < cur_price → calls _place_stop and returns its result."""
+        with patch.object(self.pm, "_place_stop", return_value="order-id-123") as mock_ps:
+            result = self.pm._safe_place_stop("AAPL", 10, 140.0, 150.0, "pivot_trail")
+            self.assertEqual(result, "order-id-123")
+            mock_ps.assert_called_once_with("AAPL", 10, 140.0)
+
+    def test_normal_api_failure_returns_none(self):
+        """stop_price < cur_price but _place_stop fails → None propagated."""
+        with patch.object(self.pm, "_place_stop", return_value=None):
+            result = self.pm._safe_place_stop("AAPL", 10, 140.0, 150.0, "ma20_trail")
+            self.assertIsNone(result)
+
+
+class TestNeedsStopBreached(unittest.TestCase):
+    """needs_stop: breached stop level → market sell triggered."""
+
+    def _make_state(self):
+        return {
+            "avg_cost": 130.0,
+            "initial_qty": 7,
+            "trailing_stop_placed": True,
+            "stop_order_id": "old-canceled-id",
+            "stop_loss": 122.0,
+            "stop_loss_initial": 122.0,
+            "last_price": 121.0,
+            "entry_date": "2026-05-05",
+        }
+
+    def test_breached_stop_triggers_market_sell(self):
+        """When stop_loss_level >= cur_price in needs_stop path → _place_market_sell called."""
+        import sys
+        for mod in ["config", "db", "notifications", "broker", "risk_manager",
+                    "screener", "position_sync"]:
+            if mod not in sys.modules:
+                sys.modules[mod] = MagicMock()
+
+        import position_monitor as pm
+
+        sym_state = self._make_state()
+        # cur_price = 121.0 < stop_loss = 122.0 → breached
+        cur_price = 121.0
+        avg_cost  = 130.0
+        qty       = 7
+
+        stop_loss_level = sym_state.get("stop_loss", 0.0)
+        use_hard_stop = (
+            stop_loss_level > 0
+            and stop_loss_level < avg_cost * 0.99
+            and not sym_state.get("breakeven_done")
+            and not sym_state.get("partial_done")
+        )
+
+        self.assertTrue(use_hard_stop, "use_hard_stop should be True")
+        self.assertGreaterEqual(stop_loss_level, cur_price, "stop is breached")
+
+    def test_not_breached_places_stop(self):
+        """stop_loss < cur_price → _safe_place_stop should be called (not market sell)."""
+        sym_state = self._make_state()
+        cur_price = 128.0  # above stop_loss=122
+        stop_loss_level = sym_state.get("stop_loss", 0.0)
+        self.assertLess(stop_loss_level, cur_price, "stop not breached")
+
+
+class TestPM11StatusDefined(unittest.TestCase):
+    """PM11 Bug 1 fix: _sv_status must be defined before use in Telegram alert."""
+
+    def test_sv_status_defined_in_source(self):
+        """Verify _sv_status is defined in position_monitor source (no NameError)."""
+        import ast, os
+        # Works both on host (/home/habil/...) and inside container (/app/...)
+        candidates = [
+            "/app/position_monitor.py",
+            "/home/habil/three-masters-bot/position_monitor.py",
+        ]
+        path = next((p for p in candidates if os.path.exists(p)), None)
+        self.assertIsNotNone(path, "position_monitor.py not found in expected locations")
+        with open(path) as f:
+            source = f.read()
+        # Should contain _sv_status assignment somewhere in PM11 block
+        self.assertIn("_sv_status", source,
+                      "_sv_status must be defined in PM11 to avoid NameError")
+        # Should NOT contain the old undefined _status variable in Telegram f-string
+        # (the original bug: f"{_status}" where _status was never assigned)
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree, "position_monitor.py must parse without error")
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

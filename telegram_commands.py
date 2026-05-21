@@ -68,7 +68,7 @@ def _get_updates(offset: int) -> list[dict]:
 def _cmd_status() -> str:
     try:
         from risk_manager import get_state
-        from broker import get_account
+        from broker import get_account, get_positions, get_open_orders
         acct = get_account()
         eq   = acct["portfolio_value"]
         s    = get_state()
@@ -77,11 +77,35 @@ def _cmd_status() -> str:
         loss = s.get("consecutive_losses", 0)
         halt = s.get("trading_halted", False)
         halt_str = f"\n⛔ HALTED: {s.get('halt_reason','')}" if halt else ""
-        return (
-            f"📊 *Three Masters — Status*\n"
-            f"Portfolio: ${eq:,.0f}\n"
-            f"Heat: {heat:.1f}% | Day P&L: {dpnl:+.1f}% | Loss streak: {loss}{halt_str}"
-        )
+
+        lines = [
+            f"📊 *Three Masters — Status*",
+            f"Portfolio: ${eq:,.0f}",
+            f"Heat: {heat:.1f}% | Day P&L: {dpnl:+.1f}% | Loss streak: {loss}{halt_str}",
+        ]
+
+        # B-fix: live stop-order verification per open position
+        try:
+            positions = get_positions()
+            if positions:
+                open_ords = get_open_orders()
+                syms_with_stop = {
+                    o["symbol"] for o in open_ords
+                    if o.get("side") == "sell"
+                    and o.get("type") in ("stop", "trailing_stop", "stop_limit")
+                }
+                lines.append("")
+                for p in positions:
+                    sym = p["symbol"]
+                    cur = float(p["current_price"])
+                    avg = float(p["avg_entry_price"])
+                    pnl = (cur - avg) / avg * 100
+                    stop_icon = "🛡" if sym in syms_with_stop else "⚠️ INGEN STOP"
+                    lines.append(f"  {stop_icon} *{sym}* ${cur:.2f} ({pnl:+.1f}%)")
+        except Exception as _se:
+            lines.append(f"  (stop-check misslyckades: {_se})")
+
+        return "\n".join(lines)
     except Exception as e:
         return f"Error fetching status: {e}"
 
