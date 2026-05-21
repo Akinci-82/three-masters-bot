@@ -257,6 +257,21 @@ def _place_stop(symbol: str, qty: int, stop_price: float) -> str | None:
         return None
 
 
+def _safe_place_stop(symbol: str, qty: int, stop_price: float, cur_price: float,
+                     context: str = "") -> str | None:
+    """Wrapper around _place_stop that skips placement when stop_price >= cur_price.
+    Prevents Alpaca rejection on a breached level; the needs_stop check catches the
+    orphaned position on the next 15-min cycle and triggers a market sell if needed.
+    """
+    if stop_price >= cur_price:
+        _log.warning(
+            "[monitor] %s stop skipped (%s): $%.2f >= cur $%.2f — needs_stop will handle",
+            symbol, context or "unknown", stop_price, cur_price,
+        )
+        return None
+    return _place_stop(symbol, qty, stop_price)
+
+
 def _place_trailing_stop(symbol: str, qty: int, trail_pct: float) -> str | None:
     """Place trailing stop. Returns Alpaca order ID on success, None on failure."""
     trail_val = round(trail_pct * 100, 1)
@@ -1108,7 +1123,7 @@ def check_positions() -> None:
                 _runner_hwm = qty - sym.get("partial_qty", 0)
                 if _runner_hwm > 0:
                     _cancel_stop_orders(symbol)
-                    _hwm_oid = _place_stop(symbol, _runner_hwm, _hwm_stop)
+                    _hwm_oid = _safe_place_stop(symbol, _runner_hwm, _hwm_stop, cur_price, "hwm")
                     if _hwm_oid:
                         sym["hwm_tightened"]       = True
                         sym["hwm_mfe_at_trigger"]  = _hwm_mfe  # P1-fix: track MFE when triggered
@@ -1213,7 +1228,7 @@ def check_positions() -> None:
                         _kelt_qty = qty - sym.get("partial_qty", 0)
                         if _kelt_qty > 0:
                             _cancel_stop_orders(symbol)
-                            _new_kelt_oid = _place_stop(symbol, _kelt_qty, _keltner_low)
+                            _new_kelt_oid = _safe_place_stop(symbol, _kelt_qty, _keltner_low, cur_price, "keltner")
                             if _new_kelt_oid:
                                 sym["stop_order_id"] = _new_kelt_oid
                                 _log.info("[monitor] %s Keltner GTC stop updated $%.2f id=%s",
@@ -1303,7 +1318,7 @@ def check_positions() -> None:
                         if pnl_pct >= 0.03 and not sym.get("breakeven_done"):
                             # Profitable → protect with breakeven stop
                             _cancel_stop_orders(symbol)
-                            _be_oid = _place_stop(symbol, _remaining, round(avg_cost, 2))
+                            _be_oid = _safe_place_stop(symbol, _remaining, round(avg_cost, 2), cur_price, "earnings_be")
                             if _be_oid:
                                 sym["breakeven_done"] = True
                                 sym["stop_order_id"] = _be_oid
@@ -1398,7 +1413,7 @@ def check_positions() -> None:
                     _rem_ex = qty - sym.get("partial_qty", 0)
                     if pnl_pct >= 0.03 and _rem_ex > 0 and not sym.get("breakeven_done"):
                         _cancel_stop_orders(symbol)
-                        _ex_oid = _place_stop(symbol, _rem_ex, round(avg_cost, 2))
+                        _ex_oid = _safe_place_stop(symbol, _rem_ex, round(avg_cost, 2), cur_price, "exdiv_be")
                         if _ex_oid:
                             sym["breakeven_done"] = True
                             sym["stop_order_id"]  = _ex_oid
@@ -1515,7 +1530,7 @@ def check_positions() -> None:
             _wv_rem  = qty - sym.get("partial_qty", 0)
             if _wv_rem > 0 and _wv_stop < cur_price:
                 _cancel_stop_orders(symbol)
-                _wv_oid = _place_stop(symbol, _wv_rem, _wv_stop)
+                _wv_oid = _safe_place_stop(symbol, _wv_rem, _wv_stop, cur_price, "weak_vol")
                 if _wv_oid:
                     sym["stop_order_id"]    = _wv_oid
                     sym["weak_vol_stop_set"] = True
@@ -1553,7 +1568,7 @@ def check_positions() -> None:
                                     _rem_pt = qty - sym.get("partial_qty", 0)
                                     if _rem_pt > 0:
                                         _cancel_stop_orders(symbol)
-                                        _pt_oid = _place_stop(symbol, _rem_pt, _pivot_stop)
+                                        _pt_oid = _safe_place_stop(symbol, _rem_pt, _pivot_stop, cur_price, "pivot_trail")
                                         if _pt_oid:
                                             sym["stop_loss"]            = _pivot_stop
                                             sym["stop_order_id"]        = _pt_oid
@@ -1590,7 +1605,7 @@ def check_positions() -> None:
                             _rem_ma = qty - sym.get("partial_qty", 0)
                             if _rem_ma > 0:
                                 _cancel_stop_orders(symbol)
-                                _ma_oid = _place_stop(symbol, _rem_ma, _ma20_stop)
+                                _ma_oid = _safe_place_stop(symbol, _rem_ma, _ma20_stop, cur_price, "ma20_trail")
                                 if _ma_oid:
                                     sym["stop_loss"]            = _ma20_stop
                                     sym["stop_order_id"]        = _ma_oid
@@ -1741,7 +1756,7 @@ def check_positions() -> None:
             remaining = qty - sym.get("partial_qty", 0)
             if remaining > 0:
                 _cancel_stop_orders(symbol)
-                oid3 = _place_stop(symbol, remaining, breakeven)
+                oid3 = _safe_place_stop(symbol, remaining, breakeven, cur_price, "breakeven")
                 if oid3:
                     sym["breakeven_done"] = True
                     sym["stop_order_id"] = oid3
@@ -1887,7 +1902,7 @@ def check_positions() -> None:
                     _c2_remaining = qty - sym.get("partial_qty", 0)
                     if _c2_remaining > 0:
                         _cancel_stop_orders(symbol)
-                        _c2_oid = _place_stop(symbol, _c2_remaining, round(avg_cost, 2))
+                        _c2_oid = _safe_place_stop(symbol, _c2_remaining, round(avg_cost, 2), cur_price, "sector_be")
                         if _c2_oid:
                             sym["breakeven_done"] = True
                             sym["stop_order_id"]  = _c2_oid
@@ -1910,7 +1925,7 @@ def check_positions() -> None:
                 _runner_l = qty - sym.get("partial_qty", 0)
                 if _runner_l > 0:
                     _cancel_stop_orders(symbol)
-                    _lock_oid = _place_stop(symbol, _runner_l, _lock_stop)
+                    _lock_oid = _safe_place_stop(symbol, _runner_l, _lock_stop, cur_price, "profit_lock")
                     if _lock_oid:
                         sym["profit_locked"]  = True
                         sym["stop_loss"]       = _lock_stop
@@ -1934,7 +1949,7 @@ def check_positions() -> None:
                 _rem_r = qty - sym.get("partial_qty", 0)
                 if _rem_r > 0:
                     _cancel_stop_orders(symbol)
-                    _r_oid = _place_stop(symbol, _rem_r, _one_r_stop)
+                    _r_oid = _safe_place_stop(symbol, _rem_r, _one_r_stop, cur_price, "2r_stop")
                     if _r_oid:
                         sym["two_r_stop_done"] = True
                         sym["breakeven_done"]  = True
@@ -2161,7 +2176,7 @@ def check_positions() -> None:
                                 _rem_rsd = qty - sym.get("partial_qty", 0)
                                 if _rem_rsd > 0:
                                     _cancel_stop_orders(symbol)
-                                    _rsd_oid = _place_stop(symbol, _rem_rsd, round(avg_cost, 2))
+                                    _rsd_oid = _safe_place_stop(symbol, _rem_rsd, round(avg_cost, 2), cur_price, "rs_div_be")
                                     if _rsd_oid:
                                         sym["breakeven_done"] = True
                                         sym["stop_order_id"]  = _rsd_oid
